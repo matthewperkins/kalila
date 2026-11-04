@@ -1,0 +1,9 @@
+[package]
+name = "oni-sys"
+version.workspace = true
+edition.workspace = true
+description = "FFI to liboni (Open Neuro Interface), vendored and statically compiled"
+links = "oni"
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,11 @@
+[package]
+name = "rhythm"
+version.workspace = true
+edition.workspace = true
+description = "Open Ephys acquisition board (ONI/FT600) driver and simulator"
+
+[dependencies]
+oni-sys = { path = "../oni-sys" }
+anyhow.workspace = true
+log.workspace = true
+serde.workspace = true

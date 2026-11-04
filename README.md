@@ -1,0 +1,102 @@
+# oers — Open Ephys acquisition in Rust
+
+A rewrite of the Open Ephys GUI's acquisition path for the **ONI/FT600 acquisition board**
+(ECP5 gateware, not Opal Kelly), with a GPU-drawn egui interface and a spike-oriented audio
+monitor. Rust everywhere except the vendored C `liboni` and the FT600 ONI driver, which
+wraps FTDI's closed-source D3XX library.
+
+```
+crates/oni-sys   liboni 4.6 (C, vendored, statically linked) + FFI
+crates/rhythm    board driver (port of AcqBoardONI/Rhd2000ONIBoard), frame parser, simulator
+crates/engine    real-time acquisition thread, recorder (Open Ephys Binary), DSP, audio
+app/             egui + wgpu (Vulkan) GUI: GPU traces, GPU spike persistence view
+scripts/         FT600 driver build, udev rule, realtime limits
+```
+
+## Build
+
+```sh
+cargo build --release            # needs Rust ≥ 1.85, a C compiler, libpipewire/alsa headers
+./target/release/oers --sim      # simulator (no hardware needed)
+./target/release/oers            # hardware
+```
+
+## Rig setup (one time)
+
+1. **FT600 ONI driver.** Download FTDI's *D3XX Linux x86_64* package
+   (<https://ftdichip.com/drivers/d3xx-drivers/>), extract it, then run
+   `scripts/build-ft600-driver.sh <extracted dir>`. This installs
+   `~/.local/lib/libonidriver_ft600.so`.
+   *Not tested on the development machine (FTDI's library isn't there). If it fails, the
+   driver shipped with an existing Open Ephys install is also picked up automatically from
+   `~/.local/share/open-ephys/shared*`, or set `ONI_DRIVER_PATH=<dir>`.*
+2. **USB permissions:** `sudo install -m644 scripts/60-open-ephys-ft600.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
+3. **Real-time priority (recommended):** copy `scripts/99-oers-realtime.conf` to
+   `/etc/security/limits.d/`, add yourself to the `realtime` group, then re-login. The top
+   bar shows `RT` (green) once the acquisition thread runs under SCHED_FIFO. Without it,
+   acquisition still works; the board's DRAM buffer absorbs scheduling stalls.
+4. **Hyprland / NVIDIA:** use NVIDIA driver ≥ 555 (explicit sync). For the absolute lowest
+   display latency, allow tearing for this window:
+   `windowrulev2 = immediate, class:^(oers)$` and `general:allow_tearing = true`.
+
+## First check on the rig (before an experiment)
+
+```sh
+cargo run --release -p engine --example headless -- --hw --seconds 600 --record /tmp/oers-test
+```
+
+It prints once per second. Expect `dropped=0 gaps=0 bad=0`, `hwbuf` near 0 %, and
+recorder back-pressure `bp=0ms`. Then open `/tmp/oers-test` with
+`open_ephys.analysis.Session` and compare against a short recording from the stock GUI with
+the same headstages: channel count, µV scale, and TTL timing. The register command lists
+are verified byte-identical to Intan's C++. The frame layout and init/scan sequence are
+ported line by line, but **have not yet run against a real board.**
+
+## Reliability design
+
+* The acquisition thread does only USB reads and parsing; one pooled `Arc<Block>` per
+  32 samples, with no allocation in steady state.
+* **Recording is lossless or loudly not.** The recorder queue is the only blocking consumer.
+  If the disk stalls, acquisition waits and the board's DRAM buffers the data (`hw buf %`
+  rises). Display, DSP and audio drop blocks instead, and are counted, never stalling.
+* Every sample's hardware counter is checked. Gaps split blocks, are counted
+  (`lost`/`gaps`), and show up as non-contiguous `sample_numbers.npy`; they are never
+  silently papered over. (The stock plugin numbers frames as received.)
+* Bad frames, read errors, PLL timeouts and recorder I/O errors surface in the UI. Stopping
+  acquisition while recording asks for confirmation.
+* Files: Open Ephys Binary (`structure.oebin`, `continuous.dat`, `sample_numbers.npy`,
+  `timestamps.npy`, TTL `states/full_words`). `.npy` headers are rewritten every second, so
+  a crash leaves readable files. Verified with `open-ephys-python-tools` and `neo`
+  (SpikeInterface).
+
+## GPU path
+
+Raw int16 samples go to the GPU exactly as they arrive from USB (one `write_buffer` per
+frame, about 64 KB at 64 channels). A compute shader runs the display filter (IIR, per
+channel) and folds samples into per-pixel min/max columns. The vertex shader builds
+geometry from those columns. Spike waveforms are uploaded once each and drawn as instanced
+thick lines with age-faded persistence. The CPU does no per-sample drawing work.
+Present mode defaults to no-vsync with one queued frame (`present_mode` in the config:
+`auto`, `vsync`, `mailbox`, `immediate`, `fifo`), and frames are paced by `max fps`.
+
+## Audio
+
+See the module docs in `crates/engine/src/audio.rs`. In short: band-limit 300–7k → gain
+from a **held** noise calibration (never an AGC, so dense GP firing and quiet cortex keep
+their character) → gentle look-ahead expander keyed on the held σ (hash stays audible;
+depth adjustable; 0 = off) → +3 dB presence at 2.8 kHz → limiter that is exactly linear
+below 0.5 FS → stereo placement → windowed-sinc resampling with a clock-drift servo.
+**A/B: reference** bypasses the expander and EQ. Noise σ uses a two-pass median that excludes
+spikes, so high-rate regions don't inflate it (tested at 80 Hz tonic firing). Click a
+channel label to listen; Shift+click to add up to 8 channels.
+
+## Config
+
+`~/.config/oers/config.json` (board, display, audio, spike, record root). Command line:
+`--sim`, `--acquire`.
+
+## Not yet ported
+
+Impedance measurement, BNO/IMU display (IMU data *is* recorded), DAC/TTL-output controls in
+the UI (supported by the engine via `LiveCommand`), the general processor graph and other
+plugins, and a spike recording format.

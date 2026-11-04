@@ -1,0 +1,3 @@
+# Open Ephys acquisition board (FTDI FT600/FT601 USB 3 bridge): allow non-root access.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="601e", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="601f", MODE="0666", TAG+="uaccess"

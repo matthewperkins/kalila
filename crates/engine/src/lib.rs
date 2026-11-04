@@ -1,0 +1,515 @@
+//! Acquisition engine: owns the board, runs the real-time acquisition thread and fans
+//! blocks out to the recorder (lossless, back-pressured), DSP/spike detection, audio
+//! monitor and display (all lossy, never able to stall acquisition).
+//!
+//! ```text
+//!            ┌──────────── recorder  (blocking send: back-pressure into the board's DRAM)
+//!  board ──► acq thread ─┼── dsp       (try_send) ──► spikes ──► GUI
+//!  (RT prio)             ├── audio     (try_send) ──► cpal/PipeWire
+//!                        └── display   (try_send) ──► GUI / GPU upload
+//! ```
+
+pub mod audio;
+pub mod dsp;
+pub mod record;
+
+use anyhow::{Result, bail};
+use audio::{AudioMonitor, AudioSettings, AudioStats};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
+use dsp::{BandSpec, FilterBank, Spike, SpikeDetector, ThresholdMode};
+use log::{error, info, warn};
+use parking_lot::Mutex;
+use record::{RecMsg, RecStatus};
+pub use rhythm;
+use rhythm::*;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DspSettings {
+    pub band: BandSpec,
+    pub threshold: ThresholdMode,
+    pub detect: bool,
+}
+
+impl Default for DspSettings {
+    fn default() -> Self {
+        Self { band: BandSpec::SPIKES, threshold: ThresholdMode::Sigma(4.5), detect: true }
+    }
+}
+
+/// Counters for the lossy consumers (display/dsp/audio drop blocks rather than stall).
+#[derive(Default)]
+pub struct PipelineStats {
+    pub display_dropped: AtomicU64,
+    pub dsp_dropped: AtomicU64,
+    pub audio_dropped: AtomicU64,
+    /// Time (µs) the acquisition thread spent blocked on the recorder queue, total.
+    pub rec_backpressure_us: AtomicU64,
+    pub rec_queue: AtomicU64,
+    pub blocks: AtomicU64,
+}
+
+/// Noise σ and thresholds per electrode, published by the DSP thread.
+#[derive(Default, Clone)]
+pub struct ChannelStats {
+    pub sigma_uv: Vec<f32>,
+    pub threshold_uv: Vec<f32>,
+    pub spike_counts: Vec<u64>,
+}
+
+pub enum BoardChoice {
+    Hardware,
+    Simulated(Vec<usize>),
+}
+
+enum Job {
+    Open(JoinHandle<Result<Box<dyn Board>>>),
+    Op(JoinHandle<(Box<dyn Board>, Result<()>)>, &'static str),
+}
+
+struct Running {
+    stop: Arc<AtomicBool>,
+    acq: JoinHandle<(Box<dyn Board>, Result<()>)>,
+    workers: Vec<JoinHandle<()>>,
+    started: Instant,
+}
+
+pub struct Engine {
+    board: Option<Box<dyn Board>>,
+    job: Option<Job>,
+    running: Option<Running>,
+    pub last_error: Option<String>,
+    pub health: SharedHealth,
+    pub pipeline: Arc<PipelineStats>,
+    pub audio_settings: Arc<Mutex<AudioSettings>>,
+    pub audio_stats: Arc<AudioStats>,
+    pub dsp_settings: Arc<Mutex<DspSettings>>,
+    pub channel_stats: Arc<Mutex<ChannelStats>>,
+    pub rec_status: Arc<RecStatus>,
+    rec_tx: Sender<RecMsg>,
+    rec_thread: Option<JoinHandle<()>>,
+    live_tx: Option<Sender<LiveCommand>>,
+    display_rx: Option<Receiver<Arc<Block>>>,
+    spike_rx: Option<Receiver<Spike>>,
+    layout: Option<StreamLayout>,
+    info: Option<BoardInfo>,
+    rt_priority: bool,
+}
+
+impl Engine {
+    pub fn new(record_root: std::path::PathBuf) -> Self {
+        let (rec_tx, rec_rx) = unbounded();
+        let rec_status = Arc::new(RecStatus::default());
+        *rec_status.root.lock() = record_root;
+        let st = rec_status.clone();
+        let rec_thread = std::thread::Builder::new().name("recorder".into()).spawn(move || record::run_recorder(rec_rx, st)).expect("spawn recorder");
+        Self {
+            board: None,
+            job: None,
+            running: None,
+            last_error: None,
+            health: Arc::new(Health::default()),
+            pipeline: Arc::new(PipelineStats::default()),
+            audio_settings: Arc::new(Mutex::new(AudioSettings::default())),
+            audio_stats: Arc::new(AudioStats::default()),
+            dsp_settings: Arc::new(Mutex::new(DspSettings::default())),
+            channel_stats: Arc::new(Mutex::new(ChannelStats::default())),
+            rec_status,
+            rec_tx,
+            rec_thread: Some(rec_thread),
+            live_tx: None,
+            display_rx: None,
+            spike_rx: None,
+            layout: None,
+            info: None,
+            rt_priority: false,
+        }
+    }
+
+    // -------------------------------------------------------------- board lifecycle
+    pub fn open_board(&mut self, choice: BoardChoice, settings: BoardSettings) {
+        if self.is_busy() || self.is_acquiring() {
+            return;
+        }
+        self.board = None;
+        self.layout = None;
+        self.last_error = None;
+        let h = std::thread::Builder::new()
+            .name("board-open".into())
+            .spawn(move || -> Result<Box<dyn Board>> {
+                let mut b: Box<dyn Board> = match choice {
+                    BoardChoice::Hardware => Box::new(OniBoard::open()?),
+                    BoardChoice::Simulated(hs) => Box::new(SimBoard::new(hs)),
+                };
+                if b.settings() != &settings {
+                    b.apply_settings(&settings)?;
+                }
+                Ok(b)
+            })
+            .expect("spawn");
+        self.job = Some(Job::Open(h));
+    }
+
+    /// Run a (possibly slow) operation on the idle board in the background.
+    pub fn board_op(&mut self, what: &'static str, f: impl FnOnce(&mut dyn Board) -> Result<()> + Send + 'static) {
+        if self.is_busy() || self.is_acquiring() {
+            return;
+        }
+        let Some(mut b) = self.board.take() else { return };
+        let h = std::thread::Builder::new()
+            .name("board-op".into())
+            .spawn(move || {
+                let r = f(b.as_mut());
+                (b, r)
+            })
+            .expect("spawn");
+        self.job = Some(Job::Op(h, what));
+    }
+
+    pub fn apply_board_settings(&mut self, s: BoardSettings) {
+        self.board_op("apply settings", move |b| b.apply_settings(&s));
+    }
+    pub fn rescan(&mut self) {
+        self.board_op("scan ports", |b| b.scan_ports());
+    }
+
+    /// Call once per GUI frame.
+    pub fn poll(&mut self) {
+        let finished = match &self.job {
+            Some(Job::Open(h)) => h.is_finished(),
+            Some(Job::Op(h, _)) => h.is_finished(),
+            None => false,
+        };
+        if finished {
+            match self.job.take().unwrap() {
+                Job::Open(h) => match h.join() {
+                    Ok(Ok(b)) => self.set_board(b),
+                    Ok(Err(e)) => self.last_error = Some(format!("{e:#}")),
+                    Err(_) => self.last_error = Some("board open thread panicked".into()),
+                },
+                Job::Op(h, what) => match h.join() {
+                    Ok((b, r)) => {
+                        if let Err(e) = r {
+                            self.last_error = Some(format!("{what}: {e:#}"));
+                        }
+                        self.set_board(b);
+                    }
+                    Err(_) => self.last_error = Some(format!("{what}: thread panicked (board lost; reopen)")),
+                },
+            }
+        }
+        // Acquisition thread died on its own (e.g. USB unplugged)?
+        if self.running.as_ref().is_some_and(|r| r.acq.is_finished()) {
+            self.stop_acquisition();
+        }
+    }
+
+    fn set_board(&mut self, b: Box<dyn Board>) {
+        self.layout = Some(b.layout());
+        self.info = Some(b.info());
+        self.board = Some(b);
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.job.is_some()
+    }
+    pub fn busy_label(&self) -> Option<&'static str> {
+        match &self.job {
+            Some(Job::Open(_)) => Some("opening board"),
+            Some(Job::Op(_, w)) => Some(w),
+            None => None,
+        }
+    }
+    pub fn has_board(&self) -> bool {
+        self.board.is_some() || self.running.is_some()
+    }
+    pub fn board_settings(&self) -> Option<BoardSettings> {
+        self.board.as_ref().map(|b| b.settings().clone())
+    }
+    pub fn available_sample_rates(&self) -> Vec<u32> {
+        self.board.as_ref().map(|b| b.available_sample_rates()).unwrap_or_default()
+    }
+    pub fn layout(&self) -> Option<&StreamLayout> {
+        self.layout.as_ref()
+    }
+    pub fn info(&self) -> Option<&BoardInfo> {
+        self.info.as_ref()
+    }
+    pub fn is_acquiring(&self) -> bool {
+        self.running.is_some()
+    }
+    pub fn acquisition_time(&self) -> Option<Duration> {
+        self.running.as_ref().map(|r| r.started.elapsed())
+    }
+    pub fn rt_priority(&self) -> bool {
+        self.rt_priority
+    }
+    pub fn display_rx(&self) -> Option<&Receiver<Arc<Block>>> {
+        self.display_rx.as_ref()
+    }
+    pub fn spike_rx(&self) -> Option<&Receiver<Spike>> {
+        self.spike_rx.as_ref()
+    }
+    pub fn send_live(&self, c: LiveCommand) {
+        if let Some(tx) = &self.live_tx {
+            let _ = tx.send(c);
+        }
+    }
+
+    // ---------------------------------------------------------------- acquisition
+    pub fn start_acquisition(&mut self) -> Result<()> {
+        if self.running.is_some() {
+            return Ok(());
+        }
+        if self.is_busy() {
+            bail!("board is busy");
+        }
+        let Some(mut board) = self.board.take() else { bail!("no board open") };
+        let layout = board.layout();
+        if let Err(e) = board.start(self.health.clone()) {
+            self.board = Some(board);
+            return Err(e);
+        }
+        self.layout = Some(layout.clone());
+        let fs = layout.sample_rate;
+        let nch = layout.num_channels();
+        let nel = layout.num_electrodes();
+        let block_samples = board.settings().block_samples.max(1);
+        let blocks_per_s = (fs / block_samples as f64).ceil() as usize;
+        self.pipeline.display_dropped.store(0, Ordering::Relaxed);
+        self.pipeline.dsp_dropped.store(0, Ordering::Relaxed);
+        self.pipeline.audio_dropped.store(0, Ordering::Relaxed);
+        self.pipeline.rec_backpressure_us.store(0, Ordering::Relaxed);
+        self.pipeline.blocks.store(0, Ordering::Relaxed);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (live_tx, live_rx) = unbounded::<LiveCommand>();
+        // Lossy queues: ~0.5 s for display, 1 s for DSP/audio.
+        let (disp_tx, disp_rx) = bounded::<Arc<Block>>(blocks_per_s / 2 + 4);
+        let (dsp_tx, dsp_rx) = bounded::<Arc<Block>>(blocks_per_s + 4);
+        let (aud_tx, aud_rx) = bounded::<Arc<Block>>(blocks_per_s / 4 + 4);
+        let (spk_tx, spk_rx) = bounded::<Spike>(20_000);
+        let _ = self.rec_tx.send(RecMsg::AcquisitionStarted(layout.clone()));
+
+        // Recorder queue limit by bytes (~20 s, ≤ 1 GiB) to bound memory.
+        let block_bytes = (nch * block_samples * 2 + block_samples * 16).max(1);
+        let rec_limit = ((fs as usize * 20 / block_samples).min((1usize << 30) / block_bytes)).max(64) as u64;
+
+        let mut workers = Vec::new();
+        // DSP / spike detection.
+        {
+            let rx = dsp_rx;
+            let settings = self.dsp_settings.clone();
+            let cs = self.channel_stats.clone();
+            workers.push(std::thread::Builder::new().name("dsp".into()).spawn(move || dsp_thread(rx, spk_tx, settings, cs, fs, nel)).unwrap());
+        }
+        // Audio feeder (owns the cpal stream).
+        {
+            let rx = aud_rx;
+            let s = self.audio_settings.clone();
+            let st = self.audio_stats.clone();
+            workers.push(
+                std::thread::Builder::new()
+                    .name("audio-feed".into())
+                    .spawn(move || {
+                        let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max);
+                        let mut m = AudioMonitor::new(s, st, fs);
+                        while let Ok(b) = rx.recv() {
+                            m.process(&b);
+                        }
+                    })
+                    .unwrap(),
+            );
+        }
+
+        let health = self.health.clone();
+        let pipe = self.pipeline.clone();
+        let rec_tx = self.rec_tx.clone();
+        let rec_status = self.rec_status.clone();
+        let stop2 = stop.clone();
+        let rt = Arc::new(AtomicBool::new(false));
+        let rt2 = rt.clone();
+        let acq = std::thread::Builder::new()
+            .name("acquisition".into())
+            .spawn(move || {
+                rt2.store(set_realtime(), Ordering::Relaxed);
+                let r = acquisition_loop(board.as_mut(), &stop2, &live_rx, &disp_tx, &dsp_tx, &aud_tx, &rec_tx, &rec_status, rec_limit, &health, &pipe);
+                if let Err(e) = &r {
+                    error!("acquisition loop ended with error: {e:#}");
+                }
+                if let Err(e) = board.stop() {
+                    error!("board stop failed: {e:#}");
+                }
+                let _ = rec_tx.send(RecMsg::AcquisitionStopped);
+                (board, r)
+            })
+            .unwrap();
+        // Give the RT attempt a moment to report.
+        std::thread::sleep(Duration::from_millis(5));
+        self.rt_priority = rt.load(Ordering::Relaxed);
+        if !self.rt_priority {
+            warn!("acquisition thread is not real-time; see README (rtprio limits). Board DRAM still buffers stalls.");
+        }
+        self.live_tx = Some(live_tx);
+        self.display_rx = Some(disp_rx);
+        self.spike_rx = Some(spk_rx);
+        self.running = Some(Running { stop, acq, workers, started: Instant::now() });
+        info!("acquisition running: {nch} channels @ {fs} Hz, {block_samples} samples/block");
+        Ok(())
+    }
+
+    pub fn stop_acquisition(&mut self) {
+        let Some(r) = self.running.take() else { return };
+        r.stop.store(true, Ordering::SeqCst);
+        self.live_tx = None;
+        match r.acq.join() {
+            Ok((b, res)) => {
+                if let Err(e) = res {
+                    self.last_error = Some(format!("acquisition stopped: {e:#}"));
+                }
+                self.set_board(b);
+            }
+            Err(_) => self.last_error = Some("acquisition thread panicked; reopen the board".into()),
+        }
+        // Senders were dropped with the acquisition thread; workers drain and exit.
+        for w in r.workers {
+            let _ = w.join();
+        }
+        self.display_rx = None;
+        self.spike_rx = None;
+    }
+
+    pub fn start_recording(&self) {
+        let _ = self.rec_tx.send(RecMsg::Start);
+    }
+    pub fn stop_recording(&self) {
+        let _ = self.rec_tx.send(RecMsg::Stop);
+    }
+    pub fn is_recording(&self) -> bool {
+        self.rec_status.recording.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.stop_acquisition();
+        let _ = self.rec_tx.send(RecMsg::Shutdown);
+        if let Some(h) = self.rec_thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn set_realtime() -> bool {
+    use thread_priority::*;
+    #[cfg(target_os = "linux")]
+    {
+        let p = ThreadPriority::from_posix(ScheduleParams { sched_priority: 70 });
+        if set_thread_priority_and_policy(thread_native_id(), p, ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo)).is_ok() {
+            return true;
+        }
+    }
+    let _ = set_current_thread_priority(ThreadPriority::Max);
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquisition_loop(
+    board: &mut dyn Board,
+    stop: &AtomicBool,
+    live_rx: &Receiver<LiveCommand>,
+    disp: &Sender<Arc<Block>>,
+    dsp: &Sender<Arc<Block>>,
+    aud: &Sender<Arc<Block>>,
+    rec: &Sender<RecMsg>,
+    rec_status: &RecStatus,
+    rec_limit: u64,
+    _health: &Health,
+    pipe: &PipelineStats,
+) -> Result<()> {
+    // Block pool: reuse blocks once every consumer has released them (no steady-state allocation).
+    const POOL: usize = 256;
+    let mut pool: Vec<Arc<Block>> = (0..POOL).map(|_| Arc::new(Block::default())).collect();
+    let mut idx = 0;
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(c) = live_rx.try_recv() {
+            if let Err(e) = board.live(&c) {
+                warn!("live command {c:?} failed: {e:#}");
+            }
+        }
+        let slot = &mut pool[idx];
+        if Arc::get_mut(slot).is_none() {
+            *slot = Arc::new(Block::default()); // still in use downstream; allocate
+        }
+        let b = Arc::get_mut(slot).unwrap();
+        board.read_block(b)?;
+        b.acquired_at = Some(Instant::now());
+        let blk = slot.clone();
+        idx = (idx + 1) % POOL;
+        pipe.blocks.fetch_add(1, Ordering::Relaxed);
+
+        // Recorder: lossless while recording. If the disk falls behind we block here; the
+        // board's DRAM absorbs the stall (and any overflow shows up as counted gaps).
+        if rec_status.recording.load(Ordering::Relaxed) {
+            let t = Instant::now();
+            while rec.len() as u64 >= rec_limit && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            let w = t.elapsed().as_micros() as u64;
+            if w > 0 {
+                pipe.rec_backpressure_us.fetch_add(w, Ordering::Relaxed);
+            }
+            let _ = rec.send(RecMsg::Data(blk.clone()));
+            pipe.rec_queue.store(rec.len() as u64, Ordering::Relaxed);
+        }
+        for (tx, ctr) in [(disp, &pipe.display_dropped), (dsp, &pipe.dsp_dropped), (aud, &pipe.audio_dropped)] {
+            if let Err(TrySendError::Full(_)) = tx.try_send(blk.clone()) {
+                ctr.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dsp_thread(rx: Receiver<Arc<Block>>, spikes: Sender<Spike>, settings: Arc<Mutex<DspSettings>>, cs: Arc<Mutex<ChannelStats>>, fs: f64, nel: usize) {
+    let mut cur = settings.lock().clone();
+    let mut bank = FilterBank::new(cur.band.sections(fs), nel);
+    let mut det = SpikeDetector::new(fs, nel, cur.threshold);
+    let mut row = vec![0.0f32; nel];
+    let mut out = Vec::new();
+    let mut counts = vec![0u64; nel];
+    let mut last_pub = Instant::now();
+    while let Ok(b) = rx.recv() {
+        let s = settings.lock().clone();
+        if s.band != cur.band {
+            bank = FilterBank::new(s.band.sections(fs), nel);
+        }
+        det.mode = s.threshold;
+        cur = s;
+        for t in 0..b.len() {
+            let r = b.sample(t);
+            for (ch, v) in row.iter_mut().enumerate() {
+                *v = bank.tick(ch, r[ch] as f32 * ELECTRODE_UV_PER_BIT);
+            }
+            if cur.detect {
+                det.push(b.first_sample + t as i64, &row, &mut out);
+            }
+        }
+        for sp in out.drain(..) {
+            counts[sp.channel] += 1;
+            let _ = spikes.try_send(sp);
+        }
+        if last_pub.elapsed() > Duration::from_millis(200) {
+            last_pub = Instant::now();
+            let mut c = cs.lock();
+            c.sigma_uv = (0..nel).map(|i| det.sigma(i)).collect();
+            c.threshold_uv = (0..nel).map(|i| det.threshold(i)).collect();
+            c.spike_counts = counts.clone();
+        }
+    }
+}
