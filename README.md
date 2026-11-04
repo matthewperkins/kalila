@@ -26,10 +26,12 @@ cargo build --release            # needs Rust ≥ 1.85, a C compiler, libpipewir
 1. **FT600 ONI driver.** Download FTDI's *D3XX Linux x86_64* package
    (<https://ftdichip.com/drivers/d3xx-drivers/>), extract it, then run
    `scripts/build-ft600-driver.sh <extracted dir>`. This installs
-   `~/.local/lib/libonidriver_ft600.so`.
-   *Not tested on the development machine (FTDI's library isn't there). If it fails, the
-   driver shipped with an existing Open Ephys install is also picked up automatically from
-   `~/.local/share/open-ephys/shared*`, or set `ONI_DRIVER_PATH=<dir>`.*
+   `~/.local/lib/libonidriver_ft600.so`. Tested with D3XX **1.1.8**
+   (`libftd3xx-linux-x86_64-1.1.8.tgz`): builds without warnings, FTDI's library is linked
+   statically (no runtime dependency on it), and oers loads the driver and reports
+   "no board found" cleanly when none is attached. A driver shipped with an existing
+   Open Ephys install is also picked up automatically from `~/.local/share/open-ephys/shared*`,
+   or set `ONI_DRIVER_PATH=<dir>`.
 2. **USB permissions:** `sudo install -m644 scripts/60-open-ephys-ft600.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
 3. **Real-time priority (recommended):** copy `scripts/99-oers-realtime.conf` to
    `/etc/security/limits.d/`, add yourself to the `realtime` group, then re-login. The top

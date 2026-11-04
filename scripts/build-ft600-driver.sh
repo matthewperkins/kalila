@@ -15,7 +15,9 @@ BUILD="$HERE/target/ft600-driver"
 PREFIX="${PREFIX:-$HOME/.local}"
 
 STATIC="$(find "$FTDI_DIR" -name 'libftd3xx-static.a' | head -1)"
-HDR="$(find "$FTDI_DIR" -iname 'ftd3xx.h' | head -1)"
+# Prefer the header shipped next to the library (packages also carry demo-app copies).
+HDR="$(find "$(dirname "$STATIC")" -maxdepth 1 -iname 'ftd3xx.h' | head -1)"
+[[ -n "$HDR" ]] || HDR="$(find "$FTDI_DIR" -iname 'ftd3xx.h' | head -1)"
 [[ -f "$STATIC" ]] || { echo "libftd3xx-static.a not found under $FTDI_DIR" >&2; exit 1; }
 [[ -f "$HDR" ]] || { echo "ftd3xx.h not found under $FTDI_DIR" >&2; exit 1; }
 
