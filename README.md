@@ -100,8 +100,22 @@ channel label to listen; Shift+click to add up to 8 channels.
 `~/.config/oers/config.json` (board, display, audio, spike, record root). Command line:
 `--sim`, `--acquire`.
 
+## Desktop launcher
+
+`packaging/install-desktop.sh` adds oers to your application launcher (with a "simulated
+board" action). Run it again if you move the checkout. A desktop launch has no terminal, so
+the log goes to `~/.local/state/oers/oers.log`.
+
 ## Not yet ported
 
-Impedance measurement, BNO/IMU display (IMU data *is* recorded), DAC/TTL-output controls in
-the UI (supported by the engine via `LiveCommand`), the general processor graph and other
-plugins, and a spike recording format.
+Impedance measurement, BNO/IMU display (IMU data *is* recorded), the general processor graph
+and other plugins, and a spike recording format.
+
+## Icon
+
+The icon shows Bastet and Sekhmet, adapted from drawings by Gunawan Kartapranata
+([CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)) and Jeff Dahl
+([CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)) on Wikimedia Commons. The
+icon is CC BY-SA 4.0; full credits and changes are in
+[packaging/icon/ICON-CREDITS.md](packaging/icon/ICON-CREDITS.md). It doesn't affect the
+licence of the code.

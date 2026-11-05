@@ -36,7 +36,14 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
-        viewport: eframe::egui::ViewportBuilder::default().with_title("oers — Open Ephys acquisition").with_app_id("oers").with_inner_size([1600.0, 1000.0]),
+        viewport: {
+            let v = eframe::egui::ViewportBuilder::default().with_title("oers — Open Ephys acquisition").with_app_id("oers").with_inner_size([1600.0, 1000.0]);
+            // Window icon: Bastet and Sekhmet (packaging/icon; credits in ICON-CREDITS.md).
+            match eframe::icon_data::from_png_bytes(include_bytes!("../../packaging/icon/oers-128.png")) {
+                Ok(icon) => v.with_icon(std::sync::Arc::new(icon)),
+                Err(_) => v,
+            }
+        },
         ..Default::default()
     };
     eframe::run_native("oers", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg, autostart)))))
