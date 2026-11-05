@@ -12,6 +12,15 @@ use std::sync::atomic::Ordering;
 pub const RHD2000_MAGIC: u64 = 0xc691199927021942;
 pub const CHIP_ID_RHD2164_B: i32 = 1000;
 pub const ADC_BIT_VOLTS: f64 = 0.00015258789;
+/// First chip channel recorded from an RHD2132 used as a 16-channel headstage (stock
+/// plugin: `RHD2132_16CH_OFFSET`). Such headstages wire chip channels 8–23.
+pub const RHD2132_16CH_OFFSET: usize = 8;
+
+/// First chip channel read from a stream: 8 for an RHD2132 in 16-channel mode, else 0.
+/// Same rule as the stock plugin (`chipId == RHD2132 && nChans == 16`).
+pub fn first_chip_channel(chip_id: i32, channels: usize) -> usize {
+    if chip_id == crate::oni_board::CHIP_ID_RHD2132 && channels == 16 { RHD2132_16CH_OFFSET } else { 0 }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RhythmParser {
@@ -52,6 +61,9 @@ impl RhythmParser {
     }
     pub fn num_aux(&self) -> usize {
         if self.acquire_aux { 3 * self.chip_ids.iter().filter(|&&c| c != CHIP_ID_RHD2164_B).count() } else { 0 }
+    }
+    fn first_chip_channel(&self, s: usize) -> usize {
+        first_chip_channel(self.chip_ids[s], self.channels_per_stream[s])
     }
     pub fn num_channels(&self) -> usize {
         self.channels_per_stream.iter().sum::<usize>() + self.num_aux() + if self.acquire_adc { 8 } else { 0 }
@@ -94,7 +106,7 @@ impl RhythmParser {
         let aux_base = 12usize;
         let amp_base = aux_base + 6 * ns;
         for s in 0..ns {
-            let mut o = amp_base + 2 * s;
+            let mut o = amp_base + 2 * s + 2 * ns * self.first_chip_channel(s);
             for _ in 0..self.channels_per_stream[s] {
                 blk.data.push((word(o) as i32 - 32768) as i16);
                 o += 2 * ns;
@@ -189,6 +201,25 @@ mod tests {
         let v = b.data[96 + 1] as f64 * ADC_BIT_VOLTS;
         assert!((v + 0.4096).abs() < 1e-3, "{v}");
         assert_eq!(b.ttl[0], 0b1010_0101);
+    }
+
+    #[test]
+    fn rhd2132_16ch_reads_chip_channels_8_to_23() {
+        // Stream 0: RHD2132 in 16-channel mode; stream 1: RHD2216 (16 ch, no offset).
+        let mut p = RhythmParser::new(vec![16, 16], vec![1, 2], false, false, false);
+        let h = Health::default();
+        let mut b = Block { num_channels: p.num_channels(), ..Default::default() };
+        assert_eq!(p.num_channels(), 32);
+        let d = encode_payload(2, 0, |_, _| 0, amp_val, [0; 8], 0);
+        assert_eq!(d.len(), p.payload_len());
+        assert!(matches!(p.parse(&d, 0.0, &mut b, &h), ParseResult::Appended));
+        for c in 0..16 {
+            assert_eq!(b.data[c], (8 + c) as i16, "RHD2132 16-ch slot {c}");
+            assert_eq!(b.data[16 + c], (100 + c) as i16, "RHD2216 slot {c}");
+        }
+        assert_eq!(first_chip_channel(1, 32), 0);
+        assert_eq!(first_chip_channel(2, 16), 0);
+        assert_eq!(first_chip_channel(1, 16), 8);
     }
 
     #[test]

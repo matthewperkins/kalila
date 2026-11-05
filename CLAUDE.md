@@ -49,14 +49,18 @@ Open Ephys Binary format, for compatibility with existing analysis tools
 
 ## Status (2026-11-05)
 
-- Workspace builds; 18 tests pass; clippy clean.
-- GUI verified on the simulator: 0 lost blocks, audio ≈ 7 ms, display ≈ 0.5 ms.
+- Workspace builds; 19 tests pass. Clippy shows 4 lints that predate today's work
+  (`dsp.rs`, `parser.rs` tests, `traces.rs`); the rig's Rust 1.95 flags them, the dev box's
+  older toolchain didn't.
+- GUI verified on the simulator: 0 lost blocks, audio ≈ 7 ms, display ≈ 0.5 ms. Not yet
+  run on hardware.
 - **First real-board runs passed (rig, 2026-11-05).** Init, port scan and cable delay
-  (`crates/rhythm/src/oni_board.rs`) worked first time: A1 RHD2132 + B1 RHD2216 = 48 ch.
-  600 s soak with recording: `dropped=0 gaps=0 bad=0`, `hwbuf` 0.0 %, recorder stall 5 ms
-  in total, 18,000,096 contiguous samples (exactly 30 kHz). Display latency about 5 ms
-  steady state, measured headless. (The `samples` counter in the headless log rises about
-  30,080 per tick only because the ticker fires slightly after each 1 s.)
+  (`crates/rhythm/src/oni_board.rs`) worked first time. 600 s soak with recording:
+  `dropped=0 gaps=0 bad=0`, `hwbuf` 0.0 %, recorder stall 5 ms in total, 18,000,096
+  contiguous samples (exactly 30 kHz). Display latency about 5 ms steady state, measured
+  headless. (The `samples` counter in the headless log rises about 30,080 per tick only
+  because the ticker fires slightly after each 1 s.) A second soak (120 s, our own driver)
+  was also clean.
 - **FT600 driver: D3XX must be 1.0.x.** With D3XX 1.1.8 (FTDI's C/libusb rewrite),
   `oni_init_ctx` hangs forever in `_oni_reset_routine` → `oni_ft600_update_control` →
   `FT_ReadPipeEx(timeout 0)`, which now means "block forever". Built against **D3XX 1.0.14**
@@ -64,16 +68,25 @@ Open Ephys Binary format, for compatibility with existing analysis tools
   (ft600 1.0.6) works. The stock plugin's prebuilt driver (ft600 1.0.3, D3XX 1.0.16) also
   works via `ONI_DRIVER_PATH=~/acquisition-board/libONI/linux`.
   `scripts/build-ft600-driver.sh` refuses 1.1.x.
-- Second soak, 120 s with our own driver: also 0/0/0, 3,600,096 contiguous samples.
-  `--aux --adc` gives 62 ch (48 + 6 AUX + 8 ADC), also clean.
-- To check against the stock GUI: AUX is recorded as `raw − 32768` × 37.4 µV, which is the
-  true voltage minus 1.2255 V. On port A, AUX1–3 sit at raw 65535 (top of the input
-  range). With the I/O board unconnected, all 8 ADCs read about −4.35 V. This board is
-  ID 0x100, so it's not a v3 and the ADC is not inverted.
-- Not yet compared against a stock-GUI recording (rig plan step 5), and the GUI hasn't
-  been run on hardware.
-- Clippy on the rig's Rust 1.95 shows 4 newer lints (`dsp.rs`, `parser.rs`, `traces.rs`)
-  that the dev box toolchain didn't flag.
+- **Matches a stock-GUI recording** (stock GUI 1.1.0, plugin 1.1.6, same headstages):
+  - Neural channels match channel for channel: the per-channel noise profile correlates at
+    1.000 (0.95 in 16-ch mode, with room drift). 0.195 µV/bit is confirmed.
+  - AUX uses the same `raw − 32768` × 37.4 µV convention, so values are the true voltage
+    minus 1.2255 V. Stock labels AUX "mV" although its bit_volts is in V; ours says V.
+  - ADC scale and offset match (board ID 0x100, not v3, not inverted); pulse high level
+    +2.227 V in both.
+  - TTL: same line number and `full_words`; 250.018 ms period and 20.000 ms width in both;
+    the ADC edge lands +1 sample after the TTL edge in both.
+- **Rig headstage A is a 16-channel board on an RHD2132**, so it needs 16-ch mode
+  (`BoardSettings::rhd2132_16ch`, GUI "16-ch RHD2132", headless `--16ch A1`). As in stock,
+  that mode keeps chip channels 8–23 (`RHD2132_16CH_OFFSET`); the unwired inputs read about
+  1.5 µV. Parsing and layout only. DAC routing adds the +8 offset to reach the physical
+  channel. Stock doesn't, so stock's DAC outputs an unwired channel in this mode. Our DAC
+  routing in 16-ch mode is untested on hardware (I/O outputs are disconnected).
+- **LEDs off by default.** The LED driver puts a ~1.06 kHz tone on every analog input:
+  floating ADC σ was 38.6 counts with LEDs on vs 4.4 off, in an alternating test, and it
+  shows on driven inputs too. Neural channels are unaffected. The stock settings here also
+  had LEDs off. Headless `--leds` turns them on.
 - Hardware-safety audit: no flash, EEPROM or FTDI chip-config writes; all registers are
   volatile. The worst case is power-cycling the board. Disconnect I/O-board outputs
   (DAC/TTL out) for the first tests.

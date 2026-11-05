@@ -28,6 +28,9 @@ pub struct ChannelInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HeadstageInfo {
     pub name: String,
+    /// Headstage slot 0..8 (A1, A2, B1, … D2); indexes `BoardSettings::rhd2132_16ch`.
+    #[serde(default)]
+    pub slot: usize,
     pub port: usize,
     pub chip: String,
     pub num_channels: usize,
@@ -185,7 +188,13 @@ pub struct BoardSettings {
     pub dac_hpf_hz: f64,
     pub fast_ttl_settle: Option<u8>,
     pub noise_slicer: i32,
+    /// Board status LEDs. Off by default: their driver puts a ~1.06 kHz tone on the analog
+    /// inputs (floating ADC noise rose ~9× with them on; neural channels are unaffected).
     pub leds: bool,
+    /// Per headstage slot (A1, A2, B1, … D2): treat an RHD2132 as a 16-channel headstage,
+    /// recording chip channels 8–23 only (stock "half channels" mode, RHD2132_16CH_OFFSET).
+    /// Parsing and layout only, no register writes.
+    pub rhd2132_16ch: [bool; 8],
     pub clock_divider: u32,
     /// liboni block read size in bytes. Smaller = lower latency, more USB transactions.
     pub usb_block_bytes: u32,
@@ -211,7 +220,8 @@ impl Default for BoardSettings {
             dac_hpf_hz: 300.0,
             fast_ttl_settle: None,
             noise_slicer: 0,
-            leds: true,
+            leds: false,
+            rhd2132_16ch: [false; 8],
             clock_divider: 1,
             usb_block_bytes: 24 * 1024,
             block_samples: 32,

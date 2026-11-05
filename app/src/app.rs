@@ -347,8 +347,20 @@ impl App {
                     }
                 });
             }
+            // RHD2132 headstages that can run as 16-channel boards (chip channels 8–23).
+            let rhd2132: Vec<(usize, String)> =
+                self.layout().map(|l| l.headstages.iter().filter(|h| h.chip == "RHD2132").map(|h| (h.slot, h.name.clone())).collect()).unwrap_or_default();
             ui.add_enabled_ui(idle, |ui| {
                 let b = &mut self.edit_board;
+                if !rhd2132.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("16-ch RHD2132");
+                        for (slot, name) in &rhd2132 {
+                            ui.checkbox(&mut b.rhd2132_16ch[*slot], name.as_str())
+                                .on_hover_text("Headstage wires only 16 of the chip's 32 inputs: record chip channels 8–23 (stock \"half channels\")");
+                        }
+                    });
+                }
                 let rates = self.engine.available_sample_rates();
                 egui::ComboBox::from_label("Sample rate").selected_text(format!("{} Hz", b.sample_rate)).show_ui(ui, |ui| {
                     for r in rates {

@@ -684,6 +684,25 @@ impl OniBoard {
         }
     }
 
+    /// Re-derive per-stream channel counts and first channels after the RHD2132 16-channel
+    /// option changes, without rescanning. Parsing and layout only; no register writes.
+    fn update_channel_counts(&mut self) {
+        let mut first = 0;
+        for (hs, h) in self.headstages.iter_mut().enumerate() {
+            if h.num_streams == 0 {
+                continue;
+            }
+            if h.chip_id == CHIP_ID_RHD2132 {
+                h.channels_per_stream = if self.settings.rhd2132_16ch[hs] { 16 } else { 32 };
+                for k in 0..h.num_streams {
+                    self.channels_per_stream[h.first_stream_index + k] = h.channels_per_stream;
+                }
+            }
+            h.first_channel = first;
+            first += h.num_channels();
+        }
+    }
+
     fn update_board_streams(&mut self) -> Result<()> {
         for i in 0..MAX_STREAMS {
             if i < self.enabled_streams.len() {
@@ -791,7 +810,7 @@ impl OniBoard {
                         self.enable_headstage(hs, true, 1, 32, bno, tmp_chip[hs]);
                     }
                 } else {
-                    let ch = if tmp_chip[hs] == CHIP_ID_RHD2132 { 32 } else { 16 };
+                    let ch = if tmp_chip[hs] == CHIP_ID_RHD2132 { if self.settings.rhd2132_16ch[hs] { 16 } else { 32 } } else { 16 };
                     self.enable_headstage(hs, true, 1, ch, bno, tmp_chip[hs]);
                 }
                 info!("headstage {} found: {} ({} ch)", HS_NAMES[hs], chip_name(tmp_chip[hs]), self.headstages[hs].num_channels());
@@ -829,7 +848,9 @@ impl OniBoard {
         let mut acc = 0;
         for (i, &n) in self.channels_per_stream.iter().enumerate() {
             if electrode < acc + n {
-                return Some((i, electrode - acc));
+                // Physical chip channel. (Stock omits the RHD2132 16-ch offset here, so its DAC
+                // outputs an unwired channel in that mode.)
+                return Some((i, electrode - acc + crate::parser::first_chip_channel(self.chip_ids[i], n)));
             }
             acc += n;
         }
@@ -941,7 +962,7 @@ impl Board for OniBoard {
                 continue;
             }
             let idx = headstages.len();
-            headstages.push(HeadstageInfo { name: HS_NAMES[hs].into(), port: hs / 2, chip: chip_name(h.chip_id).into(), num_channels: h.num_channels(), first_channel: h.first_channel, has_bno: h.has_bno });
+            headstages.push(HeadstageInfo { name: HS_NAMES[hs].into(), slot: hs, port: hs / 2, chip: chip_name(h.chip_id).into(), num_channels: h.num_channels(), first_channel: h.first_channel, has_bno: h.has_bno });
             for _ in 0..h.num_channels() {
                 let n = channels.len() + 1;
                 channels.push(ChannelInfo { name: format!("CH{n}"), kind: ChannelKind::Electrode, bit_volts: ELECTRODE_UV_PER_BIT, units: "uV".into(), headstage: Some(idx) });
@@ -979,6 +1000,9 @@ impl Board for OniBoard {
         }
         let old = self.settings.clone();
         self.settings = new.clone();
+        if new.rhd2132_16ch != old.rhd2132_16ch {
+            self.update_channel_counts();
+        }
         if new.usb_block_bytes != old.usb_block_bytes {
             self.reset_board()?;
         }

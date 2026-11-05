@@ -90,7 +90,13 @@ impl SimBoard {
     }
 
     fn electrodes(&self) -> usize {
-        self.headstage_channels.iter().sum()
+        (0..self.headstage_channels.len()).map(|i| self.hs_channels(i)).sum()
+    }
+
+    /// Channels of simulated headstage `i`, honouring the RHD2132 16-channel option.
+    fn hs_channels(&self, i: usize) -> usize {
+        let n = self.headstage_channels[i];
+        if n == 32 && self.settings.rhd2132_16ch[i % 8] { 16 } else { n }
     }
 
     fn rebuild(&mut self) {
@@ -195,8 +201,9 @@ impl Board for SimBoard {
     fn layout(&self) -> StreamLayout {
         let mut channels = Vec::new();
         let mut headstages = Vec::new();
-        for (i, &n) in self.headstage_channels.iter().enumerate() {
-            headstages.push(HeadstageInfo { name: ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"][i % 8].into(), port: i / 2, chip: if n == 64 { "RHD2164" } else { "RHD2132" }.into(), num_channels: n, first_channel: channels.len(), has_bno: false });
+        for (i, &raw) in self.headstage_channels.iter().enumerate() {
+            let n = self.hs_channels(i);
+            headstages.push(HeadstageInfo { name: ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"][i % 8].into(), slot: i % 8, port: i / 2, chip: if raw == 64 { "RHD2164" } else { "RHD2132" }.into(), num_channels: n, first_channel: channels.len(), has_bno: false });
             for _ in 0..n {
                 let k = channels.len() + 1;
                 channels.push(ChannelInfo { name: format!("CH{k}"), kind: ChannelKind::Electrode, bit_volts: ELECTRODE_UV_PER_BIT, units: "uV".into(), headstage: Some(i) });

@@ -1,11 +1,12 @@
 //! Headless acquisition + recording with live health stats (a soak-test tool for the rig).
 //!
 //! ```text
-//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ] [--aux] [--adc] [--no-audio]
+//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ] [--aux] [--adc] [--leds] [--16ch A1[,B1…]] [--no-audio]
 //! ```
 //!
 //! `--aux` / `--adc` acquire (and record) the headstage AUX and the 8 I/O-board ADC channels,
-//! for comparing scales against a stock-GUI recording.
+//! for comparing scales against a stock-GUI recording. `--leds` turns the board LEDs on (off by
+//! default). `--16ch` runs the RHD2132 in the given slots as 16-channel headstages.
 use engine::{BoardChoice, Engine};
 use rhythm::BoardSettings;
 use std::sync::atomic::Ordering;
@@ -24,6 +25,16 @@ fn main() -> anyhow::Result<()> {
     }
     settings.acquire_aux = flag("--aux");
     settings.acquire_adc = flag("--adc");
+    if flag("--leds") {
+        settings.leds = true;
+    }
+    if let Some(list) = opt("--16ch") {
+        const SLOTS: [&str; 8] = ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"];
+        for name in list.split(',') {
+            let slot = SLOTS.iter().position(|s| s.eq_ignore_ascii_case(name.trim()));
+            settings.rhd2132_16ch[slot.ok_or_else(|| anyhow::anyhow!("--16ch: unknown headstage slot {name:?} (use A1..D2)"))?] = true;
+        }
+    }
     let mut e = Engine::new(root.clone().unwrap_or_else(std::env::temp_dir));
     e.audio_settings.lock().enabled = !flag("--no-audio");
     e.open_board(if flag("--hw") { BoardChoice::Hardware } else { BoardChoice::Simulated(vec![32, 32]) }, settings);
