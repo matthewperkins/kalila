@@ -18,7 +18,8 @@ and the current state.
 ## Goal and priorities (in order)
 
 Rewrite the Open Ephys GUI and acquisition-board plugin in Rust; C only where unavoidable
-(vendored liboni, FT600 ONI driver wrapping FTDI's closed-source D3XX).
+(vendored liboni, FT600 ONI driver wrapping FTDI's closed-source D3XX). **Linux only**:
+Windows and macOS are not a consideration (no cross-platform shims or testing).
 
 1. Reliable acquisition (MUST).
 2. GPU drawing as much as possible, minimal CPU↔GPU transfer.
@@ -102,6 +103,33 @@ Open Ephys Binary format, for compatibility with existing analysis tools
   volatile. The worst case is power-cycling the board. Disconnect I/O-board outputs
   (DAC/TTL out) for the first tests.
 
+## Added on the rig (2026-11-05), committed; some checks still pending
+
+Committed per feature where the code separates; the GUI features share one commit, since
+`app.rs`/`traces.rs` interleave them.
+- TTL-input overlay (`app/src/ttl.rs`): bands plus per-line lanes. Verified on the board.
+- Outputs panel (DAC routing, DAC 1 follows audio, manual TTL out, threshold → TTL out,
+  DAC high-pass, noise slicer). Sent live and at every acquisition start (`sync_outputs`);
+  new `LiveCommand::SetTtlMode`. **Not yet checked on a scope or the Grass AM10.**
+- Triggered sweeps (`app/src/sweep.rs`, `cut` pass in `traces.wgsl`): TTL2 laser trigger by
+  default, −10/+40 ms, sweeps overlaid with fading, laser-on shading. Channel overlay:
+  1/2/4/8 electrodes per row. For opto-tagging; laser TTL on line 2, RZ5 drive on ADC1.
+- Audio underrun fix (`audio.rs`): the servo now measures the fill left *after* each
+  callback, and the guard gets 12 ms of slack for bursty USB delivery. On the board:
+  ~13/s → 1 in 30 s, ~9 ms latency. `headless --mute` and callback-size stats were added.
+- Display CAR in the 300–6k view (`filt`/`carmean`/`fold` passes), with a palette for the
+  reference and subtract sets (`CarSettings`, shared with spikes/audio). Simulator check
+  passed; not yet tried on real data.
+- CAR is also optional for spike detection and the audio monitor (`engine::dsp::Car`,
+  subtracted from raw samples before filtering; same sets as the display; recordings never).
+  Headless `--car` applies it to all electrodes. The Spike detection / Audio monitor
+  headings show a "CAR" badge when it applies there.
+- Spike tiles: click monitors that channel, Ctrl+click adds/removes it from the audio mix.
+  Monitored channels are coloured by stereo position (amber left → yellow → lime right).
+- Desktop launcher: `packaging/install-desktop.sh` (log in `~/.local/state/oers/oers.log`).
+- Simulator: a common-mode artefact burst (30 ms every 1.7 s) for testing CAR; on by
+  default, `OERS_SIM_ARTEFACT=0` turns it off.
+
 ## Rig test plan
 
 1. Close the stock Open Ephys GUI (only one program can open the board).
@@ -126,8 +154,8 @@ github.com/open-ephys-plugins/acquisition-board and github.com/open-ephys/liboni
 
 ## Not yet ported
 
-Impedance measurement, IMU display (IMU data *is* recorded), DAC/TTL-output UI (the engine
-supports it via `LiveCommand`), processor graph and plugins, spike file writing.
+Impedance measurement (the user doesn't use it), IMU display (IMU data *is* recorded; the
+rig's headstages have no IMU), processor graph and plugins (deferred), spike file writing.
 
 ## Working conventions
 

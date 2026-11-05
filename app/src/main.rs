@@ -3,7 +3,9 @@
 mod app;
 mod config;
 mod spikes;
+mod sweep;
 mod traces;
+mod ttl;
 
 use eframe::egui_wgpu::{self, wgpu};
 

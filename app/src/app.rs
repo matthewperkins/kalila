@@ -1,6 +1,8 @@
-use crate::config::{Config, ViewFilter};
+use crate::config::{Config, OutputSettings, ViewFilter};
 use crate::spikes::{SLOTS, SpikeCallback, SpikeFrame, SpikeGpu};
-use crate::traces::{MAX_SECTIONS, TraceCallback, TraceConfig, TraceFrame, TraceGpu};
+use crate::sweep::Sweeps;
+use crate::traces::{MAX_CUTS, MAX_SECTIONS, RING, SweepFrame, TraceCallback, TraceConfig, TraceFrame, TraceGpu};
+use crate::ttl::{TtlGeom, TtlOverlay};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use eframe::egui_wgpu;
 use engine::audio::GainMode;
@@ -22,7 +24,38 @@ const PALETTE: [[f32; 3]; 8] = [
     [0.95, 0.50, 0.55],
     [0.70, 0.70, 0.95],
 ];
-const MONITOR_COLOR: [f32; 4] = [1.0, 0.95, 0.35, 1.0];
+/// Colour of an audio-monitored channel, from its stereo position in the mix: amber (left)
+/// through the monitor yellow (centre, also a lone channel) to lime (right).
+fn monitor_color(i: usize, n: usize) -> [f32; 4] {
+    const L: [f32; 3] = [1.0, 0.62, 0.15];
+    const C: [f32; 3] = [1.0, 0.95, 0.35];
+    const R: [f32; 3] = [0.72, 1.0, 0.25];
+    let p = engine::audio::pan_position(i, n) / 0.8;
+    let (a, b, t) = if p < 0.0 { (C, L, -p) } else { (C, R, p) };
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, 1.0]
+}
+
+fn monitor_color32(mon: &[usize], ch: usize) -> Option<Color32> {
+    let i = mon.iter().position(|&c| c == ch)?;
+    let c = monitor_color(i, mon.len());
+    Some(Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8))
+}
+/// Colours for electrodes overlaid in one row (by position in the group); no yellow, which
+/// marks the audio-monitored channel.
+const GROUP_PALETTE: [[f32; 3]; 8] = [[0.92, 0.92, 0.92], [0.35, 0.80, 1.00], [1.00, 0.42, 0.72], [0.50, 0.92, 0.50], [1.00, 0.60, 0.25], [0.65, 0.55, 1.00], [0.30, 0.90, 0.85], [1.00, 0.35, 0.35]];
+
+/// Badge colour marking where the common average reference is applied.
+const CAR_COLOR: Color32 = Color32::from_rgb(90, 200, 190);
+
+/// A bold section heading, with a "CAR" badge when the reference is applied in that section.
+fn section_title(ui: &egui::Ui, name: &str, car: bool) -> egui::WidgetText {
+    let mut job = egui::text::LayoutJob::default();
+    RichText::new(name).strong().append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+    if car {
+        RichText::new("  CAR").small().strong().color(CAR_COLOR).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+    }
+    job.into()
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
@@ -39,12 +72,21 @@ pub struct App {
     view: View,
     // trace staging
     pending: Vec<i16>,
+    /// TTL words for the samples in `pending` (one per sample).
+    pending_ttl: Vec<u16>,
+    ttl: TtlOverlay,
     pending_nch: usize,
     disp_counter: u64,
     trace_reset: bool,
     last_trace_cfg: Option<TraceConfig>,
-    /// (channel count, ADC V/row bits) of the per-channel trace table last sent to the GPU.
-    chinfo_key: Option<(usize, u32)>,
+    /// (channel count, ADC V/row bits, channels per row) of the trace tables last sent.
+    chinfo_key: Option<(usize, u32, usize)>,
+    sweeps: Sweeps,
+    /// Per-channel trace table last sent (resent when CAR sets or scaling change).
+    last_chinfo: Option<Vec<[f32; 4]>>,
+    car_window: bool,
+    /// (pre, post, line, slots, filter, cols): a change clears the sweeps.
+    sweep_key: Option<(u32, u32, usize, u32, ViewFilter, u32)>,
     colors_dirty: bool,
     trace_colors: Option<Arc<Vec<[f32; 4]>>>,
     spike_colors: Option<Arc<Vec<[f32; 4]>>>,
@@ -66,6 +108,14 @@ pub struct App {
     toast: Option<(String, Instant)>,
     dirty_cfg: Instant,
     autostart: bool,
+    // outputs
+    was_acquiring: bool,
+    /// Manual TTL-out word (reset to 0 at every acquisition start, as the board does).
+    ttl_out_word: u16,
+    /// Last DAC route sent per DAC: (electrode, threshold µV).
+    dac_sent: [Option<(Option<usize>, f32)>; 8],
+    /// Last board-level output settings sent.
+    outputs_sent: Option<(bool, bool, u64, i32)>,
 }
 
 impl App {
@@ -91,11 +141,17 @@ impl App {
             engine,
             view: View::Split,
             pending: Vec::new(),
+            pending_ttl: Vec::new(),
+            ttl: TtlOverlay::default(),
             pending_nch: 0,
             disp_counter: 0,
             trace_reset: true,
             last_trace_cfg: None,
             chinfo_key: None,
+            sweeps: Sweeps::default(),
+            last_chinfo: None,
+            car_window: false,
+            sweep_key: None,
             colors_dirty: true,
             trace_colors: None,
             spike_colors: None,
@@ -115,6 +171,10 @@ impl App {
             toast: None,
             dirty_cfg: Instant::now(),
             autostart,
+            was_acquiring: false,
+            ttl_out_word: 0,
+            dac_sent: [None; 8],
+            outputs_sent: None,
         }
     }
 
@@ -144,6 +204,7 @@ impl App {
         let window = (self.cfg.display.window_s as f64 * l.sample_rate).max(1.0) as usize;
         if nch != self.pending_nch {
             self.pending.clear();
+            self.pending_ttl.clear();
             self.pending_nch = nch;
             self.trace_reset = true;
         }
@@ -154,6 +215,12 @@ impl App {
                     continue;
                 }
                 self.pending.extend_from_slice(&b.data);
+                let n = b.data.len() / nch.max(1);
+                if b.ttl.len() == n {
+                    self.pending_ttl.extend_from_slice(&b.ttl);
+                } else {
+                    self.pending_ttl.resize(self.pending_ttl.len() + n, 0);
+                }
                 newest = b.acquired_at.or(newest);
             }
         }
@@ -163,6 +230,9 @@ impl App {
             let drop = self.pending.len() - max;
             let drop = drop - drop % nch;
             self.pending.drain(..drop);
+            self.pending_ttl.drain(..(drop / nch).min(self.pending_ttl.len()));
+            // Trimmed samples never reach the GPU ring: waiting triggers can't be cut.
+            self.sweeps.drop_pending();
             self.disp_counter += (drop / nch) as u64;
         }
         if let Some(t) = newest {
@@ -199,14 +269,18 @@ impl App {
         }
     }
 
-    fn channel_colors(&self, l: &StreamLayout) -> Vec<[f32; 4]> {
+    /// `per_row` > 1: electrodes sharing a row get distinct colours by position in the group.
+    fn channel_colors(&self, l: &StreamLayout, per_row: usize) -> Vec<[f32; 4]> {
         let mon = self.engine.audio_settings.lock().channels.clone();
         l.channels
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                if mon.contains(&i) {
-                    MONITOR_COLOR
+                if let Some(k) = mon.iter().position(|&m| m == i) {
+                    monitor_color(k, mon.len())
+                } else if per_row > 1 && c.kind == ChannelKind::Electrode {
+                    let p = GROUP_PALETTE[i % per_row];
+                    [p[0], p[1], p[2], 0.9]
                 } else {
                     let p = PALETTE[c.headstage.unwrap_or(7) % PALETTE.len()];
                     let a = if c.kind == ChannelKind::Electrode { 0.95 } else { 0.7 };
@@ -318,6 +392,9 @@ impl App {
         self.spike_reset = true;
         self.colors_dirty = true;
         self.pending.clear();
+        self.pending_ttl.clear();
+        self.ttl.reset();
+        self.sweeps.clear();
         self.disp_counter = 0;
         self.spike_new.clear();
     }
@@ -325,6 +402,7 @@ impl App {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             self.board_section(ui);
+            self.outputs_section(ui);
             self.display_section(ui);
             self.spike_section(ui);
             self.audio_section(ui);
@@ -453,6 +531,191 @@ impl App {
         });
     }
 
+    /// DAC/TTL outputs. All live: sent while acquiring, and again at every acquisition start
+    /// (`sync_outputs`). Writes only the board's DAC-select/threshold, HPF, DAC-control
+    /// (noise slicer), MODE (TTL-out mode) registers and the TTL-out device.
+    fn outputs_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(RichText::new("Outputs (DAC / TTL)").strong()).default_open(false).show(ui, |ui| {
+            let acquiring = self.engine.is_acquiring();
+            let names: Vec<String> = self.layout().map(|l| l.channels.iter().filter(|c| c.kind == ChannelKind::Electrode).map(|c| c.name.clone()).collect()).unwrap_or_default();
+            let audio_first = self.engine.audio_settings.lock().channels.first().copied();
+            let o = &mut self.cfg.outputs;
+            let old = o.clone();
+            ui.small("Applied live while acquiring and re-sent at every start.");
+            ui.checkbox(&mut o.dac1_follows_audio, "DAC 1 follows audio monitor").on_hover_text("DAC 1 (board audio L) plays the first channel on the audio monitor");
+            egui::Grid::new("dacs").num_columns(3).spacing([6.0, 3.0]).show(ui, |ui| {
+                for d in 0..8 {
+                    ui.label(format!("DAC {}{}", d + 1, match d {
+                        0 => " L",
+                        1 => " R",
+                        _ => "",
+                    }))
+                    .on_hover_text(if d < 2 { "Also the board's audio output (noise slicer applies)" } else { "Analog output" });
+                    let follow = d == 0 && o.dac1_follows_audio;
+                    let cur = if follow { audio_first } else { o.dacs[d].electrode };
+                    let text = match cur {
+                        Some(e) => names.get(e).cloned().unwrap_or_else(|| format!("#{}", e + 1)),
+                        None => "off".into(),
+                    };
+                    ui.add_enabled_ui(!follow, |ui| {
+                        egui::ComboBox::from_id_salt(("dac", d)).width(64.0).selected_text(if follow { format!("♪ {text}") } else { text }).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut o.dacs[d].electrode, None, "off");
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut o.dacs[d].electrode, Some(i), n);
+                            }
+                        });
+                    });
+                    ui.add(egui::DragValue::new(&mut o.dacs[d].threshold_uv).range(-5000.0..=5000.0).speed(1.0).suffix(" µV"))
+                        .on_hover_text("Comparator threshold: ≥ 0 fires at or above it, < 0 at or below it. Drives TTL out n in threshold mode.");
+                    ui.end_row();
+                }
+            });
+            ui.checkbox(&mut o.ttl_threshold_mode, "Threshold → TTL out").on_hover_text("TTL out n goes high while DAC n crosses its threshold (stock \"DAC TTL\")");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut o.dac_hpf_enabled, "DAC high-pass");
+                ui.add_enabled(o.dac_hpf_enabled, egui::DragValue::new(&mut o.dac_hpf_hz).range(1.0..=5000.0).speed(5.0).suffix(" Hz"));
+            });
+            ui.add(egui::Slider::new(&mut o.noise_slicer, 0..=127).text("noise slicer (DAC L/R)"));
+            ui.horizontal(|ui| {
+                ui.label("TTL out");
+                let manual = acquiring && !o.ttl_threshold_mode;
+                for i in 0..8 {
+                    let on = self.ttl_out_word & (1 << i) != 0;
+                    let b = egui::Button::new(RichText::new(format!("{}", i + 1)).monospace()).selected(on).min_size(egui::vec2(18.0, 0.0));
+                    if ui.add_enabled(manual, b).on_hover_text("Toggle TTL output line").clicked() {
+                        self.ttl_out_word ^= 1 << i;
+                        self.engine.send_live(LiveCommand::SetTtlOut(self.ttl_out_word));
+                    }
+                }
+            });
+            if o.ttl_threshold_mode {
+                ui.weak("TTL out follows the DAC comparators (manual off)");
+            } else if !acquiring {
+                ui.weak("Manual TTL out needs acquisition running");
+            }
+            if *o != old {
+                self.dirty_cfg = Instant::now();
+            }
+        });
+    }
+
+    /// Floating palette choosing the display CAR's reference and subtract sets.
+    fn car_palette(&mut self, ctx: &egui::Context) {
+        if !self.car_window {
+            return;
+        }
+        let Some(l) = self.layout() else { return };
+        // Electrodes grouped by headstage.
+        let groups: Vec<(String, Vec<(usize, String)>)> = l
+            .headstages
+            .iter()
+            .enumerate()
+            .map(|(hi, h)| {
+                let chans = l.channels.iter().enumerate().filter(|(_, c)| c.kind == ChannelKind::Electrode && c.headstage == Some(hi)).map(|(i, c)| (i, c.name.clone())).collect();
+                (format!("{} {}", h.name, h.chip), chans)
+            })
+            .collect();
+        let mut open = true;
+        let mut changed = false;
+        let car = &mut self.cfg.display.car;
+        egui::Window::new("Common average reference").open(&mut open).resizable(false).collapsible(false).default_width(460.0).show(ctx, |ui| {
+            ui.small("Recordings always keep the original signals.");
+            ui.horizontal(|ui| {
+                ui.label("Apply to");
+                changed |= ui.checkbox(&mut car.enabled, "display (300–6k)").changed();
+                changed |= ui.checkbox(&mut car.spikes, "spike detection").changed();
+                changed |= ui.checkbox(&mut car.audio, "audio").changed();
+            });
+            ui.weak(format!("reference {} · subtract {}", car.reference.len(), car.subtract.len()));
+            let sections = [("Reference (averaged)", &mut car.reference), ("Subtract from", &mut car.subtract)];
+            let mut copy_ref = false;
+            for (title, set) in sections {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong(title);
+                    if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
+                        copy_ref = true;
+                    }
+                });
+                for (gname, chans) in &groups {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(gname).small());
+                        if ui.small_button("All").clicked() {
+                            set.extend(chans.iter().map(|(i, _)| *i).filter(|i| !set.contains(i)).collect::<Vec<_>>());
+                            changed = true;
+                        }
+                        if ui.small_button("None").clicked() {
+                            set.retain(|x| !chans.iter().any(|(i, _)| i == x));
+                            changed = true;
+                        }
+                    });
+                    egui::Grid::new((title, gname.as_str())).spacing([2.0, 2.0]).show(ui, |ui| {
+                        for (n, (i, name)) in chans.iter().enumerate() {
+                            let on = set.contains(i);
+                            let b = egui::Button::new(RichText::new(name.trim_start_matches("CH")).monospace().size(11.0)).selected(on).min_size(egui::vec2(26.0, 0.0));
+                            if ui.add(b).on_hover_text(name.as_str()).clicked() {
+                                if on {
+                                    set.retain(|x| x != i);
+                                } else {
+                                    set.push(*i);
+                                }
+                                changed = true;
+                            }
+                            if n % 16 == 15 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                }
+            }
+            if copy_ref {
+                car.subtract = car.reference.clone();
+                changed = true;
+            }
+        });
+        if changed {
+            car.reference.sort_unstable();
+            car.subtract.sort_unstable();
+            self.dirty_cfg = Instant::now();
+        }
+        if !open {
+            self.car_window = false;
+        }
+    }
+
+    /// Send DAC routes and board-level output settings that differ from what the board last
+    /// got; `force` re-sends everything (acquisition start).
+    fn sync_outputs(&mut self, force: bool) {
+        if !self.engine.is_acquiring() {
+            return;
+        }
+        let nel = self.electrode_rows();
+        let o: OutputSettings = self.cfg.outputs.clone();
+        let audio_first = self.engine.audio_settings.lock().channels.first().copied();
+        for d in 0..8 {
+            let e = if d == 0 && o.dac1_follows_audio { audio_first } else { o.dacs[d].electrode };
+            let want = (e.filter(|&e| e < nel), o.dacs[d].threshold_uv);
+            if force || self.dac_sent[d] != Some(want) {
+                self.engine.send_live(LiveCommand::DacRoute { dac: d, electrode: want.0, threshold_uv: want.1 });
+                self.dac_sent[d] = Some(want);
+            }
+        }
+        let want = (o.ttl_threshold_mode, o.dac_hpf_enabled, o.dac_hpf_hz.to_bits(), o.noise_slicer);
+        if force || self.outputs_sent != Some(want) {
+            self.engine.send_live(LiveCommand::SetTtlMode(o.ttl_threshold_mode));
+            self.engine.send_live(LiveCommand::SetDacHpf { enabled: o.dac_hpf_enabled, hz: o.dac_hpf_hz });
+            self.engine.send_live(LiveCommand::SetNoiseSlicer(o.noise_slicer));
+            self.outputs_sent = Some(want);
+            // Mirror into the board settings so they never show up as "changed" (Apply).
+            for b in [&mut self.edit_board, &mut self.cfg.board] {
+                b.ttl_output_mode = o.ttl_threshold_mode;
+                b.dac_hpf_enabled = o.dac_hpf_enabled;
+                b.dac_hpf_hz = o.dac_hpf_hz;
+                b.noise_slicer = o.noise_slicer;
+            }
+        }
+    }
+
     fn display_section(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(RichText::new("Display").strong()).default_open(true).show(ui, |ui| {
             let d = &mut self.cfg.display;
@@ -463,11 +726,60 @@ impl App {
                 ui.selectable_value(&mut d.filter, ViewFilter::Spikes, "300–6k");
                 ui.selectable_value(&mut d.filter, ViewFilter::Lfp, "LFP");
             });
+            ui.horizontal(|ui| {
+                ui.label("CAR").on_hover_text("Common average reference. Recordings always keep the original signals.");
+                ui.checkbox(&mut d.car.enabled, "display").on_hover_text("In the 300–6k view only");
+                ui.checkbox(&mut d.car.spikes, "spikes");
+                ui.checkbox(&mut d.car.audio, "audio");
+                if ui.small_button("Channels…").clicked() {
+                    self.car_window = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak(format!("CAR ref {} · sub {}", d.car.reference.len(), d.car.subtract.len()));
+                if d.car.enabled && d.filter != ViewFilter::Spikes {
+                    ui.weak("(display: 300–6k only)");
+                }
+            });
             ui.add(egui::Slider::new(&mut d.window_s, 0.05..=20.0).logarithmic(true).text("time window (s)"));
             ui.add(egui::Slider::new(&mut d.uv_per_row, 10.0..=5000.0).logarithmic(true).text("µV per row"));
-            // Rows cover every channel: electrodes first, then AUX and ADC.
-            let (nrows_all, has_adc) = self.engine.layout().map(|l| (l.num_channels(), l.channels.iter().any(|c| c.kind == ChannelKind::Adc))).unwrap_or((0, false));
+            // Rows cover every channel: electrodes first (`per_row` to a row), then AUX and ADC.
+            let k = d.per_row.clamp(1, 8) as usize;
+            let (nrows_all, has_adc, nlines) = self
+                .engine
+                .layout()
+                .map(|l| (l.num_electrodes().div_ceil(k) + l.num_channels() - l.num_electrodes(), l.channels.iter().any(|c| c.kind == ChannelKind::Adc), l.ttl_lines))
+                .unwrap_or((0, false, 8));
             let nrows_all = nrows_all.max(1);
+            ui.horizontal(|ui| {
+                ui.label("Sweep");
+                ui.selectable_value(&mut d.triggered, false, "Free");
+                ui.selectable_value(&mut d.triggered, true, "Triggered").on_hover_text("Each sweep starts at a TTL rising edge; recent sweeps are overlaid (opto-tagging)");
+            });
+            if d.triggered {
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("trigline").width(56.0).selected_text(format!("TTL{}", d.trig_line + 1)).show_ui(ui, |ui| {
+                        for i in 0..nlines.max(1) {
+                            ui.selectable_value(&mut d.trig_line, i, format!("TTL{}", i + 1));
+                        }
+                    });
+                    ui.label("rising");
+                    ui.add(egui::DragValue::new(&mut d.trig_pre_ms).range(0.0..=200.0).speed(0.5).prefix("−").suffix(" ms"));
+                    ui.add(egui::DragValue::new(&mut d.trig_post_ms).range(1.0..=250.0).speed(0.5).prefix("+").suffix(" ms"));
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut d.trig_sweeps, 1..=50).text("sweeps"));
+                    if ui.small_button("Clear").clicked() {
+                        self.sweeps.clear();
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Channels per row");
+                for n in [1u32, 2, 4, 8] {
+                    ui.selectable_value(&mut d.per_row, n, n.to_string());
+                }
+            });
             ui.add(egui::Slider::new(&mut d.rows, 1..=nrows_all).text("rows"));
             let maxfirst = nrows_all.saturating_sub(d.rows);
             d.first_row = d.first_row.min(maxfirst);
@@ -477,6 +789,7 @@ impl App {
                     .on_hover_text("ADC rows are centred on 0 V and never filtered. AUX rows span 2.5 V.");
             }
             ui.add(egui::Slider::new(&mut d.thickness, 1.0..=3.0).text("line px"));
+            ui.checkbox(&mut d.ttl_overlay, "TTL overlay").on_hover_text("Shade traces while a TTL input is high; one lane per line seen high since acquisition start");
             ui.horizontal(|ui| {
                 ui.label("View");
                 ui.selectable_value(&mut self.view, View::Split, "Split");
@@ -484,7 +797,7 @@ impl App {
                 ui.selectable_value(&mut self.view, View::Spikes, "Spikes");
             });
             ui.add(egui::Slider::new(&mut d.max_fps, 30.0..=360.0).text("max fps"));
-            ui.small("Click a channel label to monitor it on audio. Scroll over traces to move rows; Ctrl+scroll to scale.");
+            ui.small("Click a channel label or spike tile to monitor it on audio; Ctrl+click adds/removes it from the mix. Scroll over traces to move rows; Ctrl+scroll to scale.");
             if *d != old {
                 if d.window_s != old.window_s {
                     self.trace_reset = true;
@@ -495,7 +808,9 @@ impl App {
     }
 
     fn spike_section(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("Spike detection").strong()).default_open(true).show(ui, |ui| {
+        let car = self.cfg.display.car.spikes;
+        egui::CollapsingHeader::new(section_title(ui, "Spike detection", car)).id_salt("spike_section").default_open(true).show(ui, |ui| {
+            self.car_note(ui, car);
             let mut s = self.engine.dsp_settings.lock().clone();
             let old = s.clone();
             ui.checkbox(&mut s.detect, "Detect");
@@ -527,8 +842,25 @@ impl App {
         });
     }
 
+    /// Inside a section using the CAR: what it is applied with and where to change it.
+    fn car_note(&mut self, ui: &mut egui::Ui, on: bool) {
+        if !on {
+            return;
+        }
+        let c = &self.cfg.display.car;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("CAR applied · ref {} · sub {}", c.reference.len(), c.subtract.len())).small().color(CAR_COLOR))
+                .on_hover_text("Common average reference, switched on under Display. Recordings keep the original signals.");
+            if ui.small_button("Channels…").clicked() {
+                self.car_window = true;
+            }
+        });
+    }
+
     fn audio_section(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("Audio monitor").strong()).default_open(true).show(ui, |ui| {
+        let car = self.cfg.display.car.audio;
+        egui::CollapsingHeader::new(section_title(ui, "Audio monitor", car)).id_salt("audio_section").default_open(true).show(ui, |ui| {
+            self.car_note(ui, car);
             let mut a = self.engine.audio_settings.lock().clone();
             let old = a.clone();
             ui.horizontal(|ui| {
@@ -625,10 +957,24 @@ impl App {
         }
         let ppp = ui.ctx().pixels_per_point();
         let label_w = 64.0;
-        let plot = egui::Rect::from_min_max(egui::pos2(rect.min.x + label_w, rect.min.y), rect.max);
         let d = self.cfg.display.clone();
-        let rows = d.rows.clamp(1, nch);
-        let first = d.first_row.min(nch - rows);
+        let trig = d.triggered;
+        let fs = l.sample_rate;
+        // Order: electrodes first, then AUX/ADC. Rows: electrodes `k` per row (overlaid),
+        // analog channels one per row.
+        let k = d.per_row.clamp(1, 8) as usize;
+        let mut row_ch: Vec<u32> = (0..nch as u32).filter(|&i| l.channels[i as usize].kind == ChannelKind::Electrode).collect();
+        row_ch.extend((0..nch as u32).filter(|&i| l.channels[i as usize].kind != ChannelKind::Electrode));
+        let mut rowtab: Vec<[u32; 2]> = (0..nel).step_by(k).map(|s| [s as u32, k.min(nel - s) as u32]).collect();
+        rowtab.extend((nel..nch).map(|i| [i as u32, 1]));
+        let nrows_all = rowtab.len();
+        // Free-running: TTL lanes under the traces. Triggered: a time axis instead.
+        let ttl_lines = if d.ttl_overlay && !trig { self.ttl.active_lines(l.ttl_lines) } else { Vec::new() };
+        let strip_h = if trig { 14.0 } else if ttl_lines.is_empty() { 0.0 } else { 7.0 * ttl_lines.len() as f32 + 2.0 };
+        let plot = egui::Rect::from_min_max(egui::pos2(rect.min.x + label_w, rect.min.y), egui::pos2(rect.max.x, rect.max.y - strip_h));
+        let strip = egui::Rect::from_min_max(egui::pos2(plot.min.x, plot.max.y + 2.0), rect.max);
+        let rows = d.rows.clamp(1, nrows_all);
+        let first = d.first_row.min(nrows_all - rows);
         // Interaction: scroll rows / scale.
         let resp = ui.interact(rect, ui.scope_id().with("traces"), egui::Sense::click());
         if resp.hovered() {
@@ -638,105 +984,222 @@ impl App {
                     self.cfg.display.uv_per_row = (d.uv_per_row * (1.0 - scroll * 0.002)).clamp(10.0, 5000.0);
                 } else {
                     let step = (scroll / 20.0).round() as isize;
-                    self.cfg.display.first_row = (first as isize - step).clamp(0, (nch - rows) as isize) as usize;
+                    self.cfg.display.first_row = (first as isize - step).clamp(0, (nrows_all - rows) as isize) as usize;
                 }
                 self.dirty_cfg = Instant::now();
             }
         }
         let cols = (plot.width() * ppp).floor().max(1.0) as u32;
-        let window = (d.window_s as f64 * l.sample_rate).round().max(cols as f64) as u32;
+        let window = (d.window_s as f64 * fs).round().max(cols as f64) as u32;
         let sections: Vec<[f32; 5]> = match d.filter {
             ViewFilter::Raw => vec![],
-            ViewFilter::Spikes => BandSpec::SPIKES.sections(l.sample_rate),
-            ViewFilter::Lfp => BandSpec::LFP.sections(l.sample_rate),
+            ViewFilter::Spikes => BandSpec::SPIKES.sections(fs),
+            ViewFilter::Lfp => BandSpec::LFP.sections(fs),
         }
         .into_iter()
         .take(MAX_SECTIONS)
         .map(|b| [b.b0, b.b1, b.b2, b.a1, b.a2])
         .collect();
-        let config = TraceConfig { nch, cols, window, sections };
+        // Triggered window in samples; together they must fit well inside the GPU ring.
+        let pre = ((d.trig_pre_ms as f64 * 1e-3 * fs).round() as u32).min(RING / 4);
+        let post = ((d.trig_post_ms as f64 * 1e-3 * fs).round() as u32).clamp(1, RING / 4);
+        let span = pre + post;
+        let nslots = if trig { d.trig_sweeps.clamp(1, 50) } else { 0 };
+        let config = TraceConfig { nch, cols, window, sections, nslots };
         if self.last_trace_cfg.as_ref() != Some(&config) {
-            if self.last_trace_cfg.as_ref().is_some_and(|c| c.cols != config.cols || c.window != config.window || c.nch != config.nch) {
+            if self.last_trace_cfg.as_ref().is_some_and(|c| c.cols != config.cols || c.window != config.window || c.nch != config.nch || c.nslots != config.nslots) {
                 self.trace_reset = true;
             }
             self.last_trace_cfg = Some(config.clone());
         }
+        // Old sweeps are meaningless after a change of window, line, filter or geometry.
+        let sweep_key = (pre, post, d.trig_line, nslots, d.filter, cols);
+        if self.trace_reset || self.sweep_key != Some(sweep_key) {
+            self.sweeps.clear();
+            self.sweep_key = Some(sweep_key);
+        }
         let n_new = (self.pending.len() / nch.max(1)) as u32;
-        let pos0 = (self.disp_counter % window as u64) as u32;
+        let start = self.disp_counter;
+        let pos0 = (start % window as u64) as u32;
         self.disp_counter += n_new as u64;
+        // Fold TTL words into columns with the shader's mapping (a size/window change
+        // clears columns, like the GPU state), and find trigger edges.
+        if self.trace_reset {
+            self.ttl.clear_cols();
+        }
+        let words = std::mem::take(&mut self.pending_ttl);
+        let words = &words[..(n_new as usize).min(words.len())];
+        self.ttl.ingest(words, pos0, window, cols);
+        let sweep = if trig {
+            self.sweeps.scan(words, start, d.trig_line);
+            let cuts = self.sweeps.take_ready(self.disp_counter, pre, post, nslots, RING, MAX_CUTS);
+            SweepFrame { ring0: (start % RING as u64) as u32, span, cuts, newest: self.sweeps.newest_slot(nslots), filled: self.sweeps.filled(nslots) }
+        } else {
+            SweepFrame::default()
+        };
         let cursor_pos = (self.disp_counter % window as u64) as f64;
         let cursor_col = ((cursor_pos * cols as f64 / window as f64) as u32).min(cols - 1);
         let upload = Arc::new(std::mem::take(&mut self.pending));
         let row_h_px = plot.height() * ppp / rows as f32;
-        // Row -> channel: electrodes first, then AUX/ADC. Labels use the same mapping.
-        let mut row_ch: Vec<u32> = (0..nch as u32).filter(|&i| l.channels[i as usize].kind == ChannelKind::Electrode).collect();
-        row_ch.extend((0..nch as u32).filter(|&i| l.channels[i as usize].kind != ChannelKind::Electrode));
         // Per-channel scaling (see traces.wgsl): electrodes follow the global µV/row and the
         // display filter; AUX/ADC are drawn raw in volts on their own row range.
-        let chinfo_key = (nch, d.adc_v_per_row.to_bits());
-        let chinfo = (self.trace_reset || self.chinfo_key != Some(chinfo_key)).then(|| {
-            self.chinfo_key = Some(chinfo_key);
-            Arc::new(
-                l.channels
-                    .iter()
-                    .map(|c| match c.kind {
-                        ChannelKind::Electrode => [c.bit_volts, 1.0, 0.0, 0.0],
-                        ChannelKind::Aux => [c.bit_volts, 0.0, 2.5, 0.0],
-                        ChannelKind::Adc => [c.bit_volts, 0.0, d.adc_v_per_row, 0.0],
-                    })
-                    .collect::<Vec<_>>(),
-            )
+        // Flags: bit 0 display filter, bit 1 CAR reference, bit 2 CAR subtract (electrodes).
+        let car_on = d.car.enabled && d.filter == ViewFilter::Spikes;
+        let in_set = |set: &[usize], ch: usize| set.contains(&ch);
+        let info: Vec<[f32; 4]> = l
+            .channels
+            .iter()
+            .enumerate()
+            .map(|(i, c)| match c.kind {
+                ChannelKind::Electrode => [c.bit_volts, (1 + 2 * in_set(&d.car.reference, i) as u32 + 4 * in_set(&d.car.subtract, i) as u32) as f32, 0.0, 0.0],
+                ChannelKind::Aux => [c.bit_volts, 0.0, 2.5, 0.0],
+                ChannelKind::Adc => [c.bit_volts, 0.0, d.adc_v_per_row, 0.0],
+            })
+            .collect();
+        let chinfo_key = (nch, d.adc_v_per_row.to_bits(), k);
+        let send_tables = self.trace_reset || self.chinfo_key != Some(chinfo_key);
+        let chinfo = (send_tables || self.last_chinfo.as_ref() != Some(&info)).then(|| {
+            self.last_chinfo = Some(info.clone());
+            Arc::new(info)
         });
-        let order = self.trace_reset.then(|| Arc::new(row_ch.clone()));
-        let colors = if self.trace_reset { Some(Arc::new(self.channel_colors(&l))) } else { self.trace_colors.take() };
-        let frame = TraceFrame { config, reset: std::mem::take(&mut self.trace_reset), upload, n_new, pos0, cursor_col, first_row: first as u32, nrows: rows as u32, uv_per_row: d.uv_per_row, row_h_px, thickness_px: d.thickness * ppp.max(1.0), colors, order, chinfo };
+        if self.chinfo_key.is_some_and(|c| c.2 != k) {
+            self.colors_dirty = true;
+        }
+        self.chinfo_key = Some(chinfo_key);
+        let order = send_tables.then(|| Arc::new(row_ch.clone()));
+        let rowtab_gpu = send_tables.then(|| Arc::new(rowtab.clone()));
+        let colors = if self.trace_reset { Some(Arc::new(self.channel_colors(&l, k))) } else { self.trace_colors.take() };
+        let frame = TraceFrame {
+            config,
+            reset: std::mem::take(&mut self.trace_reset),
+            upload,
+            n_new,
+            pos0,
+            cursor_col,
+            first_row: first as u32,
+            nrows: rows as u32,
+            kmax: k as u32,
+            uv_per_row: d.uv_per_row,
+            row_h_px,
+            thickness_px: d.thickness * ppp.max(1.0),
+            colors,
+            order,
+            chinfo,
+            rowtab: rowtab_gpu,
+            sweep,
+            car: car_on,
+        };
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(frame)));
-        // Overlay: labels, separators, cursor time.
         let p = ui.painter_at(rect);
+        let span_ms = d.trig_pre_ms + d.trig_post_ms;
+        let t_to_x = |t_ms: f32| plot.min.x + (t_ms + d.trig_pre_ms) / span_ms.max(1e-3) * plot.width();
+        if trig {
+            // Laser-on shading under the traces: newest sweep's TTL high time.
+            if self.sweeps.count() > 0 {
+                let w_ms = self.sweeps.newest_width().map(|w| w as f32 * 1e3 / fs as f32).unwrap_or(d.trig_post_ms).min(d.trig_post_ms);
+                let c = crate::ttl::line_color(d.trig_line);
+                p.rect_filled(egui::Rect::from_min_max(egui::pos2(t_to_x(0.0), plot.min.y), egui::pos2(t_to_x(w_ms).max(t_to_x(0.0) + 1.0), plot.max.y)), 0.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 34));
+            }
+        }
+        ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(frame)));
+        // Overlay: labels, separators, cursor / time axis.
         let rh = plot.height() / rows as f32;
         let mon = self.engine.audio_settings.lock().channels.clone();
         let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
-        let mut toggle = None;
+        let mut toggle: Option<Vec<usize>> = None;
         let mut analog_visible = false;
         for r in 0..rows {
-            let ch = row_ch[first + r] as usize;
+            let [s0, n] = rowtab[first + r];
+            let chans: Vec<usize> = (s0..s0 + n).map(|i| row_ch[i as usize] as usize).collect();
+            let ch = chans[0];
             let is_electrode = l.channels[ch].kind == ChannelKind::Electrode;
             analog_visible |= !is_electrode;
             let y = plot.min.y + (r as f32 + 0.5) * rh;
             let lab = egui::Rect::from_min_size(egui::pos2(rect.min.x, y - rh / 2.0), egui::vec2(label_w, rh));
-            let monitored = mon.contains(&ch);
+            let monitored = chans.iter().any(|c| mon.contains(c));
             if rh >= 9.0 {
-                let txt = format!("{}{}", l.channels[ch].name, if monitored { " ♪" } else { "" });
-                let col = if monitored { Color32::from_rgb(255, 240, 90) } else { Color32::from_gray(150) };
+                let name = if chans.len() == 1 { l.channels[ch].name.clone() } else { format!("{}–{}", l.channels[ch].name, l.channels[*chans.last().unwrap()].name.trim_start_matches("CH")) };
+                let txt = format!("{name}{}", if monitored { " ♪" } else { "" });
+                let col = chans.iter().find_map(|&c| monitor_color32(&mon, c)).unwrap_or(Color32::from_gray(150));
                 p.text(egui::pos2(rect.min.x + 4.0, y), egui::Align2::LEFT_CENTER, txt, egui::FontId::monospace((rh * 0.6).clamp(8.0, 13.0)), col);
             }
-            // Audio monitors electrodes only.
+            // Audio monitors electrodes only; a grouped row monitors the whole group.
             if let Some(pos) = click
                 && is_electrode
                 && lab.contains(pos)
             {
-                toggle = Some(ch);
+                toggle = Some(chans);
             }
         }
-        if let Some(ch) = toggle {
-            let mut a = self.engine.audio_settings.lock();
-            if ui.input(|i| i.modifiers.shift) {
+        if let Some(chs) = toggle {
+            self.monitor_click(ui, chs);
+        }
+        let dim = Color32::from_gray(120);
+        if trig {
+            // t = 0 line and a time axis in ms.
+            let x0 = t_to_x(0.0);
+            p.line_segment([egui::pos2(x0, plot.min.y), egui::pos2(x0, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)));
+            let step = [1.0f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0].into_iter().find(|s| span_ms / s <= 12.0).unwrap_or(500.0);
+            let mut t = -(d.trig_pre_ms / step).floor() * step;
+            while t <= d.trig_post_ms + 1e-3 {
+                let x = t_to_x(t);
+                p.line_segment([egui::pos2(x, plot.max.y), egui::pos2(x, plot.max.y + 4.0)], Stroke::new(1.0, dim));
+                p.text(egui::pos2(x, rect.max.y - 1.0), egui::Align2::CENTER_BOTTOM, format!("{t:.0}"), egui::FontId::monospace(10.0), dim);
+                t += step;
+            }
+            p.text(egui::pos2(rect.min.x + 4.0, rect.max.y - 1.0), egui::Align2::LEFT_BOTTOM, "ms", egui::FontId::monospace(10.0), dim);
+            let waiting = if self.sweeps.count() == 0 { format!(" · waiting for TTL{}", d.trig_line + 1) } else { String::new() };
+            p.text(
+                egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("TTL{} ↑ · {} / {} sweeps · {:.0} µV/row{}{}", d.trig_line + 1, self.sweeps.filled(nslots), nslots, d.uv_per_row, if car_on { " · CAR" } else { "" }, waiting),
+                egui::FontId::monospace(11.0),
+                dim,
+            );
+        } else {
+            self.ttl.draw(&p, &TtlGeom { plot, strip, label_x: rect.min.x + 4.0, ppp, cursor: cursor_col }, &ttl_lines);
+            let x = plot.min.x + cursor_col as f32 / ppp;
+            p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)));
+            p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, format!("{:.2} s · {:.0} µV/row{}{}", d.window_s, d.uv_per_row, if car_on { " · CAR" } else { "" }, if analog_visible { format!(" · ADC {:.2} V/row · AUX 2.5 V/row", d.adc_v_per_row) } else { String::new() }), egui::FontId::monospace(11.0), dim);
+        }
+    }
+
+    /// Push the CAR sets to spike detection and the audio monitor when switched on there.
+    fn sync_car(&mut self) {
+        let c = &self.cfg.display.car;
+        let want = |on: bool| on.then(|| Arc::new(engine::dsp::Car { reference: c.reference.clone(), subtract: c.subtract.clone() }));
+        let (spk, aud) = (want(c.spikes), want(c.audio));
+        {
+            let mut s = self.engine.dsp_settings.lock();
+            if s.car != spk {
+                s.car = spk;
+            }
+        }
+        let mut a = self.engine.audio_settings.lock();
+        if a.car != aud {
+            a.car = aud;
+        }
+    }
+
+    /// Click on a channel (trace label or spike tile): monitor just these channels. With
+    /// Ctrl (or Shift) held, toggle them in/out of the monitored set instead (up to 8).
+    fn monitor_click(&mut self, ui: &egui::Ui, chs: Vec<usize>) {
+        let add = ui.input(|i| i.modifiers.command || i.modifiers.shift);
+        let mut a = self.engine.audio_settings.lock();
+        if add {
+            for ch in chs {
                 if let Some(i) = a.channels.iter().position(|&c| c == ch) {
                     a.channels.remove(i);
                 } else if a.channels.len() < 8 {
                     a.channels.push(ch);
                 }
-            } else {
-                a.channels = vec![ch];
             }
-            self.audio_text = channels_to_text(&a.channels);
-            self.colors_dirty = true;
-            self.engine.audio_stats.recalibrate.store(true, Ordering::Relaxed);
+        } else {
+            a.channels = chs.into_iter().take(8).collect();
         }
-        let x = plot.min.x + cursor_col as f32 / ppp;
-        p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)));
-        p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, if analog_visible { format!("{:.2} s · {:.0} µV/row · ADC {:.2} V/row · AUX 2.5 V/row", d.window_s, d.uv_per_row, d.adc_v_per_row) } else { format!("{:.2} s · {:.0} µV/row", d.window_s, d.uv_per_row) }, egui::FontId::monospace(11.0), Color32::from_gray(120));
+        self.audio_text = channels_to_text(&a.channels);
+        self.colors_dirty = true;
+        self.engine.audio_stats.recalibrate.store(true, Ordering::Relaxed);
     }
 
     fn spike_view(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -774,15 +1237,28 @@ impl App {
         };
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(10, 10, 12));
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, SpikeCallback(frame)));
+        let resp = ui.interact(rect, ui.scope_id().with("spike_tiles"), egui::Sense::click());
+        let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+        let mut clicked_ch = None;
+        let mon = self.engine.audio_settings.lock().channels.clone();
         let p = ui.painter_at(rect);
         let cs = self.engine.channel_stats.lock().clone();
         for i in 0..ncells {
             let ch = first + i;
             let o = rect.min + egui::vec2((i % gc) as f32 * cell_w, (i / gc) as f32 * cell_h);
             let cell = egui::Rect::from_min_size(o, egui::vec2(cell_w, cell_h));
-            p.rect_stroke(cell.shrink(1.0), 2.0, Stroke::new(1.0, Color32::from_gray(35)), egui::StrokeKind::Inside);
+            if click.is_some_and(|pos| cell.contains(pos)) {
+                clicked_ch = Some(ch);
+            }
+            let mc = monitor_color32(&mon, ch);
+            let monitored = mc.is_some();
+            let (border, label) = match mc {
+                Some(c) => (Stroke::new(1.5, c), c),
+                None => (Stroke::new(1.0, Color32::from_gray(35)), Color32::from_gray(160)),
+            };
+            p.rect_stroke(cell.shrink(1.0), 2.0, border, egui::StrokeKind::Inside);
             let rate = self.spike_times.get(ch).map(|q| q.len() as f32 / 2.0).unwrap_or(0.0);
-            p.text(o + egui::vec2(5.0, 3.0), egui::Align2::LEFT_TOP, format!("{}  {:.1} Hz", l.channels[ch].name, rate), egui::FontId::monospace(10.5), Color32::from_gray(160));
+            p.with_clip_rect(cell.shrink(1.0)).text(o + egui::vec2(5.0, 3.0), egui::Align2::LEFT_TOP, format!("{}{}  {:.1} Hz", l.channels[ch].name, if monitored { " ♪" } else { "" }, rate), egui::FontId::monospace(10.5), label);
             if let Some(&thr) = cs.threshold_uv.get(ch) {
                 let k = (cell_h * 0.5 - 4.0) / d.spike_uv_range;
                 let y = o.y + cell_h * 0.5 - thr * k;
@@ -790,9 +1266,12 @@ impl App {
                     p.line_segment([egui::pos2(o.x + 4.0, y), egui::pos2(o.x + cell_w - 4.0, y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(220, 80, 80, 90)));
                 }
                 if let Some(s) = cs.sigma_uv.get(ch) {
-                    p.text(o + egui::vec2(cell_w - 5.0, 3.0), egui::Align2::RIGHT_TOP, format!("σ {s:.1}"), egui::FontId::monospace(10.0), Color32::from_gray(110));
+                    p.text(o + egui::vec2(cell_w - 5.0, cell_h - 3.0), egui::Align2::RIGHT_BOTTOM, format!("σ {s:.1}"), egui::FontId::monospace(10.0), Color32::from_gray(110));
                 }
             }
+        }
+        if let Some(ch) = clicked_ch {
+            self.monitor_click(ui, vec![ch]);
         }
     }
 }
@@ -823,14 +1302,24 @@ impl eframe::App for App {
                 self.cfg.board = s;
             }
         }
+        // Outputs: everything on each acquisition start (the board resets TTL out to 0),
+        // then only changes (e.g. DAC 1 following a new audio channel).
+        let acquiring = self.engine.is_acquiring();
+        if acquiring && !self.was_acquiring {
+            self.ttl_out_word = 0;
+            self.sync_outputs(true);
+        } else {
+            self.sync_outputs(false);
+        }
+        self.was_acquiring = acquiring;
+        self.sync_car();
         self.drain();
         if self.colors_dirty
             && let Some(l) = self.layout()
         {
             self.colors_dirty = false;
-            let c = Arc::new(self.channel_colors(&l));
-            self.trace_colors = Some(c.clone());
-            self.spike_colors = Some(c);
+            self.trace_colors = Some(Arc::new(self.channel_colors(&l, self.cfg.display.per_row.clamp(1, 8) as usize)));
+            self.spike_colors = Some(Arc::new(self.channel_colors(&l, 1)));
         }
 
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
@@ -863,6 +1352,7 @@ impl eframe::App for App {
             ui.allocate_rect(full, egui::Sense::hover());
         });
 
+        self.car_palette(ui.ctx());
         if self.confirm_stop {
             egui::Modal::new(egui::Id::unique("confirm-stop")).show(ui.ctx(), |ui| {
                 ui.heading("Stop acquisition?");
