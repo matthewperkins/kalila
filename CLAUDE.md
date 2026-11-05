@@ -130,6 +130,25 @@ Committed per feature where the code separates; the GUI features share one commi
 - Simulator: a common-mode artefact burst (30 ms every 1.7 s) for testing CAR; on by
   default, `OERS_SIM_ARTEFACT=0` turns it off.
 
+## CPU comparison with the stock GUI (rig, 2026-11-05)
+
+`scripts/cpuload.py` (per process and thread, % of one core; the rig has 4 cores, no SMT).
+Same board, 32 channels, full screen, 60 s per condition; CSVs in `~/oers-test/cpu/`:
+
+| | stock 1.1 | oers |
+|---|---|---|
+| acquiring | 82 % (GUI thread 50) | 59 % (GUI thread 11) |
+| recording | 178 %, one core pinned at 100 % | 53 % |
+| recording + both cameras, system | 60 % of 4 cores | 26 % of 4 cores |
+
+- The stock "Record Thread" busy-polls (`perf`: `DataQueue::startRead`,
+  `AbstractFifo::getNumReady`), holding one core for as long as it records.
+- Both cameras together (`~/gst-record-scripts/cam_record`) take about 16 % of a core plus
+  NVENC (12 %). No camera frames were dropped with either program.
+- oers's acquisition + FTDI driver threads (30–40 %) cost more than stock's (~30 %).
+  Unconfirmed guess: smaller USB reads. A possible trim if headroom ever matters.
+- The FTDI driver's threads show up as "board-open" (they inherit that thread's name).
+
 ## Rig test plan
 
 1. Close the stock Open Ephys GUI (only one program can open the board).
