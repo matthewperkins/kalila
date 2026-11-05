@@ -268,6 +268,7 @@ impl Engine {
                     r.settings.dac_hpf_hz = *hz;
                 }
                 LiveCommand::SetNoiseSlicer(n) => r.settings.noise_slicer = *n,
+                LiveCommand::SetTtlMode(on) => r.settings.ttl_output_mode = *on,
                 LiveCommand::SetTtlOut(_) | LiveCommand::DacRoute { .. } => {}
             }
         }

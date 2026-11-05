@@ -238,6 +238,9 @@ pub enum LiveCommand {
     SetLeds(bool),
     SetDacHpf { enabled: bool, hz: f64 },
     SetNoiseSlicer(i32),
+    /// TTL outputs 1–8 driven by the DAC threshold comparators (stock "DAC TTL") instead of
+    /// software. Rhythm MODE register, TTL-out-mode bit.
+    SetTtlMode(bool),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

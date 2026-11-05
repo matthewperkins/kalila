@@ -1120,6 +1120,10 @@ impl Board for OniBoard {
                 self.settings.noise_slicer = n;
                 self.set_audio_noise_suppress(n)?;
             }
+            LiveCommand::SetTtlMode(on) => {
+                self.settings.ttl_output_mode = on;
+                self.set_ttl_mode(on as u32)?;
+            }
         }
         Ok(())
     }
