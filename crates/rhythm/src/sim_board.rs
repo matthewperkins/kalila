@@ -50,6 +50,8 @@ pub struct SimBoard {
     /// Active spike waveforms: (channel, unit, position, gain).
     active: Vec<(usize, usize, usize, f32)>,
     lfp_state: Vec<f64>,
+    /// Inject the common-mode CAR test artefact (on unless `OERS_SIM_ARTEFACT=0`).
+    artefact: bool,
     sample: i64,
     t0: Option<Instant>,
     health: Option<SharedHealth>,
@@ -80,6 +82,7 @@ impl SimBoard {
             units: Vec::new(),
             active: Vec::new(),
             lfp_state: Vec::new(),
+            artefact: std::env::var("OERS_SIM_ARTEFACT").map_or(true, |v| v != "0"),
             sample: 0,
             t0: None,
             health: None,
@@ -150,12 +153,15 @@ impl SimBoard {
         }
         let theta = (2.0 * PI * 7.0 * t).sin();
         let hum = (2.0 * PI * 50.0 * t).sin();
+        // Optional common-mode broadband artefact (motion/EMG-like) for testing the CAR:
+        // 30 ms every 1.7 s, identical on every channel. On by default; OERS_SIM_ARTEFACT=0 turns it off.
+        let artefact = if self.artefact && t % 1.7 < 0.03 { 40.0 * self.rng.gauss() } else { 0.0 };
         let start = blk.data.len();
         for ch in 0..ne {
             // 1/f-ish LFP: leaky integrated noise + shared theta.
             let s = &mut self.lfp_state[ch];
             *s = *s * 0.9995 + self.rng.gauss() * 1.5;
-            let v = 8.0 * self.rng.gauss() + *s + 60.0 * theta + 4.0 * hum;
+            let v = 8.0 * self.rng.gauss() + *s + 60.0 * theta + 4.0 * hum + artefact;
             blk.data.push((v / ELECTRODE_UV_PER_BIT as f64) as i16);
         }
         let mut i = 0;
