@@ -77,6 +77,10 @@ struct Running {
     acq: JoinHandle<(Box<dyn Board>, Result<()>)>,
     workers: Vec<JoinHandle<()>>,
     started: Instant,
+    /// The board's settings while it is owned by the acquisition thread (kept in step with
+    /// live commands), so `board_settings()` still answers during acquisition.
+    settings: BoardSettings,
+    rates: Vec<u32>,
 }
 
 pub struct Engine {
@@ -229,10 +233,10 @@ impl Engine {
         self.board.is_some() || self.running.is_some()
     }
     pub fn board_settings(&self) -> Option<BoardSettings> {
-        self.board.as_ref().map(|b| b.settings().clone())
+        self.board.as_ref().map(|b| b.settings().clone()).or_else(|| self.running.as_ref().map(|r| r.settings.clone()))
     }
     pub fn available_sample_rates(&self) -> Vec<u32> {
-        self.board.as_ref().map(|b| b.available_sample_rates()).unwrap_or_default()
+        self.board.as_ref().map(|b| b.available_sample_rates()).or_else(|| self.running.as_ref().map(|r| r.rates.clone())).unwrap_or_default()
     }
     pub fn layout(&self) -> Option<&StreamLayout> {
         self.layout.as_ref()
@@ -255,7 +259,18 @@ impl Engine {
     pub fn spike_rx(&self) -> Option<&Receiver<Spike>> {
         self.spike_rx.as_ref()
     }
-    pub fn send_live(&self, c: LiveCommand) {
+    pub fn send_live(&mut self, c: LiveCommand) {
+        if let Some(r) = &mut self.running {
+            match &c {
+                LiveCommand::SetLeds(on) => r.settings.leds = *on,
+                LiveCommand::SetDacHpf { enabled, hz } => {
+                    r.settings.dac_hpf_enabled = *enabled;
+                    r.settings.dac_hpf_hz = *hz;
+                }
+                LiveCommand::SetNoiseSlicer(n) => r.settings.noise_slicer = *n,
+                LiveCommand::SetTtlOut(_) | LiveCommand::DacRoute { .. } => {}
+            }
+        }
         if let Some(tx) = &self.live_tx {
             let _ = tx.send(c);
         }
@@ -271,6 +286,8 @@ impl Engine {
         }
         let Some(mut board) = self.board.take() else { bail!("no board open") };
         let layout = board.layout();
+        let settings = board.settings().clone();
+        let rates = board.available_sample_rates();
         if let Err(e) = board.start(self.health.clone()) {
             self.board = Some(board);
             return Err(e);
@@ -358,7 +375,7 @@ impl Engine {
         self.live_tx = Some(live_tx);
         self.display_rx = Some(disp_rx);
         self.spike_rx = Some(spk_rx);
-        self.running = Some(Running { stop, acq, workers, started: Instant::now() });
+        self.running = Some(Running { stop, acq, workers, started: Instant::now(), settings, rates });
         info!("acquisition running: {nch} channels @ {fs} Hz, {block_samples} samples/block");
         Ok(())
     }

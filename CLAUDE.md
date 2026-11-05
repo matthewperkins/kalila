@@ -52,8 +52,19 @@ Open Ephys Binary format, for compatibility with existing analysis tools
 - Workspace builds; 19 tests pass. Clippy shows 4 lints that predate today's work
   (`dsp.rs`, `parser.rs` tests, `traces.rs`); the rig's Rust 1.95 flags them, the dev box's
   older toolchain didn't.
-- GUI verified on the simulator: 0 lost blocks, audio ≈ 7 ms, display ≈ 0.5 ms. Not yet
-  run on hardware.
+- GUI verified on the simulator: 0 lost blocks, audio ≈ 7 ms, display ≈ 0.5 ms.
+- **GUI runs on hardware** (Vulkan on the RTX 2000 Ada); its recordings are valid.
+  - Board settings can be applied while acquiring: Apply stops, applies and restarts
+    (`App::autostart`), and is locked while recording. LEDs switch live. While acquiring,
+    the engine keeps a snapshot of the board settings (`Running::settings`), because the
+    board itself is owned by the acquisition thread.
+  - On the rig: applying 16-ch A1 mid-acquisition restarted it at 32 channels.
+  - The trace display scales per channel (`chinfo` in `traces.wgsl`). Electrodes use µV/row
+    and the display filter; AUX (2.5 V/row) and ADC (adjustable V/row, centred on 0 V) are
+    drawn raw and never filtered, after the electrodes in the row order. Only checked on the
+    simulator so far; not yet viewed with ADC on the board.
+  - Display and spike-detection settings never affect recordings: the recorder takes the
+    raw blocks from the acquisition thread.
 - **First real-board runs passed (rig, 2026-11-05).** Init, port scan and cable delay
   (`crates/rhythm/src/oni_board.rs`) worked first time. 600 s soak with recording:
   `dropped=0 gaps=0 bad=0`, `hwbuf` 0.0 %, recorder stall 5 ms in total, 18,000,096

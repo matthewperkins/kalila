@@ -25,11 +25,13 @@ pub struct DisplaySettings {
     pub spike_grid_cols: u32,
     pub split: f32,
     pub max_fps: f32,
+    /// Vertical range of one ADC trace row, in volts (rows are centred on 0 V).
+    pub adc_v_per_row: f32,
 }
 
 impl Default for DisplaySettings {
     fn default() -> Self {
-        Self { filter: ViewFilter::Spikes, window_s: 2.0, uv_per_row: 250.0, rows: 32, first_row: 0, thickness: 1.0, spike_uv_range: 250.0, spike_tau_s: 3.0, spike_grid_cols: 8, split: 0.62, max_fps: 144.0 }
+        Self { filter: ViewFilter::Spikes, window_s: 2.0, uv_per_row: 250.0, rows: 32, first_row: 0, thickness: 1.0, spike_uv_range: 250.0, spike_tau_s: 3.0, spike_grid_cols: 8, split: 0.62, max_fps: 144.0, adc_v_per_row: 5.0 }
     }
 }
 

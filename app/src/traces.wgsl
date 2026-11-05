@@ -5,6 +5,12 @@
 //   the result into per-pixel-column (min, max) pairs of a sweeping time window.
 // vs/fs (render): one instance per visible channel row, 6 vertices per column, building a
 //   1-px-or-taller bar from the column's min/max joined to its neighbour (gap-free trace).
+//
+// Per-channel `chinfo` = (gain, filter, units_per_row, center):
+//   gain          physical units per int16 LSB (µV for electrodes, V for AUX/ADC)
+//   filter        1 = run the display filter, 0 = always raw (AUX/ADC)
+//   units_per_row 0 = use the global µV/row; otherwise this channel's own row range
+//   center        value drawn at the row's centre line
 
 struct Ingest {
     nch: u32,
@@ -13,7 +19,7 @@ struct Ingest {
     cols: u32,
     pos0: u32,
     nsec: u32,
-    uv_per_bit: f32,
+    _unused: f32,
     _pad: u32,
     coef: array<vec4<f32>, 8>, // per section: (b0, b1, b2, 0), (a1, a2, 0, 0)
 };
@@ -22,13 +28,14 @@ struct Ingest {
 @group(0) @binding(1) var<storage, read> raw: array<u32>;
 @group(0) @binding(2) var<storage, read_write> state: array<f32>; // 12 per channel
 @group(0) @binding(3) var<storage, read_write> cols: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> chinfo: array<vec4<f32>>;
 
 fn sample(i: u32, ch: u32) -> f32 {
     let idx = i * P.nch + ch;
     let w = raw[idx >> 1u];
     let h = select(w & 0xffffu, w >> 16u, (idx & 1u) == 1u);
     let s = bitcast<i32>(h << 16u) >> 16u; // sign-extend int16
-    return f32(s) * P.uv_per_bit;
+    return f32(s) * chinfo[ch].x;
 }
 
 @compute @workgroup_size(64)
@@ -47,9 +54,10 @@ fn ingest(@builtin(global_invocation_id) gid: vec3<u32>) {
     var cur = bitcast<u32>(state[sb + 10u]);
     let fw = f32(P.window);
     let fc = f32(P.cols);
+    let nsec = select(0u, P.nsec, chinfo[ch].y > 0.5);
     for (var i = 0u; i < P.n_new; i++) {
         var x = sample(i, ch);
-        for (var s = 0u; s < P.nsec; s++) {
+        for (var s = 0u; s < nsec; s++) {
             let b = P.coef[2u * s];
             let a = P.coef[2u * s + 1u];
             let y = b.x * x + z[2u * s];
@@ -95,6 +103,7 @@ struct Render {
 @group(0) @binding(1) var<storage, read> rcols: array<vec2<f32>>;
 @group(0) @binding(2) var<storage, read> colors: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> order: array<u32>; // row -> channel
+@group(0) @binding(4) var<storage, read> rinfo: array<vec4<f32>>; // = chinfo
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -134,11 +143,13 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
             hi = max(hi, p.x);
         }
     }
+    let ci = rinfo[ch];
+    let upr = select(R.uv_per_row, ci.z, ci.z > 0.0);
     let yc = (f32(row) + 0.5) * R.row_h;
-    let k = R.row_h / R.uv_per_row;
+    let k = R.row_h / upr;
     let half = 0.5 * R.thickness;
-    let yt = yc - hi * k - half;
-    let yb = yc - lo * k + half;
+    let yt = yc - (hi - ci.w) * k - half;
+    let yb = yc - (lo - ci.w) * k + half;
     let x0 = f32(col) * R.vp.x / f32(R.cols);
     let x1 = f32(col + 1u) * R.vp.x / f32(R.cols);
     var px = vec2<f32>(0.0);

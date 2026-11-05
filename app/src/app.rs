@@ -43,6 +43,8 @@ pub struct App {
     disp_counter: u64,
     trace_reset: bool,
     last_trace_cfg: Option<TraceConfig>,
+    /// (channel count, ADC V/row bits) of the per-channel trace table last sent to the GPU.
+    chinfo_key: Option<(usize, u32)>,
     colors_dirty: bool,
     trace_colors: Option<Arc<Vec<[f32; 4]>>>,
     spike_colors: Option<Arc<Vec<[f32; 4]>>>,
@@ -93,6 +95,7 @@ impl App {
             disp_counter: 0,
             trace_reset: true,
             last_trace_cfg: None,
+            chinfo_key: None,
             colors_dirty: true,
             trace_colors: None,
             spike_colors: None,
@@ -331,7 +334,12 @@ impl App {
 
     fn board_section(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(RichText::new("Board").strong()).default_open(true).show(ui, |ui| {
-            let idle = !self.engine.is_acquiring() && !self.engine.is_busy() && self.engine.has_board();
+            // Settings can be edited while acquiring: Apply then stops, applies and restarts.
+            // Not while recording (that would split the recording) or while the board is busy.
+            let acquiring = self.engine.is_acquiring();
+            let recording = self.engine.is_recording();
+            let editable = self.engine.has_board() && !self.engine.is_busy() && !recording;
+            let leds_before = self.edit_board.leds;
             if let Some(l) = self.layout() {
                 for h in &l.headstages {
                     ui.label(format!("{}  {}  {} ch{}", h.name, h.chip, h.num_channels, if h.has_bno { "  + IMU" } else { "" }));
@@ -350,7 +358,7 @@ impl App {
             // RHD2132 headstages that can run as 16-channel boards (chip channels 8–23).
             let rhd2132: Vec<(usize, String)> =
                 self.layout().map(|l| l.headstages.iter().filter(|h| h.chip == "RHD2132").map(|h| (h.slot, h.name.clone())).collect()).unwrap_or_default();
-            ui.add_enabled_ui(idle, |ui| {
+            ui.add_enabled_ui(editable, |ui| {
                 let b = &mut self.edit_board;
                 if !rhd2132.is_empty() {
                     ui.horizontal(|ui| {
@@ -381,7 +389,7 @@ impl App {
                     ui.checkbox(&mut b.acquire_aux, "AUX");
                     ui.checkbox(&mut b.acquire_adc, "ADC");
                     ui.checkbox(&mut b.fast_settle, "Fast settle");
-                    ui.checkbox(&mut b.leds, "LEDs");
+                    ui.checkbox(&mut b.leds, "LEDs").on_hover_text("Applies immediately while acquiring");
                 });
                 ui.horizontal(|ui| {
                     ui.label("Cable delay +1");
@@ -405,25 +413,40 @@ impl App {
                     ui.small("Smaller USB blocks lower latency at the cost of more USB transactions; 24 KiB is the stock default.");
                 });
             });
+            // LEDs are a live setting: no restart needed.
+            if acquiring && self.edit_board.leds != leds_before {
+                let on = self.edit_board.leds;
+                self.engine.send_live(LiveCommand::SetLeds(on));
+                self.cfg.board.leds = on;
+                self.cfg.save();
+            }
             let changed = self.engine.board_settings().is_some_and(|s| s != self.edit_board);
             ui.horizontal(|ui| {
-                if ui.add_enabled(idle && changed, egui::Button::new("Apply")).clicked() {
+                let label = if acquiring { "Apply (restarts acquisition)" } else { "Apply" };
+                if ui.add_enabled(editable && changed, egui::Button::new(label)).clicked() {
+                    if acquiring {
+                        // Restarted when the board comes back from the apply (see `ui`).
+                        self.engine.stop_acquisition();
+                        self.autostart = true;
+                    }
                     self.cfg.board = self.edit_board.clone();
                     self.engine.apply_board_settings(self.edit_board.clone());
                     self.cfg.save();
                     self.reset_views();
                 }
-                if changed && ui.add_enabled(idle, egui::Button::new("Revert")).clicked() {
+                if changed && ui.add_enabled(editable, egui::Button::new("Revert")).clicked() {
                     self.edit_board = self.engine.board_settings().unwrap();
                 }
-                if self.engine.is_acquiring() {
-                    ui.weak("Stop acquisition to change board settings");
+                if recording {
+                    ui.weak("Stop recording to change board settings");
                 }
             });
-            if self.engine.is_acquiring() {
+            if recording {
+                // The settings block is locked while recording; keep the LED switch available.
                 let mut leds = self.edit_board.leds;
                 if ui.checkbox(&mut leds, "LEDs (live)").changed() {
                     self.edit_board.leds = leds;
+                    self.cfg.board.leds = leds;
                     self.engine.send_live(LiveCommand::SetLeds(leds));
                 }
             }
@@ -442,11 +465,17 @@ impl App {
             });
             ui.add(egui::Slider::new(&mut d.window_s, 0.05..=20.0).logarithmic(true).text("time window (s)"));
             ui.add(egui::Slider::new(&mut d.uv_per_row, 10.0..=5000.0).logarithmic(true).text("µV per row"));
-            let nel = self.engine.layout().map(|l| l.num_electrodes()).unwrap_or(0).max(1);
-            ui.add(egui::Slider::new(&mut d.rows, 1..=nel.max(1)).text("rows"));
-            let maxfirst = nel.saturating_sub(d.rows);
+            // Rows cover every channel: electrodes first, then AUX and ADC.
+            let (nrows_all, has_adc) = self.engine.layout().map(|l| (l.num_channels(), l.channels.iter().any(|c| c.kind == ChannelKind::Adc))).unwrap_or((0, false));
+            let nrows_all = nrows_all.max(1);
+            ui.add(egui::Slider::new(&mut d.rows, 1..=nrows_all).text("rows"));
+            let maxfirst = nrows_all.saturating_sub(d.rows);
             d.first_row = d.first_row.min(maxfirst);
             ui.add_enabled(maxfirst > 0, egui::Slider::new(&mut d.first_row, 0..=maxfirst).text("first row"));
+            if has_adc {
+                ui.add(egui::Slider::new(&mut d.adc_v_per_row, 0.1..=10.0).logarithmic(true).text("ADC V per row"))
+                    .on_hover_text("ADC rows are centred on 0 V and never filtered. AUX rows span 2.5 V.");
+            }
             ui.add(egui::Slider::new(&mut d.thickness, 1.0..=3.0).text("line px"));
             ui.horizontal(|ui| {
                 ui.label("View");
@@ -598,8 +627,8 @@ impl App {
         let label_w = 64.0;
         let plot = egui::Rect::from_min_max(egui::pos2(rect.min.x + label_w, rect.min.y), rect.max);
         let d = self.cfg.display.clone();
-        let rows = d.rows.clamp(1, nel);
-        let first = d.first_row.min(nel - rows);
+        let rows = d.rows.clamp(1, nch);
+        let first = d.first_row.min(nch - rows);
         // Interaction: scroll rows / scale.
         let resp = ui.interact(rect, ui.scope_id().with("traces"), egui::Sense::click());
         if resp.hovered() {
@@ -609,7 +638,7 @@ impl App {
                     self.cfg.display.uv_per_row = (d.uv_per_row * (1.0 - scroll * 0.002)).clamp(10.0, 5000.0);
                 } else {
                     let step = (scroll / 20.0).round() as isize;
-                    self.cfg.display.first_row = (first as isize - step).clamp(0, (nel - rows) as isize) as usize;
+                    self.cfg.display.first_row = (first as isize - step).clamp(0, (nch - rows) as isize) as usize;
                 }
                 self.dirty_cfg = Instant::now();
             }
@@ -639,15 +668,28 @@ impl App {
         let cursor_col = ((cursor_pos * cols as f64 / window as f64) as u32).min(cols - 1);
         let upload = Arc::new(std::mem::take(&mut self.pending));
         let row_h_px = plot.height() * ppp / rows as f32;
-        let order = if self.trace_reset {
-            let mut order: Vec<u32> = (0..nch as u32).filter(|&i| l.channels[i as usize].kind == ChannelKind::Electrode).collect();
-            order.extend((0..nch as u32).filter(|&i| l.channels[i as usize].kind != ChannelKind::Electrode));
-            Some(Arc::new(order))
-        } else {
-            None
-        };
+        // Row -> channel: electrodes first, then AUX/ADC. Labels use the same mapping.
+        let mut row_ch: Vec<u32> = (0..nch as u32).filter(|&i| l.channels[i as usize].kind == ChannelKind::Electrode).collect();
+        row_ch.extend((0..nch as u32).filter(|&i| l.channels[i as usize].kind != ChannelKind::Electrode));
+        // Per-channel scaling (see traces.wgsl): electrodes follow the global µV/row and the
+        // display filter; AUX/ADC are drawn raw in volts on their own row range.
+        let chinfo_key = (nch, d.adc_v_per_row.to_bits());
+        let chinfo = (self.trace_reset || self.chinfo_key != Some(chinfo_key)).then(|| {
+            self.chinfo_key = Some(chinfo_key);
+            Arc::new(
+                l.channels
+                    .iter()
+                    .map(|c| match c.kind {
+                        ChannelKind::Electrode => [c.bit_volts, 1.0, 0.0, 0.0],
+                        ChannelKind::Aux => [c.bit_volts, 0.0, 2.5, 0.0],
+                        ChannelKind::Adc => [c.bit_volts, 0.0, d.adc_v_per_row, 0.0],
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let order = self.trace_reset.then(|| Arc::new(row_ch.clone()));
         let colors = if self.trace_reset { Some(Arc::new(self.channel_colors(&l))) } else { self.trace_colors.take() };
-        let frame = TraceFrame { config, reset: std::mem::take(&mut self.trace_reset), upload, n_new, pos0, cursor_col, first_row: first as u32, nrows: rows as u32, uv_per_row: d.uv_per_row, row_h_px, thickness_px: d.thickness * ppp.max(1.0), colors, order };
+        let frame = TraceFrame { config, reset: std::mem::take(&mut self.trace_reset), upload, n_new, pos0, cursor_col, first_row: first as u32, nrows: rows as u32, uv_per_row: d.uv_per_row, row_h_px, thickness_px: d.thickness * ppp.max(1.0), colors, order, chinfo };
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(frame)));
         // Overlay: labels, separators, cursor time.
@@ -656,8 +698,11 @@ impl App {
         let mon = self.engine.audio_settings.lock().channels.clone();
         let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
         let mut toggle = None;
+        let mut analog_visible = false;
         for r in 0..rows {
-            let ch = first + r;
+            let ch = row_ch[first + r] as usize;
+            let is_electrode = l.channels[ch].kind == ChannelKind::Electrode;
+            analog_visible |= !is_electrode;
             let y = plot.min.y + (r as f32 + 0.5) * rh;
             let lab = egui::Rect::from_min_size(egui::pos2(rect.min.x, y - rh / 2.0), egui::vec2(label_w, rh));
             let monitored = mon.contains(&ch);
@@ -666,7 +711,9 @@ impl App {
                 let col = if monitored { Color32::from_rgb(255, 240, 90) } else { Color32::from_gray(150) };
                 p.text(egui::pos2(rect.min.x + 4.0, y), egui::Align2::LEFT_CENTER, txt, egui::FontId::monospace((rh * 0.6).clamp(8.0, 13.0)), col);
             }
+            // Audio monitors electrodes only.
             if let Some(pos) = click
+                && is_electrode
                 && lab.contains(pos)
             {
                 toggle = Some(ch);
@@ -689,7 +736,7 @@ impl App {
         }
         let x = plot.min.x + cursor_col as f32 / ppp;
         p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)));
-        p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, format!("{:.2} s · {:.0} µV/row", d.window_s, d.uv_per_row), egui::FontId::monospace(11.0), Color32::from_gray(120));
+        p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, if analog_visible { format!("{:.2} s · {:.0} µV/row · ADC {:.2} V/row · AUX 2.5 V/row", d.window_s, d.uv_per_row, d.adc_v_per_row) } else { format!("{:.2} s · {:.0} µV/row", d.window_s, d.uv_per_row) }, egui::FontId::monospace(11.0), Color32::from_gray(120));
     }
 
     fn spike_view(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -704,7 +751,7 @@ impl App {
         let cell_w = rect.width() / gc as f32;
         let cell_h = (cell_w * 0.75).max(40.0);
         let rows_fit = ((rect.height() / cell_h).floor() as usize).max(1);
-        let first = (self.cfg.display.first_row / gc) * gc;
+        let first = (self.cfg.display.first_row.min(nel - 1) / gc) * gc;
         let ncells = (gc * rows_fit).min(nel.saturating_sub(first));
         let now = self.t0.elapsed().as_secs_f32();
         let frame = SpikeFrame {

@@ -18,7 +18,7 @@ struct IngestU {
     cols: u32,
     pos0: u32,
     nsec: u32,
-    uv_per_bit: f32,
+    _unused: f32,
     _pad: u32,
     coef: [[f32; 4]; 8],
 }
@@ -65,6 +65,8 @@ pub struct TraceFrame {
     pub thickness_px: f32,
     pub colors: Option<Arc<Vec<[f32; 4]>>>,
     pub order: Option<Arc<Vec<u32>>>,
+    /// Per-channel (gain, filter 0/1, units_per_row or 0 for global µV/row, center); see traces.wgsl.
+    pub chinfo: Option<Arc<Vec<[f32; 4]>>>,
 }
 
 pub struct TraceGpu {
@@ -77,6 +79,11 @@ pub struct TraceGpu {
     /// Filter/column state, referenced by the ingest bind group; kept for resets.
     state: Option<wgpu::Buffer>,
     res: Option<Resources>,
+    /// Last per-channel tables from the app, rewritten after a reallocation (which would
+    /// otherwise silently reset them to defaults).
+    last_colors: Option<Arc<Vec<[f32; 4]>>>,
+    last_order: Option<Arc<Vec<u32>>>,
+    last_chinfo: Option<Arc<Vec<[f32; 4]>>>,
 }
 
 struct Resources {
@@ -86,6 +93,7 @@ struct Resources {
     cols: wgpu::Buffer,
     colors: wgpu::Buffer,
     order: wgpu::Buffer,
+    chinfo: wgpu::Buffer,
     ingest_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
     nrows_drawn: u32,
@@ -104,8 +112,8 @@ impl TraceGpu {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("traces"), source: wgpu::ShaderSource::Wgsl(include_str!("traces.wgsl").into()) });
         let c = wgpu::ShaderStages::COMPUTE;
         let v = wgpu::ShaderStages::VERTEX;
-        let ingest_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("ingest"), entries: &[uniform(0, c), storage(1, true, c), storage(2, false, c), storage(3, false, c)] });
-        let render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("trace-render"), entries: &[uniform(0, v), storage(1, true, v), storage(2, true, v), storage(3, true, v)] });
+        let ingest_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("ingest"), entries: &[uniform(0, c), storage(1, true, c), storage(2, false, c), storage(3, false, c), storage(4, true, c)] });
+        let render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("trace-render"), entries: &[uniform(0, v), storage(1, true, v), storage(2, true, v), storage(3, true, v), storage(4, true, v)] });
         let il = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&ingest_bgl)], immediate_size: 0 });
         let rl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&render_bgl)], immediate_size: 0 });
         let ingest_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("ingest"), layout: Some(&il), module: &module, entry_point: Some("ingest"), compilation_options: Default::default(), cache: None });
@@ -130,6 +138,9 @@ impl TraceGpu {
             render_bgl,
             state: None,
             res: None,
+            last_colors: None,
+            last_order: None,
+            last_chinfo: None,
         }
     }
 
@@ -150,6 +161,7 @@ impl TraceGpu {
             let cols = buf("cols", nch * f.config.cols as u64 * 8, st);
             let colors = buf("colors", nch * 16, st);
             let order = buf("order", nch * 4, st);
+            let chinfo = buf("chinfo", nch * 16, st);
             let ingest_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.ingest_bgl,
@@ -158,6 +170,7 @@ impl TraceGpu {
                     wgpu::BindGroupEntry { binding: 1, resource: raw.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: state.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: cols.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: chinfo.as_entire_binding() },
                 ],
             });
             let render_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -168,6 +181,7 @@ impl TraceGpu {
                     wgpu::BindGroupEntry { binding: 1, resource: cols.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: colors.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: order.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: chinfo.as_entire_binding() },
                 ],
             });
             // Default colours/order until the app supplies them.
@@ -175,7 +189,10 @@ impl TraceGpu {
             queue.write_buffer(&colors, 0, bytemuck::cast_slice(&default_colors));
             let default_order: Vec<u32> = (0..nch as u32).collect();
             queue.write_buffer(&order, 0, bytemuck::cast_slice(&default_order));
-            self.res = Some(Resources { config: f.config.clone(), raw, raw_cap, cols, colors, order, ingest_bg, render_bg, nrows_drawn: 0, vertex_count: 0 });
+            // Default: everything is an electrode until the app supplies per-channel info.
+            let default_info: Vec<[f32; 4]> = vec![[engine::rhythm::ELECTRODE_UV_PER_BIT, 1.0, 0.0, 0.0]; nch as usize];
+            queue.write_buffer(&chinfo, 0, bytemuck::cast_slice(&default_info));
+            self.res = Some(Resources { config: f.config.clone(), raw, raw_cap, cols, colors, order, chinfo, ingest_bg, render_bg, nrows_drawn: 0, vertex_count: 0 });
             // Keep `state` alive through the bind group; store the handle for resets.
             self.state = Some(state);
         }
@@ -191,11 +208,24 @@ impl TraceGpu {
             let empty: Vec<[f32; 2]> = vec![[1e30, -1e30]; nch * f.config.cols as usize];
             queue.write_buffer(&r.cols, 0, bytemuck::cast_slice(&empty));
         }
-        if let Some(c) = &f.colors {
-            queue.write_buffer(&r.colors, 0, bytemuck::cast_slice(&c[..c.len().min(f.config.nch)]));
+        if f.colors.is_some() {
+            self.last_colors = f.colors.clone();
         }
-        if let Some(o) = &f.order {
-            queue.write_buffer(&r.order, 0, bytemuck::cast_slice(&o[..o.len().min(f.config.nch)]));
+        if f.order.is_some() {
+            self.last_order = f.order.clone();
+        }
+        if f.chinfo.is_some() {
+            self.last_chinfo = f.chinfo.clone();
+        }
+        let n = f.config.nch;
+        if let Some(c) = f.colors.as_ref().or(if realloc { self.last_colors.as_ref() } else { None }) {
+            queue.write_buffer(&r.colors, 0, bytemuck::cast_slice(&c[..c.len().min(n)]));
+        }
+        if let Some(o) = f.order.as_ref().or(if realloc { self.last_order.as_ref() } else { None }) {
+            queue.write_buffer(&r.order, 0, bytemuck::cast_slice(&o[..o.len().min(n)]));
+        }
+        if let Some(c) = f.chinfo.as_ref().or(if realloc { self.last_chinfo.as_ref() } else { None }) {
+            queue.write_buffer(&r.chinfo, 0, bytemuck::cast_slice(&c[..c.len().min(n)]));
         }
     }
 }
@@ -227,7 +257,7 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
                 coef[2 * i] = [s[0], s[1], s[2], 0.0];
                 coef[2 * i + 1] = [s[3], s[4], 0.0, 0.0];
             }
-            let u = IngestU { nch: f.config.nch as u32, n_new: f.n_new, window: f.config.window, cols: f.config.cols, pos0: f.pos0, nsec: nsec as u32, uv_per_bit: engine::rhythm::ELECTRODE_UV_PER_BIT, _pad: 0, coef };
+            let u = IngestU { nch: f.config.nch as u32, n_new: f.n_new, window: f.config.window, cols: f.config.cols, pos0: f.pos0, nsec: nsec as u32, _unused: 0.0, _pad: 0, coef };
             queue.write_buffer(&g.ingest_u, 0, bytemuck::bytes_of(&u));
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ingest"), timestamp_writes: None });
             cp.set_pipeline(&g.ingest_pipe);
