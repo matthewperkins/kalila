@@ -1,8 +1,11 @@
 //! Headless acquisition + recording with live health stats (a soak-test tool for the rig).
 //!
 //! ```text
-//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ]
+//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ] [--aux] [--adc] [--no-audio]
 //! ```
+//!
+//! `--aux` / `--adc` acquire (and record) the headstage AUX and the 8 I/O-board ADC channels,
+//! for comparing scales against a stock-GUI recording.
 use engine::{BoardChoice, Engine};
 use rhythm::BoardSettings;
 use std::sync::atomic::Ordering;
@@ -19,6 +22,8 @@ fn main() -> anyhow::Result<()> {
     if let Some(r) = opt("--rate") {
         settings.sample_rate = r.parse()?;
     }
+    settings.acquire_aux = flag("--aux");
+    settings.acquire_adc = flag("--adc");
     let mut e = Engine::new(root.clone().unwrap_or_else(std::env::temp_dir));
     e.audio_settings.lock().enabled = !flag("--no-audio");
     e.open_board(if flag("--hw") { BoardChoice::Hardware } else { BoardChoice::Simulated(vec![32, 32]) }, settings);

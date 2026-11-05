@@ -23,13 +23,16 @@ cargo build --release            # needs Rust ≥ 1.85, a C compiler, libpipewir
 
 ## Rig setup (one time)
 
-1. **FT600 ONI driver.** Download FTDI's *D3XX Linux x86_64* package
-   (<https://ftdichip.com/drivers/d3xx-drivers/>), extract it, then run
-   `scripts/build-ft600-driver.sh <extracted dir>`. This installs
-   `~/.local/lib/libonidriver_ft600.so`. Tested with D3XX **1.1.8**
-   (`libftd3xx-linux-x86_64-1.1.8.tgz`): builds without warnings, FTDI's library is linked
-   statically (no runtime dependency on it), and oers loads the driver and reports
-   "no board found" cleanly when none is attached. A driver shipped with an existing
+1. **FT600 ONI driver.** Needs FTDI's *D3XX Linux x86_64* package from the **1.0.x** line;
+   tested on hardware with **1.0.14**. D3XX 1.1.x (FTDI's libusb-based rewrite) does *not*
+   work: `oni_init_ctx` hangs forever, because a 0 ms pipe timeout became "block forever".
+   FTDI's page (<https://ftdichip.com/drivers/d3xx-drivers/>) now lists only 1.1.x for Linux;
+   FTDI's 1.0.14 upload is archived at
+   <https://web.archive.org/web/20240519150808id_/https://ftdichip.com/wp-content/uploads/2023/06/libftd3xx-linux-x86_64-1.0.14.tgz>
+   (sha256 `ca71469fc2267ba655c0a9af9aa4cb853e4adad1dfd438df83f72d0b6b7ac265`).
+   Extract it, then run `scripts/build-ft600-driver.sh <extracted>/linux-x86_64`. That
+   installs `~/.local/lib/libonidriver_ft600.so` (FTDI's library linked statically, no
+   runtime dependency on it). The script refuses 1.1.x. A driver shipped with an existing
    Open Ephys install is also picked up automatically from `~/.local/share/open-ephys/shared*`,
    or set `ONI_DRIVER_PATH=<dir>`.
 2. **USB permissions:** `sudo install -m644 scripts/60-open-ephys-ft600.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
