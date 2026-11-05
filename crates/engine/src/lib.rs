@@ -16,7 +16,7 @@ pub mod record;
 use anyhow::{Result, bail};
 use audio::{AudioMonitor, AudioSettings, AudioStats};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
-use dsp::{BandSpec, FilterBank, Spike, SpikeDetector, ThresholdMode};
+use dsp::{BandSpec, Car, FilterBank, Spike, SpikeDetector, ThresholdMode};
 use log::{error, info, warn};
 use parking_lot::Mutex;
 use record::{RecMsg, RecStatus};
@@ -34,11 +34,14 @@ pub struct DspSettings {
     pub band: BandSpec,
     pub threshold: ThresholdMode,
     pub detect: bool,
+    /// Common average reference before detection; set by the GUI, not saved here.
+    #[serde(skip)]
+    pub car: Option<Arc<Car>>,
 }
 
 impl Default for DspSettings {
     fn default() -> Self {
-        Self { band: BandSpec::SPIKES, threshold: ThresholdMode::Sigma(4.5), detect: true }
+        Self { band: BandSpec::SPIKES, threshold: ThresholdMode::Sigma(4.5), detect: true, car: None }
     }
 }
 
@@ -502,17 +505,26 @@ fn dsp_thread(rx: Receiver<Arc<Block>>, spikes: Sender<Spike>, settings: Arc<Mut
     let mut out = Vec::new();
     let mut counts = vec![0u64; nel];
     let mut last_pub = Instant::now();
+    let mut car_mask = cur.car.as_ref().map(|c| c.mask(nel));
     while let Ok(b) = rx.recv() {
         let s = settings.lock().clone();
         if s.band != cur.band {
             bank = FilterBank::new(s.band.sections(fs), nel);
         }
+        if s.car != cur.car {
+            car_mask = s.car.as_ref().map(|c| c.mask(nel));
+        }
         det.mode = s.threshold;
         cur = s;
         for t in 0..b.len() {
             let r = b.sample(t);
+            let (car, mask) = match (&cur.car, &car_mask) {
+                (Some(c), Some(m)) => (c.mean(r), m.as_slice()),
+                _ => (0.0, &[][..]),
+            };
             for (ch, v) in row.iter_mut().enumerate() {
-                *v = bank.tick(ch, r[ch] as f32 * ELECTRODE_UV_PER_BIT);
+                let x = r[ch] as f32 - if mask.get(ch).copied().unwrap_or(false) { car } else { 0.0 };
+                *v = bank.tick(ch, x * ELECTRODE_UV_PER_BIT);
             }
             if cur.detect {
                 det.push(b.first_sample + t as i64, &row, &mut out);

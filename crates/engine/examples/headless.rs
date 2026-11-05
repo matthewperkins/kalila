@@ -1,12 +1,13 @@
 //! Headless acquisition + recording with live health stats (a soak-test tool for the rig).
 //!
 //! ```text
-//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ] [--aux] [--adc] [--leds] [--16ch A1[,B1…]] [--no-audio]
+//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ] [--aux] [--adc] [--leds] [--16ch A1[,B1…]] [--car] [--no-audio]
 //! ```
 //!
 //! `--aux` / `--adc` acquire (and record) the headstage AUX and the 8 I/O-board ADC channels,
 //! for comparing scales against a stock-GUI recording. `--leds` turns the board LEDs on (off by
-//! default). `--16ch` runs the RHD2132 in the given slots as 16-channel headstages.
+//! default). `--16ch` runs the RHD2132 in the given slots as 16-channel headstages. `--car`
+//! applies a common average reference (all electrodes) to spike detection and audio.
 use engine::{BoardChoice, Engine};
 use rhythm::BoardSettings;
 use std::sync::atomic::Ordering;
@@ -47,6 +48,12 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("{err}");
     }
     let l = e.layout().unwrap().clone();
+    if flag("--car") {
+        let all: Vec<usize> = (0..l.num_electrodes()).collect();
+        let car = std::sync::Arc::new(engine::dsp::Car { reference: all.clone(), subtract: all });
+        e.dsp_settings.lock().car = Some(car.clone());
+        e.audio_settings.lock().car = Some(car);
+    }
     println!("{} channels @ {} Hz; headstages: {:?}", l.num_channels(), l.sample_rate, l.headstages.iter().map(|h| format!("{} {} {}ch", h.name, h.chip, h.num_channels)).collect::<Vec<_>>());
     e.start_acquisition()?;
     println!("real-time priority: {}", e.rt_priority());

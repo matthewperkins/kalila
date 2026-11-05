@@ -2,6 +2,40 @@
 
 use std::f64::consts::PI;
 
+/// Common average reference on raw electrode samples. Applied before the band-pass filters,
+/// which is equivalent to applying it after them (both are linear and every electrode uses
+/// the same filter). Channels are global electrode indices.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Car {
+    pub reference: Vec<usize>,
+    pub subtract: Vec<usize>,
+}
+
+impl Car {
+    /// Mean of the reference electrodes in one raw sample row, in raw LSB (0 if none).
+    pub fn mean(&self, row: &[i16]) -> f32 {
+        let (mut sum, mut n) = (0i64, 0usize);
+        for &ch in &self.reference {
+            if let Some(&v) = row.get(ch) {
+                sum += v as i64;
+                n += 1;
+            }
+        }
+        if n == 0 { 0.0 } else { sum as f32 / n as f32 }
+    }
+
+    /// Per-channel "subtract the reference" mask over `nch` channels.
+    pub fn mask(&self, nch: usize) -> Vec<bool> {
+        let mut m = vec![false; nch];
+        for &ch in &self.subtract {
+            if ch < nch {
+                m[ch] = true;
+            }
+        }
+        m
+    }
+}
+
 /// Biquad coefficients (normalised, a0 = 1).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Biquad {
@@ -321,6 +355,15 @@ const _: () = assert!(SPIKE_LEN + 16 < HIST);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn car_mean_and_mask() {
+        let c = Car { reference: vec![0, 2, 9], subtract: vec![1, 2, 9] };
+        // Channel 9 is out of range for a 4-channel row: ignored in both.
+        assert_eq!(c.mean(&[10, 100, -4, 7]), 3.0);
+        assert_eq!(c.mask(4), vec![false, true, true, false]);
+        assert_eq!(Car::default().mean(&[5, 5]), 0.0);
+    }
 
     fn gain_at(sections: &[Biquad], fs: f64, f: f64) -> f64 {
         let mut z = vec![[0.0f32; 2]; sections.len()];

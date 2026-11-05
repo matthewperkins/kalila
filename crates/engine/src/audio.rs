@@ -72,6 +72,9 @@ pub struct AudioSettings {
     pub device_buffer: u32,
     /// Safety margin kept in the ring buffer (ms).
     pub margin_ms: f32,
+    /// Common average reference on the monitored channels; set by the GUI, not saved here.
+    #[serde(skip)]
+    pub car: Option<std::sync::Arc<crate::dsp::Car>>,
 }
 
 impl Default for AudioSettings {
@@ -90,6 +93,7 @@ impl Default for AudioSettings {
             mute: false,
             device_buffer: 128,
             margin_ms: 1.5,
+            car: None,
         }
     }
 }
@@ -129,6 +133,8 @@ struct Chain {
     env: f32,
     gain: f32,
     pan: (f32, f32),
+    /// Subtract the common average reference from this channel.
+    car: bool,
 }
 
 impl Chain {
@@ -148,6 +154,7 @@ impl Chain {
             env: 0.0,
             gain: 1.0,
             pan: (th.cos(), th.sin()),
+            car: false,
         }
     }
 }
@@ -168,18 +175,24 @@ impl Dyn {
     }
 }
 
+/// Stereo position (-1 = left … +1 = right) of the `i`th of `n` monitored channels, in the
+/// order they were added. The GUI colours monitored traces by this too.
+pub fn pan_position(i: usize, n: usize) -> f32 {
+    if n <= 1 { 0.0 } else { -0.8 + 1.6 * i as f32 / (n - 1) as f32 }
+}
+
 /// The DSP part of the monitor, independent of any audio device (unit-testable).
 pub struct MonitorDsp {
     fs: f64,
     chains: Vec<Chain>,
-    key: (Vec<usize>, BandSpec, u32),
+    key: (Vec<usize>, BandSpec, u32, Option<std::sync::Arc<crate::dsp::Car>>),
     dynamics: Dyn,
     samples_since_cal: u64,
 }
 
 impl MonitorDsp {
     pub fn new(fs: f64) -> Self {
-        Self { fs, chains: Vec::new(), key: (Vec::new(), BandSpec::SPIKES, 0), dynamics: Dyn::new(fs), samples_since_cal: 0 }
+        Self { fs, chains: Vec::new(), key: (Vec::new(), BandSpec::SPIKES, 0, None), dynamics: Dyn::new(fs), samples_since_cal: 0 }
     }
 
     pub fn recalibrate(&mut self) {
@@ -196,10 +209,17 @@ impl MonitorDsp {
 
     /// Process a block into interleaved stereo at the acquisition rate.
     pub fn process(&mut self, s: &AudioSettings, blk: &Block, out: &mut Vec<f32>) {
-        let key = (s.channels.clone(), s.band, s.presence_db.to_bits());
+        // A CAR change also rebuilds the chains, so the held noise σ is recalibrated.
+        let key = (s.channels.clone(), s.band, s.presence_db.to_bits(), s.car.clone());
         if key != self.key {
             let n = s.channels.len();
-            self.chains = (0..n).map(|i| Chain::new(self.fs, s, if n == 1 { 0.0 } else { -0.8 + 1.6 * i as f32 / (n - 1) as f32 })).collect();
+            self.chains = (0..n)
+                .map(|i| {
+                    let mut c = Chain::new(self.fs, s, pan_position(i, n));
+                    c.car = s.car.as_ref().is_some_and(|car| car.subtract.contains(&s.channels[i]));
+                    c
+                })
+                .collect();
             self.key = key;
             self.samples_since_cal = 0;
         }
@@ -212,10 +232,12 @@ impl MonitorDsp {
         let norm_ch = 1.0 / (s.channels.len().max(1) as f32).sqrt();
         for t in 0..blk.len() {
             let row = &blk.data[t * nch..(t + 1) * nch];
+            let car = s.car.as_ref().map_or(0.0, |c| c.mean(row));
             self.samples_since_cal += 1;
             let (mut l, mut r) = (0.0f32, 0.0f32);
             for (c, &chi) in self.chains.iter_mut().zip(s.channels.iter()) {
-                let x = row.get(chi).copied().unwrap_or(0) as f32 * ELECTRODE_UV_PER_BIT;
+                let raw = row.get(chi).copied().unwrap_or(0) as f32;
+                let x = (raw - if c.car { car } else { 0.0 }) * ELECTRODE_UV_PER_BIT;
                 let mut y = x;
                 for (b, z) in c.bp.iter().zip(c.bpz.iter_mut()) {
                     y = b.tick(y, z);
@@ -703,5 +725,29 @@ mod tests {
         let y2 = run(&s, &b2);
         let r = peak_after(&y1, 3000) / peak_after(&y2, 3000);
         assert!((r - 2.0).abs() < 0.02, "{r}");
+    }
+
+    #[test]
+    fn car_removes_common_mode_from_the_monitor() {
+        // Four electrodes: own noise (σ 5 µV) plus a shared 400 µV "artefact" train.
+        let fs = 30000.0;
+        let common = synth(fs, 1.0, 0.0, &[(5.0, 400.0)], 1);
+        let own: Vec<Block> = (0..4).map(|k| synth(fs, 1.0, 5.0, &[], 10 + k)).collect();
+        let mut b = Block::with_capacity(4, common.len());
+        for t in 0..common.len() {
+            for o in &own {
+                b.data.push(o.data[t] + common.data[t]);
+            }
+            b.timestamps.push(common.timestamps[t]);
+            b.ttl.push(0);
+        }
+        let mut s = AudioSettings { reference: true, gain_mode: GainMode::Absolute, volume_db: 0.0, channels: vec![1], ..Default::default() };
+        let plain = peak_after(&run(&s, &b), 3000);
+        s.car = Some(std::sync::Arc::new(crate::dsp::Car { reference: vec![0, 1, 2, 3], subtract: vec![1] }));
+        let car = peak_after(&run(&s, &b), 3000);
+        assert!(car < 0.1 * plain, "CAR {car} vs plain {plain}");
+        // Not in the subtract set: unchanged.
+        s.car = Some(std::sync::Arc::new(crate::dsp::Car { reference: vec![0, 1, 2, 3], subtract: vec![0] }));
+        assert_eq!(peak_after(&run(&s, &b), 3000), plain);
     }
 }
