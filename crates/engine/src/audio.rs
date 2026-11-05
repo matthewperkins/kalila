@@ -106,6 +106,9 @@ pub struct AudioStats {
     pub active: AtomicBool,
     pub ratio_ppm: AtomicU32,
     pub min_fill: AtomicU32,
+    /// Frames the device asked for in its last callback, and the most since start.
+    pub cb_frames: AtomicU32,
+    pub cb_frames_max: AtomicU32,
     /// Request a new noise calibration.
     pub recalibrate: AtomicBool,
     /// Held σ (µV ×100) of the first monitored channel, 0 while calibrating.
@@ -317,8 +320,13 @@ impl AudioMonitor {
                         return;
                     };
                     let frames = out.len() / ch;
+                    st.cb_frames.store(frames as u32, Ordering::Relaxed);
+                    st.cb_frames_max.fetch_max(frames as u32, Ordering::Relaxed);
                     let avail = cons.slots() / 2;
-                    st.min_fill.fetch_min(avail as u32, Ordering::Relaxed);
+                    // The servo regulates what is left *after* this callback: that is the
+                    // headroom against late input (measuring before it, the servo steered the
+                    // fill to margin < one callback, so every trough was an underrun).
+                    st.min_fill.fetch_min(avail.saturating_sub(frames) as u32, Ordering::Relaxed);
                     st.fill_frames.store(avail as u32, Ordering::Relaxed);
                     let n = frames.min(avail);
                     if n < frames && st.active.load(Ordering::Relaxed) {
@@ -402,8 +410,11 @@ impl AudioMonitor {
         // Backlog guard: if the ring holds far more than needed (device start-up, a stall
         // upstream), drop this block's output instead of letting the slow drift servo work
         // it off over a minute. Costs one audible skip, only when latency would be bad.
+        // Slack: two device periods plus 12 ms, enough for the board's bursty USB delivery
+        // (≈4.4 ms of data per 24 KiB read) without dropping audio in steady state.
         let used_frames = (prod.buffer().capacity() - prod.slots()) / 2;
-        let limit = (s.margin_ms as f64 * 1e-3 * self.fs_out) as usize + 2 * s.device_buffer as usize + (self.fs_out * 0.004) as usize;
+        let period = (st.cb_frames_max.load(Ordering::Relaxed) as usize).max(s.device_buffer as usize);
+        let limit = (s.margin_ms as f64 * 1e-3 * self.fs_out) as usize + 2 * period + (self.fs_out * 0.012) as usize;
         if used_frames > limit {
             st.overruns.fetch_add(1, Ordering::Relaxed);
             return;

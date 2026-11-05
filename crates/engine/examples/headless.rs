@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
     }
     let mut e = Engine::new(root.clone().unwrap_or_else(std::env::temp_dir));
     e.audio_settings.lock().enabled = !flag("--no-audio");
+    e.audio_settings.lock().mute = flag("--mute");
     e.open_board(if flag("--hw") { BoardChoice::Hardware } else { BoardChoice::Simulated(vec![32, 32]) }, settings);
     while e.is_busy() {
         e.poll();
@@ -78,11 +79,12 @@ fn main() -> anyhow::Result<()> {
             let p = &e.pipeline;
             let a = &e.audio_stats;
             println!(
-                "t={:5.1}s samples={} dropped={} gaps={} bad={} hwbuf={:.1}% | drops disp/dsp/aud={}/{}/{} recQ={} bp={}ms | spikes={} | audio {}Hz lat={:.1}ms underruns={} | disp lat max={:.2}ms | rec {} MB",
+                "t={:5.1}s samples={} dropped={} gaps={} bad={} hwbuf={:.1}% | drops disp/dsp/aud={}/{}/{} recQ={} bp={}ms | spikes={} | audio {}Hz lat={:.1}ms underruns={} overruns={} cb={}/{}fr ppm={} | disp lat max={:.2}ms | rec {} MB",
                 t0.elapsed().as_secs_f64(), h.samples, h.dropped_samples, h.discontinuities, h.bad_frames, h.hw_buffer_pct,
                 p.display_dropped.load(Ordering::Relaxed), p.dsp_dropped.load(Ordering::Relaxed), p.audio_dropped.load(Ordering::Relaxed),
                 p.rec_queue.load(Ordering::Relaxed), p.rec_backpressure_us.load(Ordering::Relaxed) / 1000, spikes,
                 a.device_rate.load(Ordering::Relaxed), a.latency_us.load(Ordering::Relaxed) as f64 / 1000.0, a.underruns.load(Ordering::Relaxed),
+                a.overruns.load(Ordering::Relaxed), a.cb_frames.load(Ordering::Relaxed), a.cb_frames_max.load(Ordering::Relaxed), a.ratio_ppm.load(Ordering::Relaxed) as i32,
                 lat_max.as_secs_f64() * 1e3, e.rec_status.bytes.load(Ordering::Relaxed) / 1_000_000
             );
             lat_max = Duration::ZERO;
