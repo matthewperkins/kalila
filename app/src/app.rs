@@ -44,6 +44,9 @@ fn monitor_color32(mon: &[usize], ch: usize) -> Option<Color32> {
 /// marks the audio-monitored channel.
 const GROUP_PALETTE: [[f32; 3]; 8] = [[0.92, 0.92, 0.92], [0.35, 0.80, 1.00], [1.00, 0.42, 0.72], [0.50, 0.92, 0.50], [1.00, 0.60, 0.25], [0.65, 0.55, 1.00], [0.30, 0.90, 0.85], [1.00, 0.35, 0.35]];
 
+/// How long the "not closing while recording" message stays up.
+const CLOSE_REFUSED_MSG: Duration = Duration::from_secs(4);
+
 /// Badge colour marking where the common average reference is applied.
 const CAR_COLOR: Color32 = Color32::from_rgb(90, 200, 190);
 
@@ -106,6 +109,8 @@ pub struct App {
     audio_text: String,
     gpu_name: String,
     toast: Option<(String, Instant)>,
+    /// When a window close was last refused because a recording is running (shows a message).
+    close_refused: Option<Instant>,
     dirty_cfg: Instant,
     autostart: bool,
     // outputs
@@ -169,6 +174,7 @@ impl App {
             audio_text,
             gpu_name: format!("{} ({:?})", info.name, info.backend),
             toast: None,
+            close_refused: None,
             dirty_cfg: Instant::now(),
             autostart,
             was_acquiring: false,
@@ -304,21 +310,19 @@ impl App {
             } else {
                 ui.label(RichText::new("No board").color(Color32::LIGHT_RED));
             }
-            ui.add_enabled_ui(!acquiring && !busy, |ui| {
-                if ui.button("Open board").on_hover_text("Open the ONI acquisition board (FT600)").clicked() {
+            // One switch to the other board; greyed out while acquiring or busy.
+            let sim = self.engine.is_simulated();
+            let can_switch = !acquiring && !busy;
+            if sim {
+                if ui.add_enabled(can_switch, egui::Button::new("Switch to: Open board")).on_hover_text("Open the ONI acquisition board (FT600)").clicked() {
                     self.cfg.open_hardware_on_start = true;
                     self.engine.open_board(BoardChoice::Hardware, self.edit_board.clone());
                     self.reset_views();
                 }
-                if ui.button("Simulator").on_hover_text("Real-time simulated headstages").clicked() {
-                    self.engine.open_board(BoardChoice::Simulated(self.cfg.sim_headstages.clone()), self.edit_board.clone());
-                    self.reset_views();
-                }
-                if ui.add_enabled(self.engine.has_board(), egui::Button::new("Rescan")).on_hover_text("Detect headstages and tune cable delays").clicked() {
-                    self.engine.rescan();
-                    self.reset_views();
-                }
-            });
+            } else if ui.add_enabled(can_switch, egui::Button::new("Switch to: Simulator")).on_hover_text("Real-time simulated headstages").clicked() {
+                self.engine.open_board(BoardChoice::Simulated(self.cfg.sim_headstages.clone()), self.edit_board.clone());
+                self.reset_views();
+            }
             ui.separator();
             let can_start = self.engine.has_board() && !busy;
             if !acquiring {
@@ -354,6 +358,20 @@ impl App {
             }
             ui.separator();
             self.health_chips(ui);
+            // Acquisition board only, at the right-hand end: Rescan (or Retry if it failed to open).
+            if !sim {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.engine.has_board() || busy {
+                        if ui.add_enabled(can_switch, egui::Button::new("Rescan")).on_hover_text("Detect headstages and tune cable delays").clicked() {
+                            self.engine.rescan();
+                            self.reset_views();
+                        }
+                    } else if ui.add_enabled(can_switch, egui::Button::new("Retry")).on_hover_text("Try opening the acquisition board again").clicked() {
+                        self.engine.open_board(BoardChoice::Hardware, self.edit_board.clone());
+                        self.reset_views();
+                    }
+                });
+            }
         });
     }
 
@@ -1353,6 +1371,24 @@ impl eframe::App for App {
         });
 
         self.car_palette(ui.ctx());
+        // Window close (Hyprland killactive, Meta+C): refused while recording; stop it first.
+        if ui.ctx().input(|i| i.viewport().close_requested()) && self.engine.is_recording() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_refused = Some(Instant::now());
+        }
+        if let Some(t) = self.close_refused {
+            if t.elapsed() < CLOSE_REFUSED_MSG && self.engine.is_recording() {
+                egui::Area::new(egui::Id::unique("close-refused")).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).fill(Color32::from_rgb(120, 25, 25)).inner_margin(16.0).show(ui, |ui| {
+                        ui.label(RichText::new("Recording in progress, not closing").size(20.0).strong().color(Color32::WHITE));
+                        ui.label(RichText::new("Stop the recording first (Recording button or Ctrl+R), then close.").size(15.0).color(Color32::WHITE));
+                    });
+                });
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            } else {
+                self.close_refused = None;
+            }
+        }
         if self.confirm_stop {
             egui::Modal::new(egui::Id::unique("confirm-stop")).show(ui.ctx(), |ui| {
                 ui.heading("Stop acquisition?");
@@ -1394,6 +1430,12 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.engine.stop_recording();
+        // Let the recorder drain its queue and finalise the files before acquisition stops
+        // and the process exits.
+        let t0 = Instant::now();
+        while self.engine.is_recording() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         self.engine.stop_acquisition();
         self.save_cfg();
     }

@@ -88,6 +88,8 @@ struct Running {
 
 pub struct Engine {
     board: Option<Box<dyn Board>>,
+    /// The last board chosen is the simulator (kept even if opening fails).
+    simulated: bool,
     job: Option<Job>,
     running: Option<Running>,
     pub last_error: Option<String>,
@@ -117,6 +119,7 @@ impl Engine {
         let rec_thread = std::thread::Builder::new().name("recorder".into()).spawn(move || record::run_recorder(rec_rx, st)).expect("spawn recorder");
         Self {
             board: None,
+            simulated: false,
             job: None,
             running: None,
             last_error: None,
@@ -146,6 +149,7 @@ impl Engine {
         self.board = None;
         self.layout = None;
         self.last_error = None;
+        self.simulated = matches!(choice, BoardChoice::Simulated(_));
         let h = std::thread::Builder::new()
             .name("board-open".into())
             .spawn(move || -> Result<Box<dyn Board>> {
@@ -231,6 +235,10 @@ impl Engine {
             Some(Job::Op(_, w)) => Some(w),
             None => None,
         }
+    }
+    /// Whether the last board chosen (open, opening or failed) is the simulator.
+    pub fn is_simulated(&self) -> bool {
+        self.simulated
     }
     pub fn has_board(&self) -> bool {
         self.board.is_some() || self.running.is_some()
