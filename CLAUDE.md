@@ -130,6 +130,35 @@ Committed per feature where the code separates; the GUI features share one commi
 - Simulator: a common-mode artefact burst (30 ms every 1.7 s) for testing CAR; on by
   default, `OERS_SIM_ARTEFACT=0` turns it off.
 
+## Trace windows (rig, 2026-11-06)
+
+- **Layout.** The main window holds the controls and the spike grid. Traces live in separate
+  windows (`app/src/app/views.rs`), configured in `Config::views`; an old `display` config
+  migrates into view 0. Each window has its own control strip:
+  - channels (headstages, AUX, ADC);
+  - filter, CAR, scaling;
+  - triggered sweeps.
+
+  "One window per port" makes the Port A / Port B pair the user records with: Myomatrix on B,
+  single units on A.
+- **Deferred viewports.** Trace windows are eframe *deferred* viewports. Immediate ones are drawn
+  inside the root's pass, and Hyprland withholds frames from a hidden root window.
+  - Settings and per-view state live in `ViewsShared` behind `Arc<parking_lot::Mutex>`.
+  - Whichever window draws first drains the display channel for all views.
+  - Board polling, outputs and spike intake run in `App::logic`, which eframe keeps running
+    while the root is hidden.
+  - GPU state is one `TraceGpu` per view in `TraceGpus` (egui-wgpu shares one renderer, and so
+    the callback resources, across viewports).
+- **Staging buffers.** Each view keeps up to one window of undrawn samples in `VecDeque`s and
+  uploads a backlog in chunks of ≤ 32768 samples per frame.
+  - The earlier `Vec` + `drain(..)` shifted the whole window for every block: ~74 MB × 940/s
+    for 20 s × 62 ch. Whenever a window missed frames, that froze all windows for 5–100 s.
+  - A one-shot backlog upload also needed a buffer over the 128 MB storage-binding limit. That
+    crashed on the simulator; the rig's 46 ch sat exactly at the limit.
+- **Stall warning.** "trace window '…' stalled" in the log means an open window went over 2 s
+  without drawing or consuming samples while acquiring. It's expected while that window itself
+  is hidden.
+
 ## CPU comparison with the stock GUI (rig, 2026-11-05)
 
 `scripts/cpuload.py` (per process and thread, % of one core; the rig has 4 cores, no SMT).

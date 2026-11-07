@@ -2160,10 +2160,12 @@ name = "oers"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "crossbeam-channel",
  "eframe",
  "engine",
  "env_logger",
  "log",
+ "parking_lot",
  "serde",
  "serde_json",
 ]

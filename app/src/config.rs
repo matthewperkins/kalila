@@ -11,20 +11,68 @@ pub enum ViewFilter {
     Lfp,
 }
 
+/// Global display settings (spike tiles, frame rate) and the CAR used by spike detection and
+/// audio. Each trace window has its own `TraceViewSettings`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DisplaySettings {
+    pub spike_uv_range: f32,
+    pub spike_tau_s: f32,
+    pub spike_grid_cols: u32,
+    /// First spike-tile row shown (scrolled with the mouse wheel).
+    pub spike_first_row: usize,
+    pub max_fps: f32,
+    /// Common average reference for spike detection and audio.
+    pub car: CarSettings,
+}
+
+/// Common average reference for spike detection and the audio monitor (never recording).
+/// Channels are global electrode indices.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct CarSettings {
+    pub spikes: bool,
+    pub audio: bool,
+    /// Electrodes averaged into the reference.
+    pub reference: Vec<usize>,
+    /// Electrodes the reference is subtracted from.
+    pub subtract: Vec<usize>,
+}
+
+impl Default for DisplaySettings {
+    fn default() -> Self {
+        Self { spike_uv_range: 250.0, spike_tau_s: 3.0, spike_grid_cols: 8, spike_first_row: 0, max_fps: 144.0, car: CarSettings::default() }
+    }
+}
+
+/// A trace view's own display-only CAR (300–6k view). Global electrode indices.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ViewCar {
+    pub enabled: bool,
+    pub reference: Vec<usize>,
+    pub subtract: Vec<usize>,
+}
+
+/// One trace window: which channels it draws and how.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TraceViewSettings {
+    /// Stable id (GPU state, window identity).
+    pub id: u32,
+    pub name: String,
+    /// Window shown.
+    pub open: bool,
+    /// Headstages drawn, by name ("A1", "B1", …); empty = all.
+    pub headstages: Vec<String>,
+    pub aux: bool,
+    pub adc: bool,
     pub filter: ViewFilter,
     pub window_s: f32,
     pub uv_per_row: f32,
     pub rows: usize,
     pub first_row: usize,
     pub thickness: f32,
-    pub spike_uv_range: f32,
-    pub spike_tau_s: f32,
-    pub spike_grid_cols: u32,
-    pub split: f32,
-    pub max_fps: f32,
     /// Vertical range of one ADC trace row, in volts (rows are centred on 0 V).
     pub adc_v_per_row: f32,
     /// Shade the traces while a TTL input is high, plus a per-line strip at the bottom.
@@ -39,29 +87,37 @@ pub struct DisplaySettings {
     pub trig_pre_ms: f32,
     pub trig_post_ms: f32,
     pub trig_sweeps: u32,
-    /// Display-only common average reference, applied in the 300–6k view.
-    pub car: CarSettings,
+    pub car: ViewCar,
+    /// Control bar at the top of the window expanded.
+    pub controls: bool,
 }
 
-/// Common average reference (never recording). One pair of channel sets, switched on
-/// separately for the display (300–6k view), spike detection and the audio monitor.
-/// Channels are global electrode indices.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct CarSettings {
-    /// Display (300–6k view).
-    pub enabled: bool,
-    pub spikes: bool,
-    pub audio: bool,
-    /// Electrodes averaged into the reference.
-    pub reference: Vec<usize>,
-    /// Electrodes the reference is subtracted from.
-    pub subtract: Vec<usize>,
-}
-
-impl Default for DisplaySettings {
+impl Default for TraceViewSettings {
     fn default() -> Self {
-        Self { filter: ViewFilter::Spikes, window_s: 2.0, uv_per_row: 250.0, rows: 32, first_row: 0, thickness: 1.0, spike_uv_range: 250.0, spike_tau_s: 3.0, spike_grid_cols: 8, split: 0.62, max_fps: 144.0, adc_v_per_row: 5.0, ttl_overlay: true, per_row: 1, triggered: false, trig_line: 1, trig_pre_ms: 10.0, trig_post_ms: 40.0, trig_sweeps: 20, car: CarSettings::default() }
+        Self {
+            id: 0,
+            name: "Traces".into(),
+            open: true,
+            headstages: Vec::new(),
+            aux: true,
+            adc: true,
+            filter: ViewFilter::Spikes,
+            window_s: 2.0,
+            uv_per_row: 250.0,
+            rows: 32,
+            first_row: 0,
+            thickness: 1.0,
+            adc_v_per_row: 5.0,
+            ttl_overlay: true,
+            per_row: 1,
+            triggered: false,
+            trig_line: 1,
+            trig_pre_ms: 10.0,
+            trig_post_ms: 40.0,
+            trig_sweeps: 20,
+            car: ViewCar::default(),
+            controls: true,
+        }
     }
 }
 
@@ -105,6 +161,8 @@ pub struct Config {
     pub audio: AudioSettings,
     pub dsp: DspSettings,
     pub display: DisplaySettings,
+    /// Trace windows.
+    pub views: Vec<TraceViewSettings>,
     pub outputs: OutputSettings,
     pub record_root: PathBuf,
     /// "auto" (no vsync, wgpu picks immediate/mailbox/fifo), "vsync", "mailbox", "immediate", "fifo".
@@ -121,6 +179,7 @@ impl Default for Config {
             audio: AudioSettings::default(),
             dsp: DspSettings::default(),
             display: DisplaySettings::default(),
+            views: vec![TraceViewSettings::default()],
             outputs: OutputSettings::default(),
             record_root: home.join("oe-recordings"),
             present_mode: "auto".into(),
@@ -137,12 +196,30 @@ impl Config {
     }
     pub fn load() -> Self {
         match std::fs::read_to_string(Self::path()) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            Ok(s) => Self::parse(&s).unwrap_or_else(|e| {
                 log::warn!("config parse error ({e}); using defaults");
                 Self::default()
             }),
             Err(_) => Self::default(),
         }
+    }
+
+    /// Parse a saved config. Configs from before trace windows had the trace settings in
+    /// `display` (same field names, the display CAR in `display.car`): they become view 1.
+    fn parse(s: &str) -> serde_json::Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(s)?;
+        let mut cfg: Self = serde_json::from_value(v.clone())?;
+        if v.get("views").is_none() {
+            let mut view: TraceViewSettings = v.get("display").cloned().map(serde_json::from_value).transpose()?.unwrap_or_default();
+            view.id = 0;
+            view.name = "Traces".into();
+            view.open = true;
+            cfg.views = vec![view];
+        }
+        if cfg.views.is_empty() {
+            cfg.views.push(TraceViewSettings::default());
+        }
+        Ok(cfg)
     }
     pub fn save(&self) {
         let p = Self::path();
@@ -156,5 +233,34 @@ impl Config {
         {
             let _ = std::fs::rename(&tmp, &p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_display_settings_become_the_first_view() {
+        let old = r#"{"display": {"filter": "Lfp", "window_s": 7.0, "uv_per_row": 800.0, "per_row": 4,
+            "car": {"enabled": true, "spikes": true, "audio": false, "reference": [1, 2], "subtract": [2]},
+            "spike_grid_cols": 9}}"#;
+        let c = Config::parse(old).unwrap();
+        assert_eq!(c.views.len(), 1);
+        let v = &c.views[0];
+        assert_eq!((v.filter, v.window_s, v.uv_per_row, v.per_row), (ViewFilter::Lfp, 7.0, 800.0, 4));
+        assert_eq!(v.car, ViewCar { enabled: true, reference: vec![1, 2], subtract: vec![2] });
+        // The global (spikes/audio) CAR keeps its switches and sets.
+        assert!(c.display.car.spikes && !c.display.car.audio);
+        assert_eq!(c.display.car.reference, vec![1, 2]);
+        assert_eq!(c.display.spike_grid_cols, 9);
+    }
+
+    #[test]
+    fn new_configs_keep_their_views() {
+        let mut c = Config::default();
+        c.views.push(TraceViewSettings { id: 1, name: "Port B".into(), headstages: vec!["B1".into()], ..Default::default() });
+        let back = Config::parse(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.views, c.views);
     }
 }

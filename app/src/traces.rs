@@ -87,8 +87,26 @@ pub struct SweepFrame {
     pub filled: u32,
 }
 
-/// Everything the GPU needs for one frame.
+/// GPU state of every trace view, by view id (created on first use).
+pub struct TraceGpus {
+    format: wgpu::TextureFormat,
+    views: std::collections::HashMap<u32, TraceGpu>,
+}
+
+impl TraceGpus {
+    pub fn new(format: wgpu::TextureFormat) -> Self {
+        Self { format, views: Default::default() }
+    }
+    /// Free a deleted view's buffers.
+    pub fn remove(&mut self, view: u32) {
+        self.views.remove(&view);
+    }
+}
+
+/// Everything the GPU needs for one frame of one view.
 pub struct TraceFrame {
+    /// Which trace view (window) this frame belongs to.
+    pub view: u32,
     pub config: TraceConfig,
     pub reset: bool,
     /// Raw interleaved int16 samples (n_new × nch).
@@ -164,7 +182,7 @@ fn entry(binding: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 }
 
 impl TraceGpu {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("traces"), source: wgpu::ShaderSource::Wgsl(include_str!("traces.wgsl").into()) });
         let c = wgpu::ShaderStages::COMPUTE;
         let v = wgpu::ShaderStages::VERTEX;
@@ -298,8 +316,10 @@ pub struct TraceCallback(pub TraceFrame);
 
 impl egui_wgpu::CallbackTrait for TraceCallback {
     fn prepare(&self, device: &wgpu::Device, queue: &wgpu::Queue, _sd: &egui_wgpu::ScreenDescriptor, enc: &mut wgpu::CommandEncoder, res: &mut egui_wgpu::CallbackResources) -> Vec<wgpu::CommandBuffer> {
-        let Some(g) = res.get_mut::<TraceGpu>() else { return vec![] };
+        let Some(all) = res.get_mut::<TraceGpus>() else { return vec![] };
         let f = &self.0;
+        let format = all.format;
+        let g = all.views.entry(f.view).or_insert_with(|| TraceGpu::new(device, format));
         if f.config.nch == 0 || f.config.cols == 0 || f.config.window == 0 {
             return vec![];
         }
@@ -375,7 +395,7 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
     }
 
     fn paint(&self, _info: egui::PaintCallbackInfo, rp: &mut wgpu::RenderPass<'static>, res: &egui_wgpu::CallbackResources) {
-        let Some(g) = res.get::<TraceGpu>() else { return };
+        let Some(g) = res.get::<TraceGpus>().and_then(|a| a.views.get(&self.0.view)) else { return };
         let Some(r) = &g.res else { return };
         if r.instances == 0 {
             return;
