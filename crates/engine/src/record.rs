@@ -120,6 +120,15 @@ struct Recording {
     first_sample: Option<i64>,
     last_header_update: Instant,
     oebin: serde_json::Value,
+    dat_path: PathBuf,
+    ttl_dir: PathBuf,
+}
+
+impl Recording {
+    /// Read-back description, once the first sample is known.
+    fn source(&self) -> Option<RecSource> {
+        Some(RecSource { dat: self.dat_path.clone(), ttl_dir: self.ttl_dir.clone(), nch: self.main.channels, first_sample: self.first_sample?, sample_rate: self.layout.sample_rate })
+    }
 }
 
 fn stream_folder(stream: &str) -> String {
@@ -143,6 +152,7 @@ impl Recording {
         let main = mk_stream(&layout.name, layout.num_channels())?;
         let side = layout.side_streams.iter().map(|s| mk_stream(&s.name, s.channel_names.len())).collect::<Result<Vec<_>>>()?;
         let ed = dir.join("events").join(stream_folder(&layout.name)).join("TTL");
+        let dat_path = cont.join(stream_folder(&layout.name)).join("continuous.dat");
         fs::create_dir_all(&ed)?;
         let ttl = TtlFiles {
             states: NpyFile::create(&ed.join("states.npy"), "<i2")?,
@@ -152,7 +162,7 @@ impl Recording {
             last: None,
             initial: 0,
         };
-        let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, first_sample: None, last_header_update: Instant::now(), oebin: json!({}) };
+        let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, first_sample: None, last_header_update: Instant::now(), oebin: json!({}), dat_path, ttl_dir: ed };
         r.oebin = r.build_oebin();
         fs::write(dir.join("structure.oebin"), serde_json::to_string_pretty(&r.oebin)?)?;
         Ok(r)
@@ -318,6 +328,21 @@ pub struct RecStatus {
     pub root: Mutex<PathBuf>,
     /// Force a new date-time session directory on the next recording.
     pub new_session: AtomicBool,
+    /// The recording being written (or the last one), for reading back while it grows
+    /// (scroll-back review in the GUI). Set once its first sample is on its way to disk.
+    pub source: Mutex<Option<RecSource>>,
+}
+
+/// Where a recording's files are, for reading them back while they are written.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecSource {
+    /// Main stream's continuous.dat: int16, `nch` channels interleaved, sample `first_sample` first.
+    pub dat: PathBuf,
+    /// Its TTL folder (sample_numbers.npy, full_words.npy).
+    pub ttl_dir: PathBuf,
+    pub nch: usize,
+    pub first_sample: i64,
+    pub sample_rate: f64,
 }
 
 /// Whether the next recording starts a new date-time session directory: the first recording,
@@ -353,6 +378,9 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                         fail(&status, e);
                         rec = None;
                     } else {
+                        if status.source.lock().as_ref().is_none_or(|s| s.dat != r.dat_path) {
+                            *status.source.lock() = r.source();
+                        }
                         status.bytes.fetch_add(b.data.len() as u64 * 2, Ordering::Relaxed);
                         status.samples.fetch_add(b.len() as u64, Ordering::Relaxed);
                     }
