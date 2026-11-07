@@ -700,6 +700,8 @@ impl App {
                 self.engine.rec_status.new_session.store(true, Ordering::SeqCst);
                 self.toast("Next recording starts a new date-time directory");
             }
+            ui.small("A new date-time directory also starts on the first recording of each day.")
+                .on_hover_text("Recordings within one session directory become experiment1, experiment2, … (one per acquisition run) and recording1, recording2, … (one per Record press).");
             ui.small("Open Ephys Binary format (structure.oebin), readable by open-ephys-python-tools, SpikeInterface and Kilosort.");
             if let Some(d) = self.engine.rec_status.current_dir.lock().as_ref() {
                 ui.small(format!("Last: {}", d.display()));

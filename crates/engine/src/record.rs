@@ -320,9 +320,17 @@ pub struct RecStatus {
     pub new_session: AtomicBool,
 }
 
+/// Whether the next recording starts a new date-time session directory: the first recording,
+/// when asked ("New session directory"), or when the date has changed since the session began,
+/// so a program left open overnight doesn't file today's recordings under yesterday's date.
+fn needs_new_session(session_date: Option<chrono::NaiveDate>, today: chrono::NaiveDate, forced: bool) -> bool {
+    forced || session_date != Some(today)
+}
+
 pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
     let mut layout: Option<StreamLayout> = None;
     let mut session: Option<PathBuf> = None;
+    let mut session_date: Option<chrono::NaiveDate> = None;
     let mut experiment = 0u32;
     let mut recording_idx = 0u32;
     let mut acq_run_seen = false;
@@ -371,8 +379,11 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                     fail(&status, anyhow::anyhow!("cannot record: acquisition is not running"));
                     continue;
                 };
-                if session.is_none() || status.new_session.swap(false, Ordering::SeqCst) {
-                    let name = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+                let now = chrono::Local::now();
+                let forced = status.new_session.swap(false, Ordering::SeqCst);
+                if needs_new_session(session_date, now.date_naive(), forced) {
+                    let name = now.format("%Y-%m-%d_%H-%M-%S").to_string();
+                    session_date = Some(now.date_naive());
                     session = Some(status.root.lock().join(name).join(format!("Record Node {RECORD_NODE_ID}")));
                     experiment = 0;
                     acq_run_seen = true;
@@ -423,6 +434,15 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
 mod tests {
     use super::*;
     use rhythm::{ChannelInfo, SideStreamInfo};
+
+    #[test]
+    fn new_session_on_first_recording_when_forced_or_on_a_new_day() {
+        let d = |day| chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+        assert!(needs_new_session(None, d(5), false));
+        assert!(!needs_new_session(Some(d(5)), d(5), false));
+        assert!(needs_new_session(Some(d(5)), d(5), true));
+        assert!(needs_new_session(Some(d(5)), d(6), false));
+    }
 
     fn read_npy(path: &Path) -> (String, Vec<u8>) {
         let b = fs::read(path).unwrap();
