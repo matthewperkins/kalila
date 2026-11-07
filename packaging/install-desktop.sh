@@ -5,6 +5,17 @@ set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
 apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 mkdir -p "$apps"
+# Install icons into the hicolor theme so launchers that only resolve icon
+# names (e.g. hyprlauncher/hyprtoolkit) can find them, not just file paths.
+icons=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor
+for sz in 32 48 64 128 256; do
+    mkdir -p "$icons/${sz}x${sz}/apps"
+    cp "$root/packaging/icon/oers-$sz.png" "$icons/${sz}x${sz}/apps/oers.png"
+done
+# hyprtoolkit ignores theme dirs without an index.theme
+[ -f "$icons/index.theme" ] || cp /usr/share/icons/hicolor/index.theme "$icons/" 2>/dev/null || true
+# No scalable SVG: oers-icon.svg links src/*.svg by relative path, which breaks once copied.
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -qtf "$icons" || true
 cat >"$apps/oers.desktop" <<DESK
 [Desktop Entry]
 Type=Application
@@ -12,7 +23,7 @@ Name=oers
 GenericName=Open Ephys acquisition (Rust)
 Comment=Acquire and record from the Open Ephys ONI acquisition board
 Exec=$root/packaging/oers-launch.sh
-Icon=$root/packaging/icon/oers-256.png
+Icon=oers
 Terminal=false
 Categories=Science;
 StartupWMClass=oers
