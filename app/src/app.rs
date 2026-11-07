@@ -1,7 +1,7 @@
 use crate::config::{Config, OutputSettings, ViewFilter};
 use crate::spikes::{SLOTS, SpikeCallback, SpikeFrame, SpikeGpu};
 use crate::sweep::Sweeps;
-use crate::traces::{MAX_CUTS, MAX_SECTIONS, RING, SweepFrame, TraceCallback, TraceConfig, TraceFrame, TraceGpus};
+use crate::traces::{MAX_CUTS, MAX_SECTIONS, RING, SweepFrame, TraceCallback, TraceConfig, TraceFrame, TraceGpus, review_key};
 use crate::ttl::{TtlGeom, TtlOverlay};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use eframe::egui_wgpu;
@@ -187,6 +187,10 @@ impl App {
             }
             sh.acquiring = self.engine.is_acquiring();
             sh.max_fps = self.cfg.display.max_fps;
+            let src = self.engine.rec_status.source.lock().clone();
+            if sh.rec_source != src {
+                sh.rec_source = src;
+            }
             sh.drain();
             sh.check_stalls();
         }

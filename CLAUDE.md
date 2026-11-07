@@ -159,6 +159,25 @@ Committed per feature where the code separates; the GUI features share one commi
   without drawing or consuming samples while acquiring. It's expected while that window itself
   is hidden.
 
+## Scroll-back review, phase 1 (simulator, 2026-11-07)
+
+Spike2-style scrubbing through the ongoing recording, per trace window (`app/src/review.rs`,
+`review_view` in `app/src/app/views.rs`). Plan and later phases: memory `review-scrollback-plan`.
+- **Source.** It reads the recording's `continuous.dat` and TTL `.npy` files, which the recorder
+  publishes in `RecStatus.source`. A "review-reader" thread does the reading, only up to the
+  flushed length, and never touches acquisition or the recorder. Without a recording there is
+  nothing to review; the window shows a note instead.
+- **Filtering.** Each read includes a lead-in so the display filter settles: Raw 0 s,
+  300–6k 0.05 s, LFP 1.5 s. Two GPU states per view (`review_key`) are double-buffered; the back
+  one is fed in chunks without painting and swapped in when complete.
+- **Controls.**
+  - Drag, Shift+wheel or ←/→ pan; panning back or Home enters review; End or "LIVE ▸" leaves.
+  - Alt+wheel and `+`/`-` set the time base in both modes, like typing into the time box. Live
+    allows 0.05–20 s (one window of samples is kept in RAM); review 5 ms–60 s, clamped on
+    return to live.
+  - A badge shows how far behind live the view is; an overview strip below jumps on click or drag.
+- Not yet: a min/max pyramid for spans over 60 s, typed notes, signal-level triggers.
+
 ## CPU comparison with the stock GUI (rig, 2026-11-05)
 
 `scripts/cpuload.py` (per process and thread, % of one core; the rig has 4 cores, no SMT).

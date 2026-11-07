@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod review;
 mod spikes;
 mod sweep;
 mod traces;

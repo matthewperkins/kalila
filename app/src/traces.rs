@@ -97,9 +97,11 @@ impl TraceGpus {
     pub fn new(format: wgpu::TextureFormat) -> Self {
         Self { format, views: Default::default() }
     }
-    /// Free a deleted view's buffers.
+    /// Free a deleted view's buffers (live and review).
     pub fn remove(&mut self, view: u32) {
         self.views.remove(&view);
+        self.views.remove(&review_key(view, 0));
+        self.views.remove(&review_key(view, 1));
     }
 }
 
@@ -131,6 +133,16 @@ pub struct TraceFrame {
     pub sweep: SweepFrame,
     /// Apply the display CAR (chinfo flag bits 1/2).
     pub car: bool,
+    /// Columns hidden ahead of the sweep cursor; `None` = the live default, `Some(0)` for a
+    /// static (review) image.
+    pub gap: Option<u32>,
+    /// Draw this frame. False while a review image is built in its back buffer.
+    pub paint: bool,
+}
+
+/// GPU-state key of a window's review buffers (0 and 1); its live state uses the bare view id.
+pub fn review_key(view: u32, buf: u8) -> u32 {
+    view | (1 + buf as u32 % 2) << 30
 }
 
 pub struct TraceGpu {
@@ -378,7 +390,7 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
             first_row: f.first_row,
             nch: f.config.nch as u32,
             cursor: f.cursor_col,
-            gap: (f.config.cols / 80).max(2),
+            gap: f.gap.unwrap_or((f.config.cols / 80).max(2)),
             uv_per_row: f.uv_per_row,
             row_h: f.row_h_px,
             thickness: f.thickness_px,
@@ -395,6 +407,9 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
     }
 
     fn paint(&self, _info: egui::PaintCallbackInfo, rp: &mut wgpu::RenderPass<'static>, res: &egui_wgpu::CallbackResources) {
+        if !self.0.paint {
+            return;
+        }
         let Some(g) = res.get::<TraceGpus>().and_then(|a| a.views.get(&self.0.view)) else { return };
         let Some(r) = &g.res else { return };
         if r.instances == 0 {
