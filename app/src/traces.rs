@@ -9,7 +9,8 @@ use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use std::sync::Arc;
 
-pub const MAX_SECTIONS: usize = 4;
+/// Biquad sections in a view's filter bank (all presets together).
+pub const MAX_SECTIONS: usize = 8;
 /// Ring of filtered samples per channel for triggered sweeps (≈1.1 s at 30 kHz).
 pub const RING: u32 = 1 << 15;
 /// Triggers cut per frame at most (uniform array size in traces.wgsl).
@@ -28,7 +29,8 @@ struct IngestU {
     ring: u32,
     car: u32,
     _p: [u32; 3],
-    coef: [[f32; 4]; 8],
+    fsec: [u32; 4],
+    coef: [[f32; 4]; 16],
 }
 
 #[repr(C)]
@@ -69,9 +71,40 @@ pub struct TraceConfig {
     pub nch: usize,
     pub cols: u32,
     pub window: u32,
-    pub sections: Vec<[f32; 5]>, // b0 b1 b2 a1 a2
+    pub bank: FilterBank,
     /// Sweep slots; 0 = free-running (no ring, no sweep store).
     pub nslots: u32,
+}
+
+/// Every display filter preset of a view in one table, so each channel can use its own
+/// (`chinfo` flag bits 3-4 pick the preset).
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct FilterBank {
+    /// b0 b1 b2 a1 a2
+    pub sections: Vec<[f32; 5]>,
+    /// Per preset (`ViewFilter::index`): first section | count << 8.
+    pub fsec: [u32; 4],
+}
+
+impl FilterBank {
+    pub fn new(fs: f64, hp_hz: f32) -> Self {
+        use crate::config::ViewFilter;
+        use engine::dsp::BandSpec;
+        let mut b = FilterBank::default();
+        for f in ViewFilter::ALL {
+            let secs = match f {
+                ViewFilter::Raw => vec![],
+                ViewFilter::Spikes => BandSpec::SPIKES.sections(fs),
+                ViewFilter::Lfp => BandSpec::LFP.sections(fs),
+                ViewFilter::Hp => BandSpec { low_hz: hp_hz.clamp(0.1, 1000.0) as f64, high_hz: 0.0, order: 2 }.sections(fs),
+            };
+            let start = b.sections.len();
+            let secs: Vec<[f32; 5]> = secs.into_iter().take(4.min(MAX_SECTIONS - start)).map(|q| [q.b0, q.b1, q.b2, q.a1, q.a2]).collect();
+            b.fsec[f.index()] = start as u32 | (secs.len() as u32) << 8;
+            b.sections.extend(secs);
+        }
+        b
+    }
 }
 
 /// Triggered-mode state for one frame.
@@ -126,7 +159,7 @@ pub struct TraceFrame {
     pub thickness_px: f32,
     pub colors: Option<Arc<Vec<[f32; 4]>>>,
     pub order: Option<Arc<Vec<u32>>>,
-    /// Per-channel (gain, filter 0/1, units_per_row or 0 for global µV/row, center); see traces.wgsl.
+    /// Per-channel (gain, flags incl. filter preset, units_per_row or 0 for global µV/row, center); see traces.wgsl.
     pub chinfo: Option<Arc<Vec<[f32; 4]>>>,
     /// Per-row (first index into `order`, channel count).
     pub rowtab: Option<Arc<Vec<[u32; 2]>>>,
@@ -348,13 +381,12 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
                 v.extend_from_slice(&[0, 0]);
                 queue.write_buffer(&r.raw, 0, &v);
             }
-            let mut coef = [[0f32; 4]; 8];
-            let nsec = f.config.sections.len().min(MAX_SECTIONS);
-            for (i, s) in f.config.sections.iter().take(nsec).enumerate() {
+            let mut coef = [[0f32; 4]; 16];
+            for (i, s) in f.config.bank.sections.iter().take(MAX_SECTIONS).enumerate() {
                 coef[2 * i] = [s[0], s[1], s[2], 0.0];
                 coef[2 * i + 1] = [s[3], s[4], 0.0, 0.0];
             }
-            let u = IngestU { nch: f.config.nch as u32, n_new: f.n_new, window: f.config.window, cols: f.config.cols, pos0: f.pos0, nsec: nsec as u32, ring0: f.sweep.ring0, ring: if trig { RING } else { 0 }, car: f.car as u32, _p: [0; 3], coef };
+            let u = IngestU { nch: f.config.nch as u32, n_new: f.n_new, window: f.config.window, cols: f.config.cols, pos0: f.pos0, nsec: 0, ring0: f.sweep.ring0, ring: if trig { RING } else { 0 }, car: f.car as u32, _p: [0; 3], fsec: f.config.bank.fsec, coef };
             queue.write_buffer(&g.ingest_u, 0, bytemuck::bytes_of(&u));
             // Each dispatch is its own synchronisation scope: filt → carmean → fold.
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ingest"), timestamp_writes: None });
@@ -418,5 +450,48 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
         rp.set_pipeline(&g.render_pipe);
         rp.set_bind_group(0, &r.render_bg, &[]);
         rp.draw(0..r.vertex_count, 0..r.instances);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ViewFilter;
+
+    /// |H(f)| of a section chain given as [b0 b1 b2 a1 a2].
+    fn gain(secs: &[[f32; 5]], fs: f64, f: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * f / fs;
+        let (c1, s1, c2, s2) = (w.cos(), -w.sin(), (2.0 * w).cos(), -(2.0 * w).sin());
+        secs.iter().fold(1.0, |g, q| {
+            let q: Vec<f64> = q.iter().map(|&v| v as f64).collect();
+            let num = ((q[0] + q[1] * c1 + q[2] * c2).powi(2) + (q[1] * s1 + q[2] * s2).powi(2)).sqrt();
+            let den = ((1.0 + q[3] * c1 + q[4] * c2).powi(2) + (q[3] * s1 + q[4] * s2).powi(2)).sqrt();
+            g * num / den
+        })
+    }
+
+    #[test]
+    fn filter_bank_holds_every_preset() {
+        let fs = 30000.0;
+        let b = FilterBank::new(fs, 10.0);
+        assert!(b.sections.len() <= MAX_SECTIONS);
+        let preset = |f: ViewFilter| {
+            let v = b.fsec[f.index()];
+            let (s0, n) = ((v & 0xff) as usize, (v >> 8) as usize);
+            assert!(n <= 4, "shader keeps 4 sections of state per channel");
+            b.sections[s0..s0 + n].to_vec()
+        };
+        assert!(preset(ViewFilter::Raw).is_empty());
+        let hp = preset(ViewFilter::Hp);
+        assert!((gain(&hp, fs, 10.0) - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.02);
+        assert!(gain(&hp, fs, 1.0) < 0.02, "drift is removed");
+        assert!((gain(&hp, fs, 200.0) - 1.0).abs() < 0.01, "EMG band passes");
+        let sp = preset(ViewFilter::Spikes);
+        assert!((gain(&sp, fs, 1500.0) - 1.0).abs() < 0.05 && gain(&sp, fs, 50.0) < 1e-3);
+        let lfp = preset(ViewFilter::Lfp);
+        assert!((gain(&lfp, fs, 30.0) - 1.0).abs() < 0.05 && gain(&lfp, fs, 3000.0) < 0.02);
+        // The HP corner follows the setting.
+        let b2 = FilterBank::new(fs, 30.0);
+        assert_ne!(b, b2);
     }
 }

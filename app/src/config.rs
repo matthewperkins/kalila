@@ -4,11 +4,44 @@ use engine::rhythm::BoardSettings;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Display filter presets of a trace view (display only; recordings stay raw).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ViewFilter {
     Raw,
     Spikes,
     Lfp,
+    /// Raw minus drift: a gentle high-pass at `TraceViewSettings::hp_hz` (movement artefacts).
+    Hp,
+}
+
+impl ViewFilter {
+    pub const ALL: [ViewFilter; 4] = [ViewFilter::Raw, ViewFilter::Hp, ViewFilter::Spikes, ViewFilter::Lfp];
+    /// Index into per-filter tables (and the shader's preset number).
+    pub fn index(self) -> usize {
+        match self {
+            ViewFilter::Raw => 0,
+            ViewFilter::Spikes => 1,
+            ViewFilter::Lfp => 2,
+            ViewFilter::Hp => 3,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewFilter::Raw => "Raw",
+            ViewFilter::Spikes => "300–6k",
+            ViewFilter::Lfp => "LFP",
+            ViewFilter::Hp => "HP",
+        }
+    }
+    /// One letter, for the per-row chips.
+    pub fn letter(self) -> &'static str {
+        match self {
+            ViewFilter::Raw => "R",
+            ViewFilter::Spikes => "S",
+            ViewFilter::Lfp => "L",
+            ViewFilter::Hp => "H",
+        }
+    }
 }
 
 /// Global display settings (spike tiles, frame rate) and the CAR used by spike detection and
@@ -67,9 +100,18 @@ pub struct TraceViewSettings {
     pub headstages: Vec<String>,
     pub aux: bool,
     pub adc: bool,
+    /// Filter of every channel without its own entry in `channel_filter`.
     pub filter: ViewFilter,
+    /// Per-channel filters, keyed by `"<headstage>:<index in headstage>"` (so they survive
+    /// regrouping rows and channel-count changes on other ports). Empty = all use `filter`.
+    pub channel_filter: std::collections::BTreeMap<String, ViewFilter>,
+    /// High-pass corner of the HP preset (Hz).
+    pub hp_hz: f32,
     pub window_s: f32,
+    /// µV/row for a filter without its own entry in `uv_by_filter`.
     pub uv_per_row: f32,
+    /// µV/row per filter (by `ViewFilter::index`); 0 = use `uv_per_row`.
+    pub uv_by_filter: [f32; 4],
     pub rows: usize,
     pub first_row: usize,
     pub thickness: f32,
@@ -102,8 +144,11 @@ impl Default for TraceViewSettings {
             aux: true,
             adc: true,
             filter: ViewFilter::Spikes,
+            channel_filter: Default::default(),
+            hp_hz: 10.0,
             window_s: 2.0,
             uv_per_row: 250.0,
+            uv_by_filter: [0.0; 4],
             rows: 32,
             first_row: 0,
             thickness: 1.0,
@@ -118,6 +163,21 @@ impl Default for TraceViewSettings {
             car: ViewCar::default(),
             controls: true,
         }
+    }
+}
+
+impl TraceViewSettings {
+    /// µV/row of electrodes drawn with filter `f`.
+    pub fn uv(&self, f: ViewFilter) -> f32 {
+        let v = self.uv_by_filter[f.index()];
+        if v > 0.0 { v } else { self.uv_per_row }
+    }
+    pub fn set_uv(&mut self, f: ViewFilter, v: f32) {
+        self.uv_by_filter[f.index()] = v.clamp(10.0, 5000.0);
+    }
+    /// Filter of the electrode with key `key` (see `channel_filter`).
+    pub fn filter_of(&self, key: Option<&str>) -> ViewFilter {
+        key.and_then(|k| self.channel_filter.get(k)).copied().unwrap_or(self.filter)
     }
 }
 
@@ -238,6 +298,24 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn per_filter_scale_and_channel_filter() {
+        let mut v = TraceViewSettings { uv_per_row: 300.0, ..Default::default() };
+        assert_eq!(v.uv(ViewFilter::Raw), 300.0, "unset scales fall back to uv_per_row");
+        v.set_uv(ViewFilter::Raw, 1200.0);
+        assert_eq!((v.uv(ViewFilter::Raw), v.uv(ViewFilter::Spikes)), (1200.0, 300.0));
+        v.filter = ViewFilter::Raw;
+        v.channel_filter.insert("B1:3".into(), ViewFilter::Hp);
+        assert_eq!(v.filter_of(Some("B1:3")), ViewFilter::Hp);
+        assert_eq!(v.filter_of(Some("B1:4")), ViewFilter::Raw);
+        assert_eq!(v.filter_of(None), ViewFilter::Raw);
+        // Old configs (no per-channel fields) still load.
+        let old: TraceViewSettings = serde_json::from_str(r#"{"filter":"Lfp","uv_per_row":800.0}"#).unwrap();
+        assert!(old.channel_filter.is_empty() && old.hp_hz == 10.0 && old.uv(ViewFilter::Lfp) == 800.0);
+        let back: TraceViewSettings = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back, v);
+    }
     use super::*;
 
     #[test]

@@ -35,7 +35,7 @@ pub(super) struct ViewState {
     last_chinfo: Option<Vec<[f32; 4]>>,
     sweeps: Sweeps,
     /// (pre, post, line, slots, filter, cols): a change clears the sweeps.
-    sweep_key: Option<(u32, u32, usize, u32, ViewFilter, u32)>,
+    sweep_key: Option<(u32, u32, usize, u32, u64, u32)>,
     pub colors_dirty: bool,
     // Diagnostics: when the view was last drawn / last got samples, and whether a stall
     // warning is outstanding.
@@ -233,19 +233,108 @@ fn nav_input(ui: &egui::Ui, resp: &egui::Response, plot: egui::Rect) -> Nav {
     n
 }
 
-/// Per-channel GPU info for a view (see traces.wgsl): gain; flags (bit 0 display filter,
+/// Key of an electrode in `TraceViewSettings::channel_filter`: headstage name and index
+/// within it ("B1:5"), stable when rows are regrouped or another port changes size.
+pub(super) fn chan_key(l: &StreamLayout, ch: usize) -> Option<String> {
+    let c = l.channels.get(ch)?;
+    if c.kind != ChannelKind::Electrode {
+        return None;
+    }
+    let hs = c.headstage?;
+    let k = l.channels[..ch].iter().filter(|o| o.kind == ChannelKind::Electrode && o.headstage == Some(hs)).count();
+    Some(format!("{}:{k}", l.headstages.get(hs)?.name))
+}
+
+/// Display filter of every channel (AUX/ADC are always drawn raw).
+pub(super) fn chan_filters(l: &StreamLayout, d: &TraceViewSettings) -> Vec<ViewFilter> {
+    (0..l.num_channels()).map(|i| if l.channels[i].kind == ChannelKind::Electrode { d.filter_of(chan_key(l, i).as_deref()) } else { ViewFilter::Raw }).collect()
+}
+
+/// Filters in use among the electrodes drawn in a view (in `ViewFilter::ALL` order).
+fn used_filters(l: &StreamLayout, filters: &[ViewFilter], row_ch: &[u32]) -> Vec<ViewFilter> {
+    ViewFilter::ALL.into_iter().filter(|f| row_ch.iter().any(|&c| l.channels[c as usize].kind == ChannelKind::Electrode && filters[c as usize] == *f)).collect()
+}
+
+/// Display CAR applies to the 300–6k electrodes only (reference and subtraction alike).
+fn car_applies(d: &TraceViewSettings, used: &[ViewFilter]) -> bool {
+    d.car.enabled && used.contains(&ViewFilter::Spikes)
+}
+
+/// Set channels' filters (a row chip); if that leaves one filter for every drawn electrode,
+/// it becomes the view's filter again and the per-channel entries go.
+fn set_row_filter(l: &StreamLayout, d: &mut TraceViewSettings, chans: &[usize], f: ViewFilter, row_ch: &[u32]) {
+    for &c in chans {
+        if let Some(k) = chan_key(l, c) {
+            d.channel_filter.insert(k, f);
+        }
+    }
+    let used = used_filters(l, &chan_filters(l, d), row_ch);
+    if let [only] = used[..] {
+        d.filter = only;
+        d.channel_filter.clear();
+    }
+}
+
+/// µV/row text for the status line: one value, or one per filter in use.
+fn uv_text(d: &TraceViewSettings, used: &[ViewFilter]) -> String {
+    match used {
+        [] => format!("{:.0} µV/row", d.uv(d.filter)),
+        [f] => format!("{:.0} µV/row", d.uv(*f)),
+        _ => format!("{} µV/row", used.iter().map(|f| format!("{} {:.0}", f.letter(), d.uv(*f))).collect::<Vec<_>>().join(" ")),
+    }
+}
+
+/// Per-channel GPU info for a view (see traces.wgsl): gain; flags (bits 3-4 filter preset,
 /// bit 1 CAR reference, bit 2 CAR subtract; electrodes only); units per row; centre.
-fn view_chinfo(l: &StreamLayout, d: &TraceViewSettings) -> Vec<[f32; 4]> {
+fn view_chinfo(l: &StreamLayout, d: &TraceViewSettings, filters: &[ViewFilter]) -> Vec<[f32; 4]> {
     let in_set = |set: &[usize], ch: usize| set.contains(&ch);
     l.channels
         .iter()
         .enumerate()
         .map(|(i, c)| match c.kind {
-            ChannelKind::Electrode => [c.bit_volts, (1 + 2 * in_set(&d.car.reference, i) as u32 + 4 * in_set(&d.car.subtract, i) as u32) as f32, 0.0, 0.0],
+            ChannelKind::Electrode => {
+                let f = filters[i];
+                let car = f == ViewFilter::Spikes;
+                let flags = 8 * f.index() as u32 + 2 * (car && in_set(&d.car.reference, i)) as u32 + 4 * (car && in_set(&d.car.subtract, i)) as u32;
+                [c.bit_volts, flags as f32, d.uv(f), 0.0]
+            }
             ChannelKind::Aux => [c.bit_volts, 0.0, 2.5, 0.0],
             ChannelKind::Adc => [c.bit_volts, 0.0, d.adc_v_per_row, 0.0],
         })
         .collect()
+}
+
+/// Width of the per-row filter chip (points), right of the channel label.
+const CHIP_W: f32 = 44.0;
+
+/// Grey diagonal stripes over a button: "no single setting" (rows differ).
+fn hatch(p: &egui::Painter, r: egui::Rect) {
+    let p = p.with_clip_rect(r.intersect(p.clip_rect()));
+    let stroke = Stroke::new(2.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120));
+    let mut x = r.min.x - r.height();
+    while x < r.max.x {
+        p.line_segment([egui::pos2(x, r.max.y), egui::pos2(x + r.height(), r.min.y)], stroke);
+        x += 6.0;
+    }
+}
+
+/// Hover text of a filter preset.
+fn filter_help(f: ViewFilter, hp_hz: f32) -> String {
+    match f {
+        ViewFilter::Raw => "Raw: unfiltered".into(),
+        ViewFilter::Hp => format!("HP: high-pass at {hp_hz:.1} Hz (raw minus drift and movement)"),
+        ViewFilter::Spikes => "300–6k: spike band (display CAR applies here)".into(),
+        ViewFilter::Lfp => "LFP: 1–300 Hz".into(),
+    }
+}
+
+/// Identifies the per-channel filters (a change clears the sweeps).
+fn filters_hash(filters: &[ViewFilter], hp_hz: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    filters.hash(&mut h);
+    hp_hz.to_bits().hash(&mut h);
+    h.finish()
 }
 
 /// Rows of one view: channel order (electrodes, then AUX/ADC) and per-row (first, count).
@@ -452,6 +541,11 @@ impl ViewsShared {
         let old = d.clone();
         let mut clear_sweeps = false;
         let mut open_car = false;
+        let mut hint = false;
+        // Filters in use among the drawn electrodes; more than one = per-row filters.
+        let used = l.as_ref().map(|l| used_filters(l, &chan_filters(l, d), &view_rows(l, d).0)).unwrap_or_default();
+        let mixed = used.len() > 1;
+        let uniform = used.first().copied().filter(|_| !mixed).unwrap_or(d.filter);
         ui.horizontal_wrapped(|ui| {
             ui.toggle_value(&mut d.controls, "Controls").on_hover_text("Show or hide this window's settings");
             ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(90.0));
@@ -480,11 +574,28 @@ impl ViewsShared {
                 }
                 ui.separator();
             }
-            ui.selectable_value(&mut d.filter, ViewFilter::Raw, "Raw");
-            ui.selectable_value(&mut d.filter, ViewFilter::Spikes, "300–6k");
-            ui.selectable_value(&mut d.filter, ViewFilter::Lfp, "LFP");
+            // The view's filter. With per-row filters the presets in use are hatched, and
+            // Shift-click (or right-click) sets every row; a plain click only explains that.
+            for f in ViewFilter::ALL {
+                let sel = !mixed && uniform == f;
+                let help = if mixed { format!("{}\nRows use different filters: Shift-click or right-click to set every row", filter_help(f, d.hp_hz)) } else { format!("{}\nEvery row; the chips left of the traces set single rows", filter_help(f, d.hp_hz)) };
+                let r = ui.selectable_label(sel, f.label()).on_hover_text(help);
+                if mixed && used.contains(&f) {
+                    hatch(ui.painter(), r.rect.shrink(1.0));
+                }
+                let force = r.secondary_clicked() || (r.clicked() && ui.input(|i| i.modifiers.shift));
+                if force || (r.clicked() && !mixed) {
+                    d.filter = f;
+                    d.channel_filter.clear();
+                } else if r.clicked() {
+                    hint = true;
+                }
+            }
+            if used.contains(&ViewFilter::Hp) || (used.is_empty() && d.filter == ViewFilter::Hp) {
+                ui.add(egui::DragValue::new(&mut d.hp_hz).range(0.5..=300.0).speed(0.2).prefix("HP ").suffix(" Hz")).on_hover_text("High-pass corner of the HP filter (2nd-order Butterworth)");
+            }
             ui.separator();
-            ui.add_enabled(d.filter == ViewFilter::Spikes, egui::Checkbox::new(&mut d.car.enabled, "CAR")).on_hover_text("Display-only common average reference, in the 300–6k view");
+            ui.add_enabled(used.contains(&ViewFilter::Spikes) || (used.is_empty() && d.filter == ViewFilter::Spikes), egui::Checkbox::new(&mut d.car.enabled, "CAR")).on_hover_text("Display-only common average reference, in the 300–6k view");
             if ui.small_button("Channels…").on_hover_text(format!("CAR reference {} · subtract {}", d.car.reference.len(), d.car.subtract.len())).clicked() {
                 open_car = true;
             }
@@ -494,7 +605,15 @@ impl ViewsShared {
                 // One time base for live and review; review reaches further (5 ms to 60 s).
                 let range = if reviewing { REVIEW_MIN_S..=REVIEW_MAX_S } else { LIVE_MIN_S..=LIVE_MAX_S };
                 ui.add(egui::DragValue::new(&mut d.window_s).range(range).speed(0.02).suffix(" s")).on_hover_text(if reviewing { "Time window (review: 5 ms – 60 s)" } else { "Time window" });
-                ui.add(egui::DragValue::new(&mut d.uv_per_row).range(10.0..=5000.0).speed(2.0).suffix(" µV/row"));
+                // µV/row is kept per filter: one box, or one per filter in use.
+                let shown: Vec<ViewFilter> = if mixed { used.clone() } else { vec![uniform] };
+                for f in shown {
+                    let mut uv = d.uv(f);
+                    let prefix = if mixed { format!("{} ", f.letter()) } else { String::new() };
+                    if ui.add(egui::DragValue::new(&mut uv).range(10.0..=5000.0).speed(2.0).prefix(prefix).suffix(" µV/row")).on_hover_text(format!("{} rows (Ctrl+wheel over a row scales its filter)", f.label())).changed() {
+                        d.set_uv(f, uv);
+                    }
+                }
                 ui.add(egui::DragValue::new(&mut d.rows).range(1..=512).prefix("rows "));
                 ui.label("per row");
                 for n in [1u32, 2, 4, 8] {
@@ -539,6 +658,9 @@ impl ViewsShared {
         if open_car {
             self.car_open = Some(id);
         }
+        if hint {
+            self.states[vi].note = Some((Instant::now() + Duration::from_secs(3), "Rows use different filters: Shift-click or right-click to set every row".into()));
+        }
         if clear_sweeps {
             self.states[vi].sweeps.clear();
         }
@@ -571,7 +693,10 @@ impl ViewsShared {
             return;
         }
         let ppp = ui.ctx().pixels_per_point();
-        let label_w = 64.0;
+        let filters = chan_filters(&l, &d);
+        let used = used_filters(&l, &filters, &row_ch);
+        // Room for the per-row filter chips when the view draws electrodes.
+        let label_w = if used.is_empty() { 64.0 } else { 64.0 + CHIP_W };
         let trig = d.triggered;
         let fs = l.sample_rate;
         let k = d.per_row.clamp(1, 8) as usize;
@@ -598,9 +723,16 @@ impl ViewsShared {
         if resp.hovered() {
             let (scroll, ctrl, alt) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl, i.modifiers.alt));
             if scroll != 0.0 && !alt {
+                // Ctrl+wheel scales the filter of the row under the pointer (every filter
+                // in use when it isn't over an electrode row).
+                let over = resp.hover_pos().filter(|p| plot.contains(*p)).map(|p| first + (((p.y - plot.min.y) / plot.height() * rows as f32) as usize).min(rows - 1));
+                let row_f = over.map(|r| row_ch[rowtab[r][0] as usize] as usize).filter(|&c| l.channels[c].kind == ChannelKind::Electrode).map(|c| filters[c]);
                 let v = &mut self.settings[vi];
                 if ctrl {
-                    v.uv_per_row = (d.uv_per_row * (1.0 - scroll * 0.002)).clamp(10.0, 5000.0);
+                    let scale = 1.0 - scroll * 0.002;
+                    for f in row_f.map_or_else(|| if used.is_empty() { vec![d.filter] } else { used.clone() }, |f| vec![f]) {
+                        v.set_uv(f, d.uv(f) * scale);
+                    }
                 } else {
                     let step = (scroll / 20.0).round() as isize;
                     v.first_row = (first as isize - step).clamp(0, (nrows_all - rows) as isize) as usize;
@@ -617,18 +749,10 @@ impl ViewsShared {
         }
         let in_review = !trig && self.states[vi].review.is_some();
         let window = (d.window_s as f64 * fs).round().max(cols as f64) as u32;
-        let sections: Vec<[f32; 5]> = match d.filter {
-            ViewFilter::Raw => vec![],
-            ViewFilter::Spikes => BandSpec::SPIKES.sections(fs),
-            ViewFilter::Lfp => BandSpec::LFP.sections(fs),
-        }
-        .into_iter()
-        .take(MAX_SECTIONS)
-        .map(|b| [b.b0, b.b1, b.b2, b.a1, b.a2])
-        .collect();
+        let bank = FilterBank::new(fs, d.hp_hz);
         if in_review {
             let g = ReviewGeom { rect, plot, strip, ttl_h, label_w, cols, rows, first, k, ppp };
-            self.review_view(ui, &resp, vi, &l, &d, &g, sections, &row_ch, &rowtab, &ttl_lines);
+            self.review_view(ui, &resp, vi, &l, &d, &g, bank, &filters, &row_ch, &rowtab, &ttl_lines);
             return;
         }
         let vs = &mut self.states[vi];
@@ -637,7 +761,7 @@ impl ViewsShared {
         let post = ((d.trig_post_ms as f64 * 1e-3 * fs).round() as u32).clamp(1, RING / 4);
         let span = pre + post;
         let nslots = if trig { d.trig_sweeps.clamp(1, 50) } else { 0 };
-        let config = TraceConfig { nch, cols, window, sections, nslots };
+        let config = TraceConfig { nch, cols, window, bank, nslots };
         vs.last_drawn = Instant::now();
         if vs.last_cfg.as_ref() != Some(&config) {
             if let Some(c) = vs.last_cfg.as_ref().filter(|c| c.cols != config.cols || c.window != config.window || c.nch != config.nch || c.nslots != config.nslots) {
@@ -647,7 +771,7 @@ impl ViewsShared {
             vs.last_cfg = Some(config.clone());
         }
         // Old sweeps are meaningless after a change of window, line, filter or geometry.
-        let sweep_key = (pre, post, d.trig_line, nslots, d.filter, cols);
+        let sweep_key = (pre, post, d.trig_line, nslots, filters_hash(&filters, d.hp_hz), cols);
         if vs.reset || vs.sweep_key != Some(sweep_key) {
             vs.sweeps.clear();
             vs.sweep_key = Some(sweep_key);
@@ -687,9 +811,9 @@ impl ViewsShared {
         let row_h_px = plot.height() * ppp / rows as f32;
         // Per-channel scaling (see traces.wgsl): electrodes follow the view's µV/row and
         // display filter; AUX/ADC are drawn raw in volts on their own row range.
-        // Flags: bit 0 display filter, bit 1 CAR reference, bit 2 CAR subtract (electrodes).
-        let car_on = d.car.enabled && d.filter == ViewFilter::Spikes;
-        let info = view_chinfo(&l, &d);
+        // Flags: bits 3-4 filter preset, bit 1 CAR reference, bit 2 CAR subtract (electrodes).
+        let car_on = car_applies(&d, &used);
+        let info = view_chinfo(&l, &d, &filters);
         let tables_key = (row_ch.clone(), rowtab.clone(), d.adc_v_per_row.to_bits());
         let send_tables = vs.reset || vs.tables_key.as_ref() != Some(&tables_key);
         if vs.tables_key.as_ref().is_some_and(|t| t.1 != tables_key.1) {
@@ -717,7 +841,7 @@ impl ViewsShared {
             first_row: first as u32,
             nrows: rows as u32,
             kmax: k as u32,
-            uv_per_row: d.uv_per_row,
+            uv_per_row: d.uv(d.filter),
             row_h_px,
             thickness_px: d.thickness * ppp.max(1.0),
             colors,
@@ -742,7 +866,7 @@ impl ViewsShared {
         }
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(frame)));
         // Overlay: labels, separators, cursor / time axis.
-        let analog_visible = self.row_labels(ui, &p, rect, plot, rows, first, &row_ch, &rowtab, &l, &resp, label_w);
+        let analog_visible = self.row_labels(ui, &p, vi, rect, plot, rows, first, &row_ch, &rowtab, &l, &resp, label_w, &filters);
         let vs = &self.states[vi];
         let dim = Color32::from_gray(120);
         if let Some((until, msg)) = &vs.note
@@ -767,7 +891,7 @@ impl ViewsShared {
             p.text(
                 egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0),
                 egui::Align2::RIGHT_BOTTOM,
-                format!("TTL{} rising · {} / {} sweeps · {:.0} µV/row{}{}", d.trig_line + 1, vs.sweeps.filled(nslots), nslots, d.uv_per_row, if car_on { " · CAR" } else { "" }, waiting),
+                format!("TTL{} rising · {} / {} sweeps · {}{}{}", d.trig_line + 1, vs.sweeps.filled(nslots), nslots, uv_text(&d, &used), if car_on { " · CAR" } else { "" }, waiting),
                 egui::FontId::monospace(11.0),
                 dim,
             );
@@ -775,7 +899,7 @@ impl ViewsShared {
             vs.ttl.draw(&p, &TtlGeom { plot, strip, label_x: rect.min.x + 4.0, ppp, cursor: cursor_col, gap: None }, &ttl_lines);
             let x = plot.min.x + cursor_col as f32 / ppp;
             p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)));
-            p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, format!("{:.2} s · {:.0} µV/row{}{}", d.window_s, d.uv_per_row, if car_on { " · CAR" } else { "" }, if analog_visible { format!(" · ADC {:.2} V/row · AUX 2.5 V/row", d.adc_v_per_row) } else { String::new() }), egui::FontId::monospace(11.0), dim);
+            p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, format!("{:.2} s · {}{}{}", d.window_s, uv_text(&d, &used), if car_on { " · CAR" } else { "" }, if analog_visible { format!(" · ADC {:.2} V/row · AUX 2.5 V/row", d.adc_v_per_row) } else { String::new() }), egui::FontId::monospace(11.0), dim);
         }
     }
 
@@ -853,7 +977,7 @@ impl ViewsShared {
     /// buffered on the GPU), then draw it with labels, TTL lanes, a time axis, a "behind live"
     /// badge and a strip for the whole recording (click or drag to jump).
     #[allow(clippy::too_many_arguments)]
-    fn review_view(&mut self, ui: &mut egui::Ui, resp: &egui::Response, vi: usize, l: &StreamLayout, d: &TraceViewSettings, g: &ReviewGeom, sections: Vec<[f32; 5]>, row_ch: &[u32], rowtab: &[[u32; 2]], ttl_lines: &[usize]) {
+    fn review_view(&mut self, ui: &mut egui::Ui, resp: &egui::Response, vi: usize, l: &StreamLayout, d: &TraceViewSettings, g: &ReviewGeom, bank: FilterBank, filters: &[ViewFilter], row_ch: &[u32], rowtab: &[[u32; 2]], ttl_lines: &[usize]) {
         let ReviewGeom { rect, plot, strip, ttl_h, label_w, cols, rows, first, k, ppp } = *g;
         let fs = l.sample_rate;
         let nch = l.num_channels();
@@ -863,12 +987,13 @@ impl ViewsShared {
         };
         let end = src.first_sample + review::available(&src);
         let (min_span, max_span) = review_span_limits(cols, fs);
-        let car_on = d.car.enabled && d.filter == ViewFilter::Spikes;
-        let info = Arc::new(view_chinfo(l, d));
+        let used = used_filters(l, filters, row_ch);
+        let car_on = car_applies(d, &used);
+        let info = Arc::new(view_chinfo(l, d, filters));
         let order = Arc::new(row_ch.to_vec());
         let rowtab_gpu = Arc::new(rowtab.to_vec());
         let colors = Arc::new(self.view_colors(l, row_ch, rowtab));
-        let lead = (review::lead_in_s(d.filter) * fs).round() as i64;
+        let lead = (used.iter().map(|&f| review::lead_in_s(f, d.hp_hz)).fold(0.0, f64::max) * fs).round() as i64;
         let id = d.id;
         let newest = self.newest_sample;
         let vs = &mut self.states[vi];
@@ -877,7 +1002,7 @@ impl ViewsShared {
         vs.last_data = Instant::now();
         let Some(rv) = vs.review.as_mut() else { return };
         rv.clamp(src.first_sample, end, min_span, max_span);
-        let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filter: d.filter, car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
+        let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filters: filters.to_vec(), hp: d.hp_hz.to_bits(), car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
         if rv.shown.as_ref().is_none_or(|s| s.key != key) && rv.filling.as_ref().is_none_or(|f| f.key != key) {
             rv.generation += 1;
             let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
@@ -897,7 +1022,7 @@ impl ViewsShared {
             first_row: first as u32,
             nrows: rows as u32,
             kmax: k as u32,
-            uv_per_row: d.uv_per_row,
+            uv_per_row: d.uv(d.filter),
             row_h_px,
             thickness_px: d.thickness * ppp.max(1.0),
             colors: Some(colors.clone()),
@@ -918,7 +1043,7 @@ impl ViewsShared {
             let total = ld.data.len() / nch.max(1);
             let chunk = ((8usize << 20) / nch.max(1)).max(1).min(total - ld.fed);
             let span = f.key.span.max(1);
-            let config = TraceConfig { nch, cols: f.key.cols, window: span, sections: sections.clone(), nslots: 0 };
+            let config = TraceConfig { nch, cols: f.key.cols, window: span, bank: bank.clone(), nslots: 0 };
             let upload = Arc::new(ld.data[ld.fed * nch..(ld.fed + chunk) * nch].to_vec());
             let pos0 = ((ld.pos0 as u64 + ld.fed as u64) % span as u64) as u32;
             let fr = frame(review_key(id, f.buf), config, ld.fed == 0, upload, chunk as u32, pos0, false);
@@ -936,7 +1061,7 @@ impl ViewsShared {
             if !ld.words.is_empty() {
                 ttl.ingest(&ld.words, 0, f.key.span.max(1), f.key.cols);
             }
-            let config = TraceConfig { nch, cols: f.key.cols, window: f.key.span.max(1), sections: sections.clone(), nslots: 0 };
+            let config = TraceConfig { nch, cols: f.key.cols, window: f.key.span.max(1), bank: bank.clone(), nslots: 0 };
             rv.shown = Some(review::Shown { key: f.key, buf: f.buf, config, ttl });
         }
         if let Some(sh) = rv.shown.as_ref() {
@@ -995,11 +1120,11 @@ impl ViewsShared {
         p.text(
             egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0),
             egui::Align2::RIGHT_BOTTOM,
-            format!("{} · {:.0} µV/row{}", if span_s < 1.0 { format!("{:.0} ms", span_s * 1e3) } else { format!("{span_s:.2} s") }, d.uv_per_row, if car_on { " · CAR" } else { "" }),
+            format!("{} · {}{}", if span_s < 1.0 { format!("{:.0} ms", span_s * 1e3) } else { format!("{span_s:.2} s") }, uv_text(d, &used), if car_on { " · CAR" } else { "" }),
             egui::FontId::monospace(11.0),
             dim,
         );
-        let _ = self.row_labels(ui, &p, rect, plot, rows, first, row_ch, rowtab, l, resp, label_w);
+        let _ = self.row_labels(ui, &p, vi, rect, plot, rows, first, row_ch, rowtab, l, resp, label_w, filters);
         if go_live {
             self.leave_review(vi);
         }
@@ -1008,12 +1133,14 @@ impl ViewsShared {
     /// Channel labels down the left edge of a trace plot; clicking one monitors it on audio
     /// (Ctrl/Shift adds or removes it). Returns whether an AUX/ADC row is visible.
     #[allow(clippy::too_many_arguments)]
-    fn row_labels(&mut self, ui: &egui::Ui, p: &egui::Painter, rect: egui::Rect, plot: egui::Rect, rows: usize, first: usize, row_ch: &[u32], rowtab: &[[u32; 2]], l: &StreamLayout, resp: &egui::Response, label_w: f32) -> bool {
+    fn row_labels(&mut self, ui: &egui::Ui, p: &egui::Painter, vi: usize, rect: egui::Rect, plot: egui::Rect, rows: usize, first: usize, row_ch: &[u32], rowtab: &[[u32; 2]], l: &StreamLayout, resp: &egui::Response, label_w: f32, filters: &[ViewFilter]) -> bool {
         let rh = plot.height() / rows as f32;
         let mon = self.audio.lock().channels.clone();
         let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
         let mut toggle: Option<Vec<usize>> = None;
+        let mut set_filter: Option<(Vec<usize>, ViewFilter)> = None;
         let mut analog_visible = false;
+        let id = self.settings[vi].id;
         for r in 0..rows {
             let [s0, n] = rowtab[first + r];
             let chans: Vec<usize> = (s0..s0 + n).map(|i| row_ch[i as usize] as usize).collect();
@@ -1028,6 +1155,28 @@ impl ViewsShared {
                 let txt = format!("{name}{}", if monitored { " ♪" } else { "" });
                 let col = chans.iter().find_map(|&c| monitor_color32(&mon, c)).unwrap_or(Color32::from_gray(150));
                 p.text(egui::pos2(rect.min.x + 4.0, y), egui::Align2::LEFT_CENTER, txt, egui::FontId::monospace((rh * 0.6).clamp(8.0, 13.0)), col);
+                // Filter chip: one segment per preset; a row overlaying channels with
+                // different filters shows each of them hatched.
+                if is_electrode {
+                    let h = (rh - 2.0).clamp(8.0, 14.0);
+                    let chip = egui::Rect::from_min_size(egui::pos2(rect.min.x + label_w - CHIP_W - 3.0, y - h / 2.0), egui::vec2(CHIP_W, h));
+                    let here: Vec<ViewFilter> = ViewFilter::ALL.into_iter().filter(|f| chans.iter().any(|&c| filters[c] == *f)).collect();
+                    let seg_w = CHIP_W / ViewFilter::ALL.len() as f32;
+                    for (j, f) in ViewFilter::ALL.into_iter().enumerate() {
+                        let seg = egui::Rect::from_min_size(egui::pos2(chip.min.x + j as f32 * seg_w, chip.min.y), egui::vec2(seg_w, h));
+                        let sr = ui.interact(seg, ui.scope_id().with(("rowfilt", id, first + r, j)), egui::Sense::click()).on_hover_text(filter_help(f, self.settings[vi].hp_hz));
+                        let on = here.contains(&f);
+                        let fill = if on { ui.visuals().selection.bg_fill } else if sr.hovered() { Color32::from_gray(60) } else { Color32::from_gray(34) };
+                        p.rect_filled(seg.shrink(0.5), 2.0, fill);
+                        if on && here.len() > 1 {
+                            hatch(p, seg.shrink(0.5));
+                        }
+                        p.text(seg.center(), egui::Align2::CENTER_CENTER, f.letter(), egui::FontId::monospace((h * 0.8).min(10.0)), if on { Color32::WHITE } else { Color32::from_gray(140) });
+                        if sr.clicked() {
+                            set_filter = Some((chans.clone(), f));
+                        }
+                    }
+                }
             }
             // Audio monitors electrodes only; a grouped row monitors the whole group.
             if let Some(pos) = click
@@ -1039,6 +1188,11 @@ impl ViewsShared {
         }
         if let Some(chs) = toggle {
             self.monitor_click(ui, chs);
+        }
+        if let Some((chans, f)) = set_filter {
+            let d = &mut self.settings[vi];
+            set_row_filter(l, d, &chans, f, row_ch);
+            self.dirty = true;
         }
         analog_visible
     }
@@ -1166,14 +1320,10 @@ impl App {
             for (i, v) in sh.settings.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     changed |= ui.checkbox(&mut v.open, "").on_hover_text("Show this window").changed();
-                    let car = if v.car.enabled && v.filter == ViewFilter::Spikes { " · CAR" } else { "" };
+                    let car = if v.car.enabled && (v.filter == ViewFilter::Spikes || v.channel_filter.values().any(|f| *f == ViewFilter::Spikes)) { " · CAR" } else { "" };
                     let chans = if v.headstages.is_empty() { "all".to_string() } else { v.headstages.join(", ") };
                     ui.label(RichText::new(&v.name).strong());
-                    ui.weak(format!("{chans} · {}{car}", match v.filter {
-                        ViewFilter::Raw => "raw",
-                        ViewFilter::Spikes => "300–6k",
-                        ViewFilter::Lfp => "LFP",
-                    }));
+                    ui.weak(format!("{chans} · {}{car}", if v.channel_filter.is_empty() { v.filter.label() } else { "per-row filters" }));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Delete").clicked() {
                             delete = Some(i);

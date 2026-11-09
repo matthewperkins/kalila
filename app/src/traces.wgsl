@@ -15,7 +15,7 @@
 //
 // Per-channel `chinfo` = (gain, flags, units_per_row, center):
 //   gain          physical units per int16 LSB (µV for electrodes, V for AUX/ADC)
-//   flags         bit 0: run the display filter (electrodes; AUX/ADC stay raw)
+//   flags         bits 3-4: display filter preset (0 raw, 1 300–6k, 2 LFP, 3 HP; AUX/ADC raw)
 //                 bit 1: part of the CAR reference; bit 2: subtract the CAR
 //   units_per_row 0 = use the global µV/row; otherwise this channel's own row range
 //   center        value drawn at the row's centre line
@@ -34,7 +34,8 @@ struct Ingest {
     _p0: u32,
     _p1: u32,
     _p2: u32,
-    coef: array<vec4<f32>, 8>, // per section: (b0, b1, b2, 0), (a1, a2, 0, 0)
+    fsec: vec4<u32>,            // per preset: first section | count << 8
+    coef: array<vec4<f32>, 16>, // per section: (b0, b1, b2, 0), (a1, a2, 0, 0)
 };
 
 @group(0) @binding(0) var<uniform> P: Ingest;
@@ -69,12 +70,15 @@ fn filt(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k = 0u; k < 8u; k++) {
         z[k] = state[sb + k];
     }
-    let nsec = select(0u, P.nsec, (flags(ch) & 1u) != 0u);
+    // This channel's preset: a run of sections in the shared bank (at most 4, so 8 states).
+    let fs = P.fsec[(flags(ch) >> 3u) & 3u];
+    let s0 = fs & 0xffu;
+    let nsec = min(fs >> 8u, 4u);
     for (var i = 0u; i < P.n_new; i++) {
         var x = sample(i, ch);
         for (var s = 0u; s < nsec; s++) {
-            let b = P.coef[2u * s];
-            let a = P.coef[2u * s + 1u];
+            let b = P.coef[2u * (s0 + s)];
+            let a = P.coef[2u * (s0 + s) + 1u];
             let y = b.x * x + z[2u * s];
             z[2u * s] = b.y * x - a.x * y + z[2u * s + 1u];
             z[2u * s + 1u] = b.z * x - a.y * y;

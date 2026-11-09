@@ -1,12 +1,12 @@
 use crate::config::{Config, OutputSettings, ViewFilter};
 use crate::spikes::{SLOTS, SpikeCallback, SpikeFrame, SpikeGpu};
 use crate::sweep::Sweeps;
-use crate::traces::{MAX_CUTS, MAX_SECTIONS, RING, SweepFrame, TraceCallback, TraceConfig, TraceFrame, TraceGpus, review_key};
+use crate::traces::{FilterBank, MAX_CUTS, RING, SweepFrame, TraceCallback, TraceConfig, TraceFrame, TraceGpus, review_key};
 use crate::ttl::{TtlGeom, TtlOverlay};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use eframe::egui_wgpu;
 use engine::audio::GainMode;
-use engine::dsp::{BandSpec, Spike, ThresholdMode};
+use engine::dsp::{Spike, ThresholdMode};
 use engine::rhythm::{BoardSettings, ChannelKind, LiveCommand, StreamLayout};
 use engine::{BoardChoice, Engine};
 use std::collections::VecDeque;

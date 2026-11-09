@@ -170,11 +170,13 @@ fn read_npy_8(path: &Path, skip: usize) -> Option<Vec<[u8; 8]>> {
 
 /// Filter settling time read before the visible stretch, so its left edge shows the filtered
 /// signal and not the filter's start-up transient (zero state).
-pub fn lead_in_s(filter: crate::config::ViewFilter) -> f64 {
+pub fn lead_in_s(filter: crate::config::ViewFilter, hp_hz: f32) -> f64 {
     match filter {
         crate::config::ViewFilter::Raw => 0.0,
         crate::config::ViewFilter::Spikes => 0.05, // 300 Hz high-pass: settled in a few ms
         crate::config::ViewFilter::Lfp => 1.5,     // 1 Hz high-pass: e^(-2π·1.5) ≈ 1e-4
+        // Same settling as LFP, scaled by the corner (10 Hz → 0.15 s).
+        crate::config::ViewFilter::Hp => 1.5 / hp_hz.max(0.1) as f64,
     }
 }
 
@@ -198,7 +200,9 @@ pub struct Key {
     pub span: u32,
     pub cols: u32,
     pub nch: usize,
-    pub filter: crate::config::ViewFilter,
+    /// Every channel's display filter, and the HP corner (bits).
+    pub filters: Vec<crate::config::ViewFilter>,
+    pub hp: u32,
     pub car: Option<(Vec<usize>, Vec<usize>)>,
 }
 
@@ -304,7 +308,7 @@ mod tests {
 
     #[test]
     fn lead_in_ends_at_window_position_zero() {
-        let key = Key { t0: 1000, span: 300, cols: 100, nch: 1, filter: crate::config::ViewFilter::Spikes, car: None };
+        let key = Key { t0: 1000, span: 300, cols: 100, nch: 1, filters: vec![crate::config::ViewFilter::Spikes], hp: 0, car: None };
         let mut v = ReviewView::new(1000, 300);
         v.filling = Some(Filling { key, generation: 3, buf: 0, loaded: None });
         // Read from 950: 50 lead-in samples, so the first one goes to position 250.
