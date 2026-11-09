@@ -2166,6 +2166,7 @@ dependencies = [
  "env_logger",
  "log",
  "parking_lot",
+ "png",
  "serde",
  "serde_json",
 ]

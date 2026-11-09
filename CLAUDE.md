@@ -194,6 +194,20 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
 - **CAR** uses and corrects only the 300–6k channels.
 - Display only; recordings, spike detection and audio are untouched.
 
+## Scripted GUI tests (`OERS_UI_SCRIPT`)
+
+No input-injection tools are installed on the rig. To click through the GUI, run the simulator
+with `OERS_UI_SCRIPT=<file>`.
+- **Steps:** window, wait, move, click, drag, scroll, key, text, shot, log, quit. The format
+  is at the top of `app/src/uiscript.rs`.
+- **Input path:** `App::raw_input_hook` feeds the steps into one oers window's own egui input,
+  never the system pointer.
+- **Screenshots:** `shot` saves that window as a PNG, to `OERS_UI_SHOTS` or the script's folder.
+- **Coordinates** are window points (= pixels on the rig).
+- **Example run:** `OERS_UI_SCRIPT=s.txt XDG_CONFIG_HOME=<scratch cfg> ./target/release/oers --sim --acquire`
+- Ask before launching it while the user's own oers is open: the window rules place the
+  simulator's windows over theirs, and it plays audio.
+
 ## CPU comparison with the stock GUI (rig, 2026-11-05)
 
 `scripts/cpuload.py` (per process and thread, % of one core; the rig has 4 cores, no SMT).

@@ -7,6 +7,7 @@ mod spikes;
 mod sweep;
 mod traces;
 mod ttl;
+mod uiscript;
 
 use eframe::egui_wgpu::{self, wgpu};
 

@@ -73,6 +73,8 @@ pub struct App {
     shared: SharedViews,
     render_state: egui_wgpu::RenderState,
     icon: Option<Arc<egui::IconData>>,
+    /// Scripted test input (`OERS_UI_SCRIPT`), off by default.
+    ui_script: Option<crate::uiscript::UiScript>,
     /// Which CAR the CAR window is editing, if open.
     car_window: Option<CarTarget>,
     colors_dirty: bool,
@@ -129,6 +131,7 @@ impl App {
             shared,
             render_state: rs.clone(),
             icon: eframe::icon_data::from_png_bytes(include_bytes!("../../packaging/icon/oers-128.png")).ok().map(Arc::new),
+            ui_script: crate::uiscript::UiScript::from_env(),
             car_window: None,
             colors_dirty: true,
             spike_colors: None,
@@ -828,6 +831,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Scripted test input, injected into one window's own input (never the system's).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(s) = self.ui_script.as_mut() {
+            s.hook(ctx, raw_input);
+        }
+    }
+
     /// Runs every pass, also while the main window is hidden (Wayland then withholds its
     /// frames and eframe runs only this): board, outputs and the display/spike queues.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
