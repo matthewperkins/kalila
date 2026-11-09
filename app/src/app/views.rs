@@ -541,7 +541,6 @@ impl ViewsShared {
         let old = d.clone();
         let mut clear_sweeps = false;
         let mut open_car = false;
-        let mut hint = false;
         // Filters in use among the drawn electrodes; more than one = per-row filters.
         let used = l.as_ref().map(|l| used_filters(l, &chan_filters(l, d), &view_rows(l, d).0)).unwrap_or_default();
         let mixed = used.len() > 1;
@@ -574,46 +573,71 @@ impl ViewsShared {
                 }
                 ui.separator();
             }
-            // The view's filter. With per-row filters the presets in use are hatched, and
-            // Shift-click (or right-click) sets every row; a plain click only explains that.
-            for f in ViewFilter::ALL {
-                let sel = !mixed && uniform == f;
-                let help = if mixed { format!("{}\nRows use different filters: Shift-click or right-click to set every row", filter_help(f, d.hp_hz)) } else { format!("{}\nEvery row; the chips left of the traces set single rows", filter_help(f, d.hp_hz)) };
-                let r = ui.selectable_label(sel, f.label()).on_hover_text(help);
-                if mixed && used.contains(&f) {
-                    hatch(ui.painter(), r.rect.shrink(1.0));
-                }
-                let force = r.secondary_clicked() || (r.clicked() && ui.input(|i| i.modifiers.shift));
-                if force || (r.clicked() && !mixed) {
-                    d.filter = f;
-                    d.channel_filter.clear();
-                } else if r.clicked() {
-                    hint = true;
-                }
+            // Filtering palette: one column per preset, with "every row", its µV/row, and
+            // its own setting (HP corner, CAR). The row chips beside the traces set single rows.
+            let car_on = car_applies(d, &used) || (used.is_empty() && d.car.enabled && d.filter == ViewFilter::Spikes);
+            let label = format!("Filtering: {}{}", if mixed { "mixed" } else { uniform.label() }, if car_on { " · CAR" } else { "" });
+            let btn = ui.button(label).on_hover_text(if mixed { "Rows use different filters (set with the chips beside the traces)" } else { "Display filter, µV/row per filter, HP corner and CAR" });
+            if mixed {
+                hatch(ui.painter(), btn.rect.shrink(1.0));
             }
-            if used.contains(&ViewFilter::Hp) || (used.is_empty() && d.filter == ViewFilter::Hp) {
-                ui.add(egui::DragValue::new(&mut d.hp_hz).range(0.5..=300.0).speed(0.2).prefix("HP ").suffix(" Hz")).on_hover_text("High-pass corner of the HP filter (2nd-order Butterworth)");
-            }
-            ui.separator();
-            ui.add_enabled(used.contains(&ViewFilter::Spikes) || (used.is_empty() && d.filter == ViewFilter::Spikes), egui::Checkbox::new(&mut d.car.enabled, "CAR")).on_hover_text("Display-only common average reference, in the 300–6k view");
-            if ui.small_button("Channels…").on_hover_text(format!("CAR reference {} · subtract {}", d.car.reference.len(), d.car.subtract.len())).clicked() {
-                open_car = true;
-            }
+            egui::Popup::from_toggle_button_response(&btn).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                egui::Grid::new(("filter-palette", id)).num_columns(5).spacing([10.0, 6.0]).min_col_width(64.0).show(ui, |ui| {
+                    ui.label("");
+                    for f in ViewFilter::ALL {
+                        ui.vertical_centered(|ui| ui.strong(f.label()).on_hover_text(filter_help(f, d.hp_hz)));
+                    }
+                    ui.end_row();
+                    ui.label("All channels");
+                    for f in ViewFilter::ALL {
+                        ui.vertical_centered(|ui| {
+                            let r = ui.selectable_label(!mixed && uniform == f, " all rows ").on_hover_text(format!("{} on every row (clears per-row choices)", f.label()));
+                            if mixed && used.contains(&f) {
+                                hatch(ui.painter(), r.rect.shrink(1.0));
+                            }
+                            if r.clicked() {
+                                d.filter = f;
+                                d.channel_filter.clear();
+                            }
+                        });
+                    }
+                    ui.end_row();
+                    ui.label("µV/row").on_hover_text("Each filter keeps its own range; Ctrl+wheel over a row scales that row's filter");
+                    for f in ViewFilter::ALL {
+                        let mut uv = d.uv(f);
+                        if ui.add(egui::DragValue::new(&mut uv).range(10.0..=5000.0).speed(2.0)).changed() {
+                            d.set_uv(f, uv);
+                        }
+                    }
+                    ui.end_row();
+                    ui.label("");
+                    for f in ViewFilter::ALL {
+                        match f {
+                            ViewFilter::Hp => {
+                                ui.add(egui::DragValue::new(&mut d.hp_hz).range(0.5..=300.0).speed(0.2).suffix(" Hz")).on_hover_text("High-pass corner of the HP filter (2nd-order Butterworth)");
+                            }
+                            ViewFilter::Spikes => {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut d.car.enabled, "CAR").on_hover_text("Display-only common average reference, on the 300–6k rows");
+                                    if ui.small_button("…").on_hover_text(format!("CAR channels: reference {} · subtract {}", d.car.reference.len(), d.car.subtract.len())).clicked() {
+                                        open_car = true;
+                                    }
+                                });
+                            }
+                            _ => {
+                                ui.label("");
+                            }
+                        }
+                    }
+                    ui.end_row();
+                });
+            });
         });
         if d.controls {
             ui.horizontal_wrapped(|ui| {
                 // One time base for live and review; review reaches further (5 ms to 60 s).
                 let range = if reviewing { REVIEW_MIN_S..=REVIEW_MAX_S } else { LIVE_MIN_S..=LIVE_MAX_S };
                 ui.add(egui::DragValue::new(&mut d.window_s).range(range).speed(0.02).suffix(" s")).on_hover_text(if reviewing { "Time window (review: 5 ms – 60 s)" } else { "Time window" });
-                // µV/row is kept per filter: one box, or one per filter in use.
-                let shown: Vec<ViewFilter> = if mixed { used.clone() } else { vec![uniform] };
-                for f in shown {
-                    let mut uv = d.uv(f);
-                    let prefix = if mixed { format!("{} ", f.letter()) } else { String::new() };
-                    if ui.add(egui::DragValue::new(&mut uv).range(10.0..=5000.0).speed(2.0).prefix(prefix).suffix(" µV/row")).on_hover_text(format!("{} rows (Ctrl+wheel over a row scales its filter)", f.label())).changed() {
-                        d.set_uv(f, uv);
-                    }
-                }
                 ui.add(egui::DragValue::new(&mut d.rows).range(1..=512).prefix("rows "));
                 ui.label("per row");
                 for n in [1u32, 2, 4, 8] {
@@ -657,9 +681,6 @@ impl ViewsShared {
         }
         if open_car {
             self.car_open = Some(id);
-        }
-        if hint {
-            self.states[vi].note = Some((Instant::now() + Duration::from_secs(3), "Rows use different filters: Shift-click or right-click to set every row".into()));
         }
         if clear_sweeps {
             self.states[vi].sweeps.clear();

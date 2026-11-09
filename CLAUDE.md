@@ -187,9 +187,10 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
   8 sections), and `chinfo` flag bits 3–4 pick the preset per channel.
 - **Controls:**
   - the R·H·S·L chips beside each row set that row's filter;
-  - when rows differ, the global buttons are hatched, and Shift-click or right-click sets every
-    row;
-  - µV/row is kept per filter (`uv_by_filter`); Ctrl+wheel over a row scales that row's filter.
+  - a "Filtering" button in the toolbar opens a palette with one column per preset: "all rows",
+    its µV/row (`uv_by_filter`), the HP corner and CAR. The button reads "mixed", hatched, when
+    rows differ;
+  - Ctrl+wheel over a row scales that row's filter.
 - **CAR** uses and corrects only the 300–6k channels.
 - Display only; recordings, spike detection and audio are untouched.
 
