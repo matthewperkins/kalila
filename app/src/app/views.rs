@@ -582,6 +582,7 @@ impl ViewsShared {
                 hatch(ui.painter(), btn.rect.shrink(1.0));
             }
             egui::Popup::from_toggle_button_response(&btn).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 egui::Grid::new(("filter-palette", id)).num_columns(5).spacing([10.0, 6.0]).min_col_width(64.0).show(ui, |ui| {
                     ui.label("");
                     for f in ViewFilter::ALL {
