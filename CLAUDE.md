@@ -194,6 +194,31 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
 - **CAR** uses and corrects only the 300–6k channels.
 - Display only; recordings, spike detection and audio are untouched.
 
+## Typed notes (simulator, 2026-11-09)
+
+`app/src/notes.rs`. Keys work in any oers window while no text box has focus:
+- **Typed notes:** `/` opens a note stamped at that sample; Enter or `\` saves it, Esc cancels.
+  While a note is open, every key goes into it, so no shortcuts fire.
+- **One-key stamps:** `` ` `` stamps the next draft (queued in the Notes panel); 1–9 stamp the
+  presets.
+- **Stamp accuracy:** the newest block's sample plus the time since that block was acquired, so
+  the display latency is excluded. Keys are read once per frame, so the stamp can be up to one
+  frame late.
+- **Recording format:** as stock 1.x (`RecordNode::handleBroadcastMessage`), in
+  `events/MessageCenter/`:
+  - `text.npy`: `|S513`, null-padded, cut at 512 bytes;
+  - `sample_numbers.npy`: main-stream clock;
+  - `timestamps.npy`: offset from the latest block's timestamp.
+
+  In `structure.oebin` the entry's `sample_rate` is the main stream's; stock writes 1000 there.
+  Verified with open-ephys-python-tools and neo 0.14.3.
+- **Keystroke log:** every keypress, sample-stamped, goes to `note_keystrokes.tsv` in the
+  recording folder.
+- **Notes log:** every note, recorded or not, is also appended to
+  `$XDG_STATE_HOME/oers/notes.log` (default `~/.local/state`). Point `XDG_STATE_HOME` elsewhere
+  for simulator tests.
+- **Markers:** notes are drawn on the live traces and in review.
+
 ## Scripted GUI tests (`OERS_UI_SCRIPT`)
 
 No input-injection tools are installed on the rig. To click through the GUI, run the simulator

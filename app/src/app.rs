@@ -124,6 +124,7 @@ impl App {
         engine.open_board(choice, cfg.board.clone());
         let audio_text = channels_to_text(&cfg.audio.channels);
         let shared = Arc::new(parking_lot::Mutex::new(ViewsShared::new(cfg.views.clone(), engine.audio_settings.clone(), engine.audio_stats.clone())));
+        shared.lock().notes = crate::notes::Notes::new(&cfg.notes);
         Self {
             edit_board: cfg.board.clone(),
             cfg,
@@ -171,7 +172,10 @@ impl App {
     fn save_cfg(&mut self) {
         self.cfg.audio = self.engine.audio_settings.lock().clone();
         self.cfg.dsp = self.engine.dsp_settings.lock().clone();
-        self.cfg.views = self.shared.lock().settings.clone();
+        let sh = self.shared.lock();
+        self.cfg.views = sh.settings.clone();
+        self.cfg.notes = sh.notes.settings();
+        drop(sh);
         self.cfg.save();
     }
 
@@ -351,6 +355,60 @@ impl App {
             self.spike_section(ui);
             self.audio_section(ui);
             self.record_section(ui);
+            self.notes_section(ui);
+        });
+    }
+
+    /// Notes: how to type them, drafts written ahead, presets on 1–9, the latest notes.
+    fn notes_section(&mut self, ui: &mut egui::Ui) {
+        let mut sh = self.shared.lock();
+        egui::CollapsingHeader::new(RichText::new("Notes").strong()).id_salt("notes_section").default_open(true).show(ui, |ui| {
+            ui.small("In any oers window: / starts a note at that moment; Enter or \\ saves it, Esc cancels. ` stamps the next draft, 1–9 a preset. Saved in the recording as Open Ephys messages.");
+            ui.label("Drafts (` stamps the top one)");
+            let id = egui::Id::unique("note-draft-input");
+            let mut draft = ui.data_mut(|d| d.get_temp::<String>(id).unwrap_or_default());
+            let r = ui.add(egui::TextEdit::singleline(&mut draft).hint_text("Write ahead, Enter to queue").desired_width(f32::INFINITY));
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !draft.trim().is_empty() {
+                sh.notes.drafts.push_back(draft.trim().to_string());
+                sh.notes.changed = true;
+                draft.clear();
+                r.request_focus();
+            }
+            ui.data_mut(|d| d.insert_temp(id, draft));
+            let mut remove = None;
+            for (i, d) in sh.notes.drafts.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("×").on_hover_text("Remove this draft").clicked() {
+                        remove = Some(i);
+                    }
+                    let t = if i == 0 { RichText::new(format!("` {d}")).strong() } else { RichText::new(format!("  {d}")) };
+                    ui.label(t);
+                });
+            }
+            if let Some(i) = remove {
+                sh.notes.drafts.remove(i);
+                sh.notes.changed = true;
+            }
+            egui::CollapsingHeader::new("Presets (keys 1–9)").id_salt("note-presets").show(ui, |ui| {
+                for k in 0..9 {
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{}", k + 1));
+                        if ui.add(egui::TextEdit::singleline(&mut sh.notes.presets[k]).desired_width(f32::INFINITY)).changed() {
+                            sh.notes.changed = true;
+                        }
+                    });
+                }
+            });
+            if !sh.notes.notes.is_empty() {
+                ui.label("Latest");
+                let latest: Vec<(String, String)> = sh.notes.notes.iter().rev().take(8).map(|n| (sh.note_time(n.sample), n.text.clone())).collect();
+                for (t, text) in latest {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(t);
+                        ui.label(text);
+                    });
+                }
+            }
         });
     }
 
@@ -830,6 +888,20 @@ impl App {
     }
 }
 
+/// Every note also goes to `$XDG_STATE_HOME/oers/notes.log` (default `~/.local/state`) (tab-separated: local time, sample,
+/// time, recording folder or "-", text), so notes typed while not recording are kept too.
+fn append_notes_log(sample: i64, when: &str, dir: Option<&std::path::Path>, text: &str) {
+    use std::io::Write;
+    let state = std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")));
+    let Some(state) = state else { return };
+    let d = state.join("oers");
+    let _ = std::fs::create_dir_all(&d);
+    let line = format!("{}\t{sample}\t{when}\t{}\t{}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), dir.map_or("-".into(), |p| p.display().to_string()), text.replace(['\t', '\n'], " "));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(d.join("notes.log")) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 impl eframe::App for App {
     /// Scripted test input, injected into one window's own input (never the system's).
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -877,8 +949,22 @@ impl eframe::App for App {
                 self.audio_text = channels_to_text(&self.engine.audio_settings.lock().channels);
                 self.colors_dirty = true;
             }
-            if std::mem::take(&mut sh.dirty) {
+            if std::mem::take(&mut sh.dirty) || std::mem::take(&mut sh.notes.changed) {
                 self.dirty_cfg = Instant::now();
+            }
+            // Finished notes: into the recording (if recording) and always into the notes log.
+            let done = std::mem::take(&mut sh.notes.out);
+            if !done.is_empty() {
+                let recording = self.engine.is_recording();
+                let dir = self.engine.rec_status.current_dir.lock().clone().filter(|_| recording);
+                for f in done {
+                    let when = sh.note_time(f.note.sample);
+                    log::info!("note at sample {} ({when}){}: {}", f.note.sample, if recording { "" } else { ", not recording" }, f.note.text);
+                    append_notes_log(f.note.sample, &when, dir.as_deref(), &f.note.text);
+                    if recording {
+                        self.engine.record_message(f.note.sample, f.note.text, f.keys);
+                    }
+                }
             }
             let removed = std::mem::take(&mut sh.removed);
             if self.colors_dirty {
@@ -911,6 +997,8 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Note keys first, so an open note gets every key of this frame.
+        self.shared.lock().notes_frame(ui);
         let dt = self.last_frame.elapsed().as_secs_f32();
         self.last_frame = Instant::now();
         self.frame_times.push_back(dt);

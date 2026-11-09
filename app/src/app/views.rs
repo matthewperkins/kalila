@@ -130,8 +130,12 @@ pub(super) struct ViewsShared {
     reader: Reader,
     /// The recording being written (or the last one), from the recorder.
     pub rec_source: Option<RecSource>,
-    /// Absolute sample number just after the newest displayed block.
+    /// Absolute sample number just after the newest displayed block, and when that block
+    /// was acquired.
     newest_sample: i64,
+    newest_at: Option<Instant>,
+    /// Typed notes (any window), drafts and presets.
+    pub notes: crate::notes::Notes,
 }
 
 /// Navigation asked for in one frame (scroll-back review).
@@ -393,6 +397,8 @@ impl ViewsShared {
             reader: Reader::spawn(),
             rec_source: None,
             newest_sample: 0,
+            newest_at: None,
+            notes: Default::default(),
         };
         s.sync_states();
         s
@@ -443,7 +449,16 @@ impl ViewsShared {
         let blocks: Vec<Arc<Block>> = rx.try_iter().filter(|b| b.num_channels == nch).collect();
         for b in &blocks {
             newest = b.acquired_at.or(newest);
-            self.newest_sample = self.newest_sample.max(b.first_sample + b.len() as i64);
+            let end = b.first_sample + b.len() as i64;
+            // The sample counter restarted (new acquisition): earlier notes are of another clock.
+            if end + (fs as i64) < self.newest_sample {
+                self.newest_sample = 0;
+                self.notes.notes.clear();
+            }
+            if end >= self.newest_sample {
+                self.newest_sample = end;
+                self.newest_at = b.acquired_at.or(self.newest_at);
+            }
         }
         for r in self.reader.rx.try_iter() {
             if let Some(rv) = self.states.iter_mut().find(|v| v.id == r.view).and_then(|v| v.review.as_mut()) {
@@ -496,6 +511,56 @@ impl ViewsShared {
         }
     }
 
+    /// The sample being acquired now: the newest block plus the time since it was acquired
+    /// (so a note's stamp doesn't include the display latency). None when not acquiring.
+    pub fn now_sample(&self) -> Option<i64> {
+        let fs = self.layout.as_ref()?.sample_rate;
+        if !self.acquiring || self.newest_sample == 0 {
+            return None;
+        }
+        let ahead = self.newest_at.map_or(0.0, |t| t.elapsed().as_secs_f64().min(0.5)) * fs;
+        Some(self.newest_sample + ahead as i64)
+    }
+
+    /// A sample as a time: since the recording started while recording, else since acquisition.
+    pub fn note_time(&self, s: i64) -> String {
+        let fs = self.layout.as_ref().map_or(30000.0, |l| l.sample_rate);
+        match &self.rec_source {
+            Some(r) if s >= r.first_sample => format!("rec {}", review::fmt_time((s - r.first_sample) as f64 / fs, true)),
+            _ => review::fmt_time(s as f64 / fs, true),
+        }
+    }
+
+    /// Note keys for this window's frame, and the note bar. Call before any other widget.
+    pub fn notes_frame(&mut self, ui: &egui::Ui) {
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let now = self.now_sample();
+        ui.ctx().input_mut(|i| self.notes.handle(&mut i.events, typing, now));
+        let vp = ui.ctx().viewport_id();
+        let times: Vec<(i64, String)> = self.notes.compose.as_ref().map(|c| vec![(c.sample, self.note_time(c.sample))]).unwrap_or_default();
+        self.notes.draw(ui.ctx(), vp, |s| times.iter().find(|t| t.0 == s).map(|t| t.1.clone()).unwrap_or_default());
+    }
+
+    /// Note markers over a plot: `x_of` maps a sample to x (None = off screen).
+    fn draw_note_markers(&self, p: &egui::Painter, plot: egui::Rect, ui: &egui::Ui, x_of: impl Fn(i64) -> Option<f32>) {
+        let col = Color32::from_rgb(255, 200, 90);
+        let hover = ui.input(|i| i.pointer.hover_pos());
+        for n in &self.notes.notes {
+            let Some(x) = x_of(n.sample) else { continue };
+            p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 200, 90, 110)));
+            let short: String = n.text.chars().take(32).collect();
+            let more = if n.text.chars().count() > 32 { "…" } else { "" };
+            let r = p.text(egui::pos2(x + 3.0, plot.min.y + 2.0), egui::Align2::LEFT_TOP, format!("{short}{more}"), egui::FontId::proportional(12.0), col);
+            if hover.is_some_and(|h| r.expand(3.0).contains(h) || ((h.x - x).abs() < 3.0 && plot.contains(h))) {
+                let full = format!("{}  {}", self.note_time(n.sample), n.text);
+                let g = p.layout(full, egui::FontId::proportional(13.0), Color32::WHITE, 420.0);
+                let at = egui::pos2(x + 6.0, plot.min.y + 20.0);
+                p.rect_filled(egui::Rect::from_min_size(at, g.size()).expand(5.0), 4.0, Color32::from_rgba_unmultiplied(20, 20, 24, 235));
+                p.galley(at, g, Color32::WHITE);
+            }
+        }
+    }
+
     /// One trace window's whole UI (a deferred viewport callback).
     pub fn window(&mut self, ui: &mut egui::Ui, id: u32) {
         self.drain();
@@ -503,6 +568,7 @@ impl ViewsShared {
         if vi >= self.states.len() {
             return;
         }
+        self.notes_frame(ui);
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             // Closing a trace window only hides it (reopen from "Trace windows").
             self.settings[vi].open = false;
@@ -919,6 +985,13 @@ impl ViewsShared {
             );
         } else {
             vs.ttl.draw(&p, &TtlGeom { plot, strip, label_x: rect.min.x + 4.0, ppp, cursor: cursor_col, gap: None }, &ttl_lines);
+            // Notes: absolute sample → position in the sweep (window position = counter % window).
+            let base = self.newest_sample - (vs.pending.len() / nch) as i64 - vs.counter as i64;
+            let (counter, w64) = (vs.counter as i64, window as i64);
+            self.draw_note_markers(&p, plot, ui, |s| {
+                let c = s - base;
+                (c <= counter && c > counter - w64).then(|| plot.min.x + (c.rem_euclid(w64) as f64 * cols as f64 / w64 as f64) as f32 / ppp)
+            });
             let x = plot.min.x + cursor_col as f32 / ppp;
             p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)));
             p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, format!("{:.2} s · {}{}{}", d.window_s, uv_text(&d, &used), if car_on { " · CAR" } else { "" }, if analog_visible { format!(" · ADC {:.2} V/row · AUX 2.5 V/row", d.adc_v_per_row) } else { String::new() }), egui::FontId::monospace(11.0), dim);
@@ -1097,8 +1170,11 @@ impl ViewsShared {
         let (t0, span) = (rv.t0, rv.span as i64);
         let rel = |s: i64| (s - src.first_sample) as f64 / fs;
         let ttl_strip = egui::Rect::from_min_max(strip.min, egui::pos2(strip.max.x, strip.min.y + ttl_h));
+        let mut review_notes: Option<(i64, i64)> = None;
         if let Some(sh) = rv.shown.as_ref() {
             sh.ttl.draw(&p, &TtlGeom { plot, strip: ttl_strip, label_x: rect.min.x + 4.0, ppp, cursor: 0, gap: Some(0) }, ttl_lines);
+            let (st0, sspan) = (sh.key.t0, sh.key.span as i64);
+            review_notes = Some((st0, sspan));
         } else {
             p.text(plot.center(), egui::Align2::CENTER_CENTER, "Reading the recording…", egui::FontId::proportional(15.0), dim);
         }
@@ -1146,6 +1222,9 @@ impl ViewsShared {
             egui::FontId::monospace(11.0),
             dim,
         );
+        if let Some((st0, sspan)) = review_notes {
+            self.draw_note_markers(&p, plot, ui, |s| (s >= st0 && s < st0 + sspan).then(|| plot.min.x + ((s - st0) as f64 / sspan.max(1) as f64) as f32 * plot.width()));
+        }
         let _ = self.row_labels(ui, &p, vi, rect, plot, rows, first, row_ch, rowtab, l, resp, label_w, filters);
         if go_live {
             self.leave_review(vi);

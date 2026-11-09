@@ -181,6 +181,14 @@ impl TraceViewSettings {
     }
 }
 
+/// Typed notes: presets on keys 1–9 and drafts written ahead (stamped one by one with `).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct NotesSettings {
+    pub presets: Vec<String>,
+    pub drafts: Vec<String>,
+}
+
 /// One board DAC output: which electrode it plays and its comparator threshold.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
@@ -218,6 +226,8 @@ impl Default for OutputSettings {
 #[serde(default)]
 pub struct Config {
     pub board: BoardSettings,
+    /// Note drafts and presets.
+    pub notes: NotesSettings,
     pub audio: AudioSettings,
     pub dsp: DspSettings,
     pub display: DisplaySettings,
@@ -236,6 +246,7 @@ impl Default for Config {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
         Self {
             board: BoardSettings::default(),
+            notes: NotesSettings::default(),
             audio: AudioSettings::default(),
             dsp: DspSettings::default(),
             display: DisplaySettings::default(),
