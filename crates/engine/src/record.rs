@@ -6,7 +6,12 @@
 //!     structure.oebin, sync_messages.txt
 //!     continuous/Acquisition_Board-100.<stream>/{continuous.dat, sample_numbers.npy, timestamps.npy}
 //!     events/Acquisition_Board-100.<stream>/TTL/{states,sample_numbers,timestamps,full_words}.npy
+//!     events/MessageCenter/{text,sample_numbers,timestamps}.npy
+//!     note_keystrokes.tsv   (oers only: every keypress of each typed note)
 //! ```
+//!
+//! Messages follow the stock GUI 1.x (`RecordNode::handleBroadcastMessage`): sample numbers in
+//! the main stream's clock, timestamps in its seconds, text as null-padded `|S513`.
 //!
 //! The recorder thread receives every block while acquiring (recording or not). Data reaches
 //! disk through large buffered writes; `.npy` headers are rewritten every second so a crash
@@ -110,6 +115,29 @@ struct TtlFiles {
     initial: u16,
 }
 
+/// Stock `MAX_MSG_LENGTH`; records are this plus a terminating null.
+pub const MAX_MESSAGE_BYTES: usize = 512;
+
+struct MessageFiles {
+    text: NpyFile,
+    samples: NpyFile,
+    timestamps: NpyFile,
+    /// Keystroke log (tab-separated), created with the first note that has keys.
+    keys: Option<BufWriter<File>>,
+}
+
+/// A message's text as one stock record: UTF-8 cut to 512 bytes at a character boundary,
+/// null-padded to 513.
+fn message_record(text: &str) -> [u8; MAX_MESSAGE_BYTES + 1] {
+    let mut end = text.len().min(MAX_MESSAGE_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut r = [0u8; MAX_MESSAGE_BYTES + 1];
+    r[..end].copy_from_slice(&text.as_bytes()[..end]);
+    r
+}
+
 struct Recording {
     dir: PathBuf,
     layout: StreamLayout,
@@ -117,6 +145,9 @@ struct Recording {
     side: Vec<StreamFiles>,
     side_tmp: Vec<i16>,
     ttl: TtlFiles,
+    messages: MessageFiles,
+    /// (first sample, its timestamp) of the latest block: messages are timestamped from it.
+    clock: Option<(i64, f64)>,
     first_sample: Option<i64>,
     last_header_update: Instant,
     oebin: serde_json::Value,
@@ -162,7 +193,15 @@ impl Recording {
             last: None,
             initial: 0,
         };
-        let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, first_sample: None, last_header_update: Instant::now(), oebin: json!({}), dat_path, ttl_dir: ed };
+        let md = dir.join("events").join("MessageCenter");
+        fs::create_dir_all(&md)?;
+        let messages = MessageFiles {
+            text: NpyFile::create(&md.join("text.npy"), "|S513")?,
+            samples: NpyFile::create(&md.join("sample_numbers.npy"), "<i8")?,
+            timestamps: NpyFile::create(&md.join("timestamps.npy"), "<f8")?,
+            keys: None,
+        };
+        let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, messages, clock: None, first_sample: None, last_header_update: Instant::now(), oebin: json!({}), dat_path, ttl_dir: ed };
         r.oebin = r.build_oebin();
         fs::write(dir.join("structure.oebin"), serde_json::to_string_pretty(&r.oebin)?)?;
         Ok(r)
@@ -207,6 +246,13 @@ impl Recording {
                 "channel_name": "Acquisition Board TTL Input", "description": "TTL events from the acquisition board digital inputs",
                 "identifier": "acq-board.ttl", "sample_rate": l.sample_rate, "type": "int16",
                 "source_processor": SOURCE_NAME, "stream_name": l.name, "initial_state": self.ttl.initial
+            }, {
+                // As stock, except sample_rate: stock gives its 1 kHz message stream's rate,
+                // but the sample numbers are in the main stream, so we give that one's.
+                "folder_name": "MessageCenter/",
+                "channel_name": "Messages", "description": "Broadcasts messages from the MessageCenter",
+                "identifier": "messagecenter.events", "sample_rate": l.sample_rate, "type": "string",
+                "source_processor": "Message Center", "stream_name": "MessageCenter stream"
             }],
             "spikes": []
         })
@@ -225,6 +271,9 @@ impl Recording {
                     self.layout.name, self.layout.sample_rate, b.first_sample
                 );
                 fs::write(self.dir.join("sync_messages.txt"), txt)?;
+            }
+            if let Some(&t0) = b.timestamps.first() {
+                self.clock = Some((b.first_sample, t0));
             }
             let bytes = unsafe { std::slice::from_raw_parts(b.data.as_ptr() as *const u8, b.data.len() * 2) };
             self.main.dat.write_all(bytes)?;
@@ -277,6 +326,35 @@ impl Recording {
         Ok(())
     }
 
+    /// A typed note: text stamped at `sample` (main-stream clock), and its keystrokes
+    /// (sample, key) for the sidecar log.
+    fn write_message(&mut self, sample: i64, text: &str, keys: &[(i64, String)]) -> Result<()> {
+        let ts = match self.clock {
+            Some((s0, t0)) => t0 + (sample - s0) as f64 / self.layout.sample_rate,
+            None => sample as f64 / self.layout.sample_rate,
+        };
+        self.messages.text.write(&[message_record(text)])?;
+        self.messages.samples.write(&[sample])?;
+        self.messages.timestamps.write(&[ts])?;
+        if !keys.is_empty() {
+            if self.messages.keys.is_none() {
+                let mut w = BufWriter::new(File::create(self.dir.join("note_keystrokes.tsv"))?);
+                writeln!(w, "note_sample\tkey_sample\tkey")?;
+                self.messages.keys = Some(w);
+            }
+            let w = self.messages.keys.as_mut().unwrap();
+            for (k, key) in keys {
+                writeln!(w, "{sample}\t{k}\t{}", key.replace(['\t', '\n'], " "))?;
+            }
+            w.flush()?;
+        }
+        // Headers now: notes are rare and should survive a crash right away.
+        for n in [&mut self.messages.text, &mut self.messages.samples, &mut self.messages.timestamps] {
+            n.update_header()?;
+        }
+        Ok(())
+    }
+
     fn checkpoint(&mut self) -> Result<()> {
         self.last_header_update = Instant::now();
         for f in std::iter::once(&mut self.main).chain(self.side.iter_mut()) {
@@ -304,6 +382,13 @@ impl Recording {
         for n in [t.states, t.samples, t.timestamps, t.words] {
             n.finish()?;
         }
+        let m = self.messages;
+        for n in [m.text, m.samples, m.timestamps] {
+            n.finish()?;
+        }
+        if let Some(mut k) = m.keys {
+            k.flush()?;
+        }
         Ok(())
     }
 }
@@ -315,6 +400,8 @@ pub enum RecMsg {
     AcquisitionStopped,
     Start,
     Stop,
+    /// A typed note for the open recording (ignored when not recording).
+    Message { sample: i64, text: String, keys: Vec<(i64, String)> },
     Shutdown,
 }
 
@@ -445,6 +532,14 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                 }
                 status.recording.store(false, Ordering::SeqCst);
             }
+            RecMsg::Message { sample, text, keys } => {
+                if let Some(r) = rec.as_mut()
+                    && let Err(e) = r.write_message(sample, &text, &keys)
+                {
+                    fail(&status, e);
+                    rec = None;
+                }
+            }
             RecMsg::Shutdown => {
                 if let Some(r) = rec.take()
                     && let Err(e) = r.finish()
@@ -481,6 +576,15 @@ mod tests {
     }
 
     #[test]
+    fn message_records_are_cut_at_a_character_boundary() {
+        let long = "é".repeat(300); // 600 bytes
+        let r = message_record(&long);
+        assert_eq!(r.len(), 513);
+        assert_eq!(std::str::from_utf8(&r[..512]).unwrap(), "é".repeat(256));
+        assert_eq!(r[512], 0);
+    }
+
+    #[test]
     fn writes_valid_open_ephys_binary() {
         let root = std::env::temp_dir().join(format!("oers-rec-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -513,6 +617,7 @@ mod tests {
             b.side.push(rhythm::SideSample { stream: 0, sample_number: k, timestamp: 0.0, values: vec![12.4] });
             tx.send(RecMsg::Data(Arc::new(b))).unwrap();
         }
+        tx.send(RecMsg::Message { sample: 1100, text: "drinking ☕".into(), keys: vec![(1100, "/".into()), (1130, "d".into())] }).unwrap();
         tx.send(RecMsg::Stop).unwrap();
         tx.send(RecMsg::Shutdown).unwrap();
         h.join().unwrap();
@@ -540,6 +645,20 @@ mod tests {
         let (h, _) = read_npy(&dir.join("continuous/Acquisition_Board-100.memory_usage/timestamps.npy"));
         assert!(h.contains("'shape': (10,)"));
         assert!(fs::read_to_string(dir.join("sync_messages.txt")).unwrap().contains("@ 30000 Hz: 1000"));
+        // Typed note: stock MessageCenter layout, main-stream sample number and seconds.
+        assert_eq!(oebin["events"][1]["folder_name"], "MessageCenter/");
+        let md = dir.join("events/MessageCenter");
+        let (h, d) = read_npy(&md.join("text.npy"));
+        assert!(h.contains("'descr': '|S513'") && h.contains("'shape': (1,)"), "{h}");
+        assert_eq!(d.len(), 513);
+        assert_eq!(&d[..12], "drinking ☕".as_bytes());
+        assert!(d[12..].iter().all(|&b| b == 0));
+        let (_, d) = read_npy(&md.join("sample_numbers.npy"));
+        assert_eq!(i64::from_le_bytes(d[..8].try_into().unwrap()), 1100);
+        let (_, d) = read_npy(&md.join("timestamps.npy"));
+        assert!((f64::from_le_bytes(d[..8].try_into().unwrap()) - 1100.0 / 30000.0).abs() < 1e-9);
+        let keys = fs::read_to_string(dir.join("note_keystrokes.tsv")).unwrap();
+        assert_eq!(keys, "note_sample\tkey_sample\tkey\n1100\t1100\t/\n1100\t1130\td\n");
         let _ = fs::remove_dir_all(&root);
     }
 }

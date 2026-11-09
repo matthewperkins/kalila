@@ -413,6 +413,12 @@ impl Engine {
         self.spike_rx = None;
     }
 
+    /// Write a typed note into the open recording (MessageCenter text event at `sample`,
+    /// main-stream clock). Ignored when not recording.
+    pub fn record_message(&self, sample: i64, text: String, keys: Vec<(i64, String)>) {
+        let _ = self.rec_tx.send(RecMsg::Message { sample, text, keys });
+    }
+
     pub fn start_recording(&self) {
         let _ = self.rec_tx.send(RecMsg::Start);
     }
