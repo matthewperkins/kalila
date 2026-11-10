@@ -87,6 +87,31 @@ pub struct ViewCar {
     pub subtract: Vec<usize>,
 }
 
+/// Sweep trigger source.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub enum TrigSource {
+    #[default]
+    Ttl,
+    /// Level crossing on one electrode (spike band).
+    Spike,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub enum Slope {
+    /// Falling through a negative level (the usual extracellular spike).
+    #[default]
+    Neg,
+    Pos,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub enum TrigAlign {
+    /// t = 0 at the extreme within 0.5 ms of the crossing (as the spike detector aligns).
+    #[default]
+    Trough,
+    Crossing,
+}
+
 /// One trace window: which channels it draws and how.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -129,6 +154,22 @@ pub struct TraceViewSettings {
     pub trig_pre_ms: f32,
     pub trig_post_ms: f32,
     pub trig_sweeps: u32,
+    /// What starts a sweep: a TTL rising edge or a level crossing on one channel.
+    pub trig_source: TrigSource,
+    /// Slope-trigger channel, as a `channel_filter` key ("A1:5"); "" = none yet.
+    pub trig_channel: String,
+    pub trig_slope: Slope,
+    /// Fixed crossing level in µV (sign follows the slope); 0 = the spike detector's threshold.
+    pub trig_level_uv: f32,
+    pub trig_align: TrigAlign,
+    /// Extra holdoff after each trigger (ms), on top of the 1 ms dead time.
+    pub trig_holdoff_ms: f32,
+    /// Window discriminator: reject crossings whose trough goes beyond `trig_level2_uv`.
+    pub trig_window: bool,
+    pub trig_level2_uv: f32,
+    /// Sweep window of the slope trigger (ms; finer than the TTL window).
+    pub spk_pre_ms: f32,
+    pub spk_post_ms: f32,
     pub car: ViewCar,
     /// Control bar at the top of the window expanded.
     pub controls: bool,
@@ -160,6 +201,16 @@ impl Default for TraceViewSettings {
             trig_pre_ms: 10.0,
             trig_post_ms: 40.0,
             trig_sweeps: 20,
+            trig_source: TrigSource::Ttl,
+            trig_channel: String::new(),
+            trig_slope: Slope::Neg,
+            trig_level_uv: 0.0,
+            trig_align: TrigAlign::Trough,
+            trig_holdoff_ms: 0.0,
+            trig_window: false,
+            trig_level2_uv: 300.0,
+            spk_pre_ms: 1.0,
+            spk_post_ms: 2.0,
             car: ViewCar::default(),
             controls: true,
         }

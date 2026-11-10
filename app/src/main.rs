@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod notes;
+mod slope;
 mod review;
 mod spikes;
 mod sweep;

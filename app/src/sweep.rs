@@ -55,6 +55,11 @@ impl Sweeps {
         }
     }
 
+    /// A trigger found elsewhere (slope trigger): `a` is its absolute sample index.
+    pub fn push_trigger(&mut self, a: u64) {
+        self.pending.push_back(a);
+    }
+
     /// Triggers whose window `[rise - pre, rise + post)` is complete in the GPU ring once
     /// `uploaded` samples have been ingested. Returns (slot, ring index of window start), at
     /// most `max_cuts` (the newest).

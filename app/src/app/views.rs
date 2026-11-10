@@ -2,8 +2,10 @@
 //! and sweep mode. The main window keeps the controls and the spike tiles.
 
 use super::*;
-use crate::config::{TraceViewSettings, ViewCar};
+use crate::config::{Slope, TraceViewSettings, TrigAlign, TrigSource, ViewCar};
+use crate::slope::{DEAD_S, SlopeParams, SlopeTrigger};
 use crossbeam_channel::Receiver;
+use engine::{ChannelStats, DspSettings};
 use engine::audio::{AudioSettings, AudioStats};
 use engine::rhythm::Block;
 use parking_lot::Mutex;
@@ -34,8 +36,15 @@ pub(super) struct ViewState {
     tables_key: Option<(Vec<u32>, Vec<[u32; 2]>, u32)>,
     last_chinfo: Option<Vec<[f32; 4]>>,
     sweeps: Sweeps,
-    /// (pre, post, line, slots, filter, cols): a change clears the sweeps.
-    sweep_key: Option<(u32, u32, usize, u32, u64, u32)>,
+    /// Hash of everything a sweep depends on (window, trigger, filters, geometry): a change
+    /// clears the sweeps.
+    sweep_key: Option<u64>,
+    /// Slope trigger on this view's trigger channel (made at the stream's rate).
+    slope: Option<SlopeTrigger>,
+    /// The slope trigger's input lost continuity (restart it).
+    slope_reset: bool,
+    /// Slope triggers found this acquisition.
+    slope_count: u64,
     pub colors_dirty: bool,
     // Diagnostics: when the view was last drawn / last got samples, and whether a stall
     // warning is outstanding.
@@ -62,6 +71,9 @@ impl ViewState {
             last_chinfo: None,
             sweeps: Sweeps::default(),
             sweep_key: None,
+            slope: None,
+            slope_reset: true,
+            slope_count: 0,
             colors_dirty: true,
             last_drawn: Instant::now(),
             last_data: Instant::now(),
@@ -79,6 +91,8 @@ impl ViewState {
         self.ttl.reset();
         self.sweeps.clear();
         self.counter = 0;
+        self.slope_reset = true;
+        self.slope_count = 0;
     }
 
     /// Stage a block; keep at most one window of samples (e.g. while the window is hidden).
@@ -98,6 +112,7 @@ impl ViewState {
             self.pending_ttl.drain(..(drop / nch).min(self.pending_ttl.len()));
             // Trimmed samples never reach the GPU ring: waiting triggers can't be cut.
             self.sweeps.drop_pending();
+            self.slope_reset = true;
             self.counter += (drop / nch) as u64;
         }
     }
@@ -113,6 +128,9 @@ pub(super) struct ViewsShared {
     nch: usize,
     audio: Arc<Mutex<AudioSettings>>,
     audio_stats: Arc<AudioStats>,
+    /// Spike detection settings (CAR) and per-channel thresholds, for the slope trigger.
+    dsp: Arc<Mutex<DspSettings>>,
+    stats: Arc<Mutex<ChannelStats>>,
     /// View whose CAR window is open.
     car_open: Option<u32>,
     /// Settings changed in a trace window: the main window saves the config.
@@ -341,6 +359,33 @@ fn filters_hash(filters: &[ViewFilter], hp_hz: f32) -> u64 {
     h.finish()
 }
 
+/// Global channel index of a view's slope-trigger channel, when the layout has it.
+fn trig_channel(l: &StreamLayout, d: &TraceViewSettings) -> Option<usize> {
+    if d.trig_channel.is_empty() {
+        return None;
+    }
+    (0..l.num_channels()).find(|&i| chan_key(l, i).as_deref() == Some(d.trig_channel.as_str()))
+}
+
+/// Everything the sweeps of a view depend on, apart from the crossing level (which may move
+/// while dragging or as σ updates): a change clears them.
+fn sweep_hash(d: &TraceViewSettings, pre: u32, post: u32, nslots: u32, filters: &[ViewFilter], cols: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (pre, post, nslots, cols, filters_hash(filters, d.hp_hz)).hash(&mut h);
+    (d.trig_source, d.trig_line, &d.trig_channel, d.trig_slope, d.trig_align, d.trig_window).hash(&mut h);
+    (d.trig_level_uv == 0.0, d.trig_holdoff_ms.to_bits(), d.trig_level2_uv.to_bits()).hash(&mut h);
+    h.finish()
+}
+
+/// Sweep window (pre, post) of a view in ms: the slope trigger has its own, finer window.
+fn trig_window_ms(d: &TraceViewSettings) -> (f32, f32) {
+    match d.trig_source {
+        TrigSource::Ttl => (d.trig_pre_ms, d.trig_post_ms),
+        TrigSource::Spike => (d.spk_pre_ms, d.spk_post_ms),
+    }
+}
+
 /// Rows of one view: channel order (electrodes, then AUX/ADC) and per-row (first, count).
 pub(super) fn view_rows(l: &StreamLayout, v: &TraceViewSettings) -> (Vec<u32>, Vec<[u32; 2]>) {
     let k = v.per_row.clamp(1, 8) as usize;
@@ -376,7 +421,7 @@ fn electrode_groups(l: &StreamLayout, only: &[String]) -> Vec<(String, Vec<(usiz
 
 
 impl ViewsShared {
-    pub fn new(settings: Vec<TraceViewSettings>, audio: Arc<Mutex<AudioSettings>>, audio_stats: Arc<AudioStats>) -> Self {
+    pub fn new(settings: Vec<TraceViewSettings>, audio: Arc<Mutex<AudioSettings>>, audio_stats: Arc<AudioStats>, dsp: Arc<Mutex<DspSettings>>, stats: Arc<Mutex<ChannelStats>>) -> Self {
         let mut s = Self {
             settings,
             states: Vec::new(),
@@ -385,6 +430,8 @@ impl ViewsShared {
             nch: 0,
             audio,
             audio_stats,
+            dsp,
+            stats,
             car_open: None,
             dirty: false,
             monitor_changed: false,
@@ -603,6 +650,7 @@ impl ViewsShared {
         let l = self.layout.clone();
         let id = self.settings[vi].id;
         let reviewing = self.states[vi].review.is_some();
+        let stats = self.stats.clone();
         let d = &mut self.settings[vi];
         let old = d.clone();
         let mut clear_sweeps = false;
@@ -716,16 +764,71 @@ impl ViewsShared {
                 }
                 ui.separator();
                 ui.selectable_value(&mut d.triggered, false, "Free");
-                ui.selectable_value(&mut d.triggered, true, "Triggered").on_hover_text("Each sweep starts at a TTL rising edge; recent sweeps are overlaid (opto-tagging)");
+                ui.selectable_value(&mut d.triggered, true, "Triggered").on_hover_text("Each sweep starts at a trigger (TTL rising edge, or a level crossing on one channel); recent sweeps are overlaid");
                 if d.triggered {
                     let nlines = l.as_ref().map(|l| l.ttl_lines).unwrap_or(8).max(1);
-                    egui::ComboBox::from_id_salt(("trigline", id)).width(56.0).selected_text(format!("TTL{}", d.trig_line + 1)).show_ui(ui, |ui| {
+                    // Trigger: a TTL line, or one of this view's electrodes (slope trigger).
+                    let tc = l.as_ref().and_then(|l| trig_channel(l, d));
+                    let sel = match d.trig_source {
+                        TrigSource::Ttl => format!("TTL{}", d.trig_line + 1),
+                        TrigSource::Spike => match (tc, &l) {
+                            (Some(c), Some(l)) => format!("{} {}", l.channels[c].name, if d.trig_slope == Slope::Neg { "falling" } else { "rising" }),
+                            _ => "Spike: pick a channel".into(),
+                        },
+                    };
+                    egui::ComboBox::from_id_salt(("trigsrc", id)).width(120.0).selected_text(sel).show_ui(ui, |ui| {
                         for i in 0..nlines {
-                            ui.selectable_value(&mut d.trig_line, i, format!("TTL{}", i + 1));
+                            if ui.selectable_label(d.trig_source == TrigSource::Ttl && d.trig_line == i, format!("TTL{} rising", i + 1)).clicked() {
+                                d.trig_source = TrigSource::Ttl;
+                                d.trig_line = i;
+                            }
+                        }
+                        if let Some(l) = &l {
+                            ui.separator();
+                            ui.small("Slope trigger on a channel (Alt+click a row label)");
+                            let (row_ch, _) = view_rows(l, d);
+                            for &c in row_ch.iter().filter(|&&c| l.channels[c as usize].kind == ChannelKind::Electrode) {
+                                let Some(key) = chan_key(l, c as usize) else { continue };
+                                if ui.selectable_label(d.trig_source == TrigSource::Spike && d.trig_channel == key, &l.channels[c as usize].name).clicked() {
+                                    d.trig_source = TrigSource::Spike;
+                                    d.trig_channel = key;
+                                }
+                            }
                         }
                     });
-                    ui.add(egui::DragValue::new(&mut d.trig_pre_ms).range(0.0..=200.0).speed(0.5).prefix("−").suffix(" ms"));
-                    ui.add(egui::DragValue::new(&mut d.trig_post_ms).range(1.0..=250.0).speed(0.5).prefix("+").suffix(" ms"));
+                    if d.trig_source == TrigSource::Spike {
+                        ui.selectable_value(&mut d.trig_slope, Slope::Neg, "falling").on_hover_text("Trigger when the spike-band signal falls through a negative level (the usual extracellular spike)");
+                        ui.selectable_value(&mut d.trig_slope, Slope::Pos, "rising").on_hover_text("Trigger when the spike-band signal rises through a positive level");
+                        // Level: the spike detector's threshold for the channel, or a fixed µV
+                        // (also set by dragging the dashed line on the trace).
+                        let auto_uv = tc.map(|c| stats.lock().threshold_uv.get(c).copied().unwrap_or(0.0).abs()).unwrap_or(0.0);
+                        let sign = if d.trig_slope == Slope::Neg { "−" } else { "+" };
+                        if d.trig_level_uv == 0.0 {
+                            let txt = if auto_uv > 0.0 { format!("level {sign}{auto_uv:.0} µV (detector)") } else { "level: detector (waiting for σ)".to_string() };
+                            if ui.button(txt).on_hover_text("The spike detector's threshold for this channel. Click, or drag the dashed line, to fix a level for this window").clicked() {
+                                d.trig_level_uv = if auto_uv > 0.0 { auto_uv } else { 50.0 };
+                            }
+                        } else {
+                            ui.add(egui::DragValue::new(&mut d.trig_level_uv).range(1.0..=5000.0).speed(0.5).max_decimals(0).prefix(format!("level {sign}")).suffix(" µV")).on_hover_text("Fixed crossing level for this window (drag the dashed line too)");
+                            if ui.small_button("detector").on_hover_text("Back to the spike detector's threshold").clicked() {
+                                d.trig_level_uv = 0.0;
+                            }
+                        }
+                        egui::ComboBox::from_id_salt(("trigalign", id)).width(80.0).selected_text(if d.trig_align == TrigAlign::Trough { "t0 trough" } else { "t0 crossing" }).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut d.trig_align, TrigAlign::Trough, "t0 trough").on_hover_text("t = 0 at the extreme within 0.5 ms of the crossing (as the spike detector aligns)");
+                            ui.selectable_value(&mut d.trig_align, TrigAlign::Crossing, "t0 crossing").on_hover_text("t = 0 at the crossing sample");
+                        });
+                        ui.add(egui::DragValue::new(&mut d.trig_holdoff_ms).range(0.0..=1000.0).speed(0.1).prefix("holdoff ").suffix(" ms")).on_hover_text("Extra time after each trigger before the next can start (a 1 ms dead time always applies)");
+                        ui.checkbox(&mut d.trig_window, "window").on_hover_text("Window discriminator: reject crossings whose trough goes beyond the second level");
+                        if d.trig_window {
+                            ui.add(egui::DragValue::new(&mut d.trig_level2_uv).range(1.0..=5000.0).speed(1.0).prefix(format!("to {sign}")).suffix(" µV"));
+                        }
+                        ui.add(egui::DragValue::new(&mut d.spk_pre_ms).range(0.1..=50.0).speed(0.05).fixed_decimals(1).prefix("−").suffix(" ms"));
+                        ui.add(egui::DragValue::new(&mut d.spk_post_ms).range(0.1..=100.0).speed(0.05).fixed_decimals(1).prefix("+").suffix(" ms"));
+                    } else {
+                        ui.add(egui::DragValue::new(&mut d.trig_pre_ms).range(0.0..=200.0).speed(0.5).prefix("−").suffix(" ms"));
+                        ui.add(egui::DragValue::new(&mut d.trig_post_ms).range(1.0..=250.0).speed(0.5).prefix("+").suffix(" ms"));
+                    }
                     ui.add(egui::DragValue::new(&mut d.trig_sweeps).range(1..=50).suffix(" sweeps"));
                     if ui.small_button("Clear").clicked() {
                         clear_sweeps = true;
@@ -845,9 +948,12 @@ impl ViewsShared {
         }
         let vs = &mut self.states[vi];
         // Triggered window in samples; together they must fit well inside the GPU ring.
-        let pre = ((d.trig_pre_ms as f64 * 1e-3 * fs).round() as u32).min(RING / 4);
-        let post = ((d.trig_post_ms as f64 * 1e-3 * fs).round() as u32).clamp(1, RING / 4);
+        let (pre_ms, post_ms) = trig_window_ms(&d);
+        let pre = ((pre_ms as f64 * 1e-3 * fs).round() as u32).min(RING / 4);
+        let post = ((post_ms as f64 * 1e-3 * fs).round() as u32).clamp(1, RING / 4);
         let span = pre + post;
+        let slope_trig = trig && d.trig_source == TrigSource::Spike;
+        let tc = slope_trig.then(|| trig_channel(&l, &d)).flatten();
         let nslots = if trig { d.trig_sweeps.clamp(1, 50) } else { 0 };
         let config = TraceConfig { nch, cols, window, bank, nslots };
         vs.last_drawn = Instant::now();
@@ -859,10 +965,11 @@ impl ViewsShared {
             vs.last_cfg = Some(config.clone());
         }
         // Old sweeps are meaningless after a change of window, line, filter or geometry.
-        let sweep_key = (pre, post, d.trig_line, nslots, filters_hash(&filters, d.hp_hz), cols);
+        let sweep_key = sweep_hash(&d, pre, post, nslots, &filters, cols);
         if vs.reset || vs.sweep_key != Some(sweep_key) {
             vs.sweeps.clear();
             vs.sweep_key = Some(sweep_key);
+            vs.slope_reset = true;
         }
         // Upload a backlog (e.g. after the window was hidden) in chunks: the GPU staging buffers
         // are sized for one frame's upload, and a whole 20 s window at once would exceed the
@@ -886,8 +993,46 @@ impl ViewsShared {
         let words: Vec<u16> = vs.pending_ttl.drain(..(n_new as usize).min(vs.pending_ttl.len())).collect();
         let words = &words[..];
         vs.ttl.ingest(words, pos0, window, cols);
+        let upload: Arc<Vec<i16>> = Arc::new(vs.pending.drain(..n_new as usize * nch).collect());
+        // The crossing level: the detector's threshold (sign per slope) or the fixed one.
+        let level_uv = tc.map(|c| {
+            let mag = if d.trig_level_uv > 0.0 { d.trig_level_uv } else { self.stats.lock().threshold_uv.get(c).copied().unwrap_or(0.0).abs() };
+            if d.trig_slope == Slope::Neg { -mag } else { mag }
+        });
         let sweep = if trig {
-            vs.sweeps.scan(words, start, d.trig_line);
+            match (slope_trig, tc, level_uv) {
+                (false, ..) => vs.sweeps.scan(words, start, d.trig_line),
+                (true, Some(c), Some(level)) => {
+                    // Slope trigger: band-pass the channel (spike detector's band and CAR)
+                    // and look for crossings over the new samples.
+                    if vs.slope.is_none() {
+                        vs.slope = Some(SlopeTrigger::new(fs));
+                    }
+                    let st = vs.slope.as_mut().unwrap();
+                    if std::mem::take(&mut vs.slope_reset) {
+                        st.reset();
+                    }
+                    let car = self.dsp.lock().car.clone().filter(|car| car.subtract.contains(&c));
+                    let p = SlopeParams {
+                        level,
+                        slope: d.trig_slope,
+                        align: d.trig_align,
+                        holdoff: ((DEAD_S + d.trig_holdoff_ms as f64 * 1e-3) * fs) as u32,
+                        window: d.trig_window.then(|| if d.trig_slope == Slope::Neg { -d.trig_level2_uv.abs() } else { d.trig_level2_uv.abs() }),
+                    };
+                    let mut found = Vec::new();
+                    for i in 0..n_new as usize {
+                        let row = &upload[i * nch..(i + 1) * nch];
+                        let x = row[c] as f32 - car.as_ref().map_or(0.0, |car| car.mean(row));
+                        st.feed(x * l.channels[c].bit_volts, start + i as u64, &p, &mut found);
+                    }
+                    vs.slope_count += found.len() as u64;
+                    for a in found {
+                        vs.sweeps.push_trigger(a);
+                    }
+                }
+                _ => {}
+            }
             let cuts = vs.sweeps.take_ready(vs.counter, pre, post, nslots, RING, MAX_CUTS);
             SweepFrame { ring0: (start % RING as u64) as u32, span, cuts, newest: vs.sweeps.newest_slot(nslots), filled: vs.sweeps.filled(nslots) }
         } else {
@@ -895,7 +1040,6 @@ impl ViewsShared {
         };
         let cursor_pos = (vs.counter % window as u64) as f64;
         let cursor_col = ((cursor_pos * cols as f64 / window as f64) as u32).min(cols - 1);
-        let upload: Arc<Vec<i16>> = Arc::new(vs.pending.drain(..n_new as usize * nch).collect());
         let row_h_px = plot.height() * ppp / rows as f32;
         // Per-channel scaling (see traces.wgsl): electrodes follow the view's µV/row and
         // display filter; AUX/ADC are drawn raw in volts on their own row range.
@@ -943,12 +1087,12 @@ impl ViewsShared {
         };
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         let p = ui.painter_at(rect);
-        let span_ms = d.trig_pre_ms + d.trig_post_ms;
-        let t_to_x = |t_ms: f32| plot.min.x + (t_ms + d.trig_pre_ms) / span_ms.max(1e-3) * plot.width();
+        let span_ms = pre_ms + post_ms;
+        let t_to_x = |t_ms: f32| plot.min.x + (t_ms + pre_ms) / span_ms.max(1e-3) * plot.width();
         let vs = &self.states[vi];
-        if trig && vs.sweeps.count() > 0 {
+        if trig && !slope_trig && vs.sweeps.count() > 0 {
             // Laser-on shading under the traces: newest sweep's TTL high time.
-            let w_ms = vs.sweeps.newest_width().map(|w| w as f32 * 1e3 / fs as f32).unwrap_or(d.trig_post_ms).min(d.trig_post_ms);
+            let w_ms = vs.sweeps.newest_width().map(|w| w as f32 * 1e3 / fs as f32).unwrap_or(post_ms).min(post_ms);
             let c = crate::ttl::line_color(d.trig_line);
             p.rect_filled(egui::Rect::from_min_max(egui::pos2(t_to_x(0.0), plot.min.y), egui::pos2(t_to_x(w_ms).max(t_to_x(0.0) + 1.0), plot.max.y)), 0.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 34));
         }
@@ -966,23 +1110,73 @@ impl ViewsShared {
             // t = 0 line and a time axis in ms.
             let x0 = t_to_x(0.0);
             p.line_segment([egui::pos2(x0, plot.min.y), egui::pos2(x0, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)));
-            let step = [1.0f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0].into_iter().find(|s| span_ms / s <= 12.0).unwrap_or(500.0);
-            let mut t = -(d.trig_pre_ms / step).floor() * step;
-            while t <= d.trig_post_ms + 1e-3 {
+            let step = [0.1f32, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0].into_iter().find(|s| span_ms / s <= 12.0).unwrap_or(500.0);
+            let decimals = if step < 1.0 { 1 } else { 0 };
+            let mut t = -(pre_ms / step).floor() * step;
+            while t <= post_ms + 1e-3 {
                 let x = t_to_x(t);
                 p.line_segment([egui::pos2(x, plot.max.y), egui::pos2(x, plot.max.y + 4.0)], Stroke::new(1.0, dim));
-                p.text(egui::pos2(x, rect.max.y - 1.0), egui::Align2::CENTER_BOTTOM, format!("{t:.0}"), egui::FontId::monospace(10.0), dim);
+                p.text(egui::pos2(x, rect.max.y - 1.0), egui::Align2::CENTER_BOTTOM, format!("{t:.decimals$}"), egui::FontId::monospace(10.0), dim);
                 t += step;
             }
             p.text(egui::pos2(rect.min.x + 4.0, rect.max.y - 1.0), egui::Align2::LEFT_BOTTOM, "ms", egui::FontId::monospace(10.0), dim);
-            let waiting = if vs.sweeps.count() == 0 { format!(" · waiting for TTL{}", d.trig_line + 1) } else { String::new() };
+            let source = if slope_trig {
+                match (tc, level_uv) {
+                    (Some(c), Some(level)) if level != 0.0 => format!("{} {} {:+.0} µV{} · t0 {}", l.channels[c].name, if d.trig_slope == Slope::Neg { "falling through" } else { "rising through" }, level, if d.trig_level_uv > 0.0 { "" } else { " (detector)" }, if d.trig_align == TrigAlign::Trough { "trough" } else { "crossing" }),
+                    (Some(c), _) => format!("{} · waiting for the noise estimate", l.channels[c].name),
+                    _ => "slope trigger · pick a channel (Alt+click a row label)".into(),
+                }
+            } else {
+                format!("TTL{} rising", d.trig_line + 1)
+            };
+            let waiting = match (vs.sweeps.count(), slope_trig) {
+                (0, false) => format!(" · waiting for TTL{}", d.trig_line + 1),
+                (0, true) if tc.is_some() && level_uv.is_some_and(|l| l != 0.0) => " · waiting for a crossing".to_string(),
+                _ => String::new(),
+            };
             p.text(
                 egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0),
                 egui::Align2::RIGHT_BOTTOM,
-                format!("TTL{} rising · {} / {} sweeps · {}{}{}", d.trig_line + 1, vs.sweeps.filled(nslots), nslots, uv_text(&d, &used), if car_on { " · CAR" } else { "" }, waiting),
+                format!("{source} · {} / {} sweeps · {}{}{}", vs.sweeps.filled(nslots), nslots, uv_text(&d, &used), if car_on { " · CAR" } else { "" }, waiting),
                 egui::FontId::monospace(11.0),
                 dim,
             );
+            // The crossing level, dashed on the trigger channel's row; drag it to fix a level.
+            if let (Some(c), Some(level)) = (tc, level_uv)
+                && let Some(r) = (0..rows).find(|&r| {
+                    let [s0, n] = rowtab[first + r];
+                    (s0..s0 + n).any(|i| row_ch[i as usize] as usize == c)
+                })
+            {
+                let rh = plot.height() / rows as f32;
+                let yc = plot.min.y + (r as f32 + 0.5) * rh;
+                let uv = d.uv(filters[c]);
+                let y = (yc - level * rh / uv).clamp(plot.min.y, plot.max.y);
+                let col = Color32::from_rgb(255, 170, 60);
+                let handle = egui::Rect::from_min_max(egui::pos2(plot.min.x, y - 4.0), egui::pos2(plot.max.x, y + 4.0));
+                let hr = ui.interact(handle, ui.scope_id().with(("triglevel", d.id)), egui::Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text(format!("Trigger level {level:+.0} µV · drag to set a fixed level for this window"));
+                if hr.dragged()
+                    && let Some(pos) = hr.interact_pointer_pos()
+                {
+                    let v = (yc - pos.y) * uv / rh;
+                    let mag = v.abs().clamp(1.0, 5000.0);
+                    // The level keeps the slope's sign; dragging across the centre is ignored.
+                    if (d.trig_slope == Slope::Neg) == (v < 0.0) {
+                        self.settings[vi].trig_level_uv = mag;
+                        self.dirty = true;
+                    }
+                }
+                let dash = if hr.hovered() || hr.dragged() { Stroke::new(1.5, col) } else { Stroke::new(1.0, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 170)) };
+                let mut x = plot.min.x;
+                while x < plot.max.x {
+                    p.line_segment([egui::pos2(x, y), egui::pos2((x + 6.0).min(plot.max.x), y)], dash);
+                    x += 10.0;
+                }
+                p.text(egui::pos2(plot.min.x + 3.0, y - 2.0), egui::Align2::LEFT_BOTTOM, format!("{level:+.0} µV"), egui::FontId::monospace(10.0), col);
+                if level == 0.0 {
+                    p.text(egui::pos2(plot.min.x + 3.0, y - 12.0), egui::Align2::LEFT_BOTTOM, "no threshold yet", egui::FontId::monospace(10.0), col);
+                }
+            }
         } else {
             vs.ttl.draw(&p, &TtlGeom { plot, strip, label_x: rect.min.x + 4.0, ppp, cursor: cursor_col, gap: None }, &ttl_lines);
             // Notes: absolute sample → position in the sweep (window position = counter % window).
@@ -1238,7 +1432,9 @@ impl ViewsShared {
         let rh = plot.height() / rows as f32;
         let mon = self.audio.lock().channels.clone();
         let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+        let alt = ui.input(|i| i.modifiers.alt);
         let mut toggle: Option<Vec<usize>> = None;
+        let mut trig_pick: Option<usize> = None;
         let mut set_filter: Option<(Vec<usize>, ViewFilter)> = None;
         let mut analog_visible = false;
         let id = self.settings[vi].id;
@@ -1280,15 +1476,29 @@ impl ViewsShared {
                 }
             }
             // Audio monitors electrodes only; a grouped row monitors the whole group.
+            // Alt+click makes the row's (first) channel the window's slope trigger.
             if let Some(pos) = click
                 && is_electrode
                 && lab.contains(pos)
             {
-                toggle = Some(chans);
+                if alt {
+                    trig_pick = Some(ch);
+                } else {
+                    toggle = Some(chans);
+                }
             }
         }
         if let Some(chs) = toggle {
             self.monitor_click(ui, chs);
+        }
+        if let (Some(ch), Some(key)) = (trig_pick, trig_pick.and_then(|c| chan_key(l, c))) {
+            let d = &mut self.settings[vi];
+            d.triggered = true;
+            d.trig_source = TrigSource::Spike;
+            d.trig_channel = key;
+            self.states[vi].review = None;
+            self.states[vi].note = Some((Instant::now() + Duration::from_secs(2), format!("Slope trigger on {}", l.channels[ch].name)));
+            self.dirty = true;
         }
         if let Some((chans, f)) = set_filter {
             let d = &mut self.settings[vi];

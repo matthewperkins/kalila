@@ -219,6 +219,30 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
   for simulator tests.
 - **Markers:** notes are drawn on the live traces and in review.
 
+## Slope trigger for sweeps (simulator, 2026-11-10)
+
+`app/src/slope.rs`; settings in `TraceViewSettings` (`trig_source`, `trig_channel`, …). A trace
+window's sweeps can start at a level crossing on one of its electrodes instead of a TTL edge.
+- **Detection** runs per window on the CPU, over the samples it uploads: the channel is
+  band-passed with the spike detector's band (300–6k) and CAR, so the sweeps match the spike
+  tiles. It does not use the detector's event stream, because each window needs its own
+  level, slope and alignment.
+- **Level:** the spike detector's threshold for that channel by default (so it follows σ), or a
+  fixed µV: drag the dashed line on the channel's row, or click the "level" button. "detector"
+  goes back. The line is drawn in the row's own µV scale, so it only lines up with the trace
+  when that row is on 300–6k.
+- **Slope** falling (negative level) or rising; **t0** at the trough (the extreme within 0.5 ms
+  of the crossing, as the detector aligns) or at the crossing; **holdoff** on top of the 1 ms
+  dead time; **window** discriminator (reject troughs beyond a second level), off by default.
+- **Window:** its own −1/+2 ms defaults in 0.1 ms steps (`spk_pre_ms`/`spk_post_ms`); the TTL
+  window keeps −10/+40. With fewer samples than columns, the `cut` pass interpolates linearly
+  instead of taking per-column min/max.
+- **Picking the channel:** the trigger combo lists the TTL lines and the window's electrodes;
+  Alt+click on a row label picks that row's first channel and switches to triggered mode.
+- Changing the level does not clear the sweeps (it moves while dragging and as σ updates);
+  every other trigger setting does.
+- Not yet: triggering in review; a combined spike/laser latency view.
+
 ## Scripted GUI tests (`OERS_UI_SCRIPT`)
 
 No input-injection tools are installed on the rig. To click through the GUI, run the simulator

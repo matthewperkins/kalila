@@ -173,9 +173,21 @@ fn cut(@builtin(global_invocation_id) gid: vec3<u32>) {
     let start = C.trig[t].y;
     let base = (slot * C.nch + ch) * C.cols;
     let rb = ch * C.ring;
+    if (C.span < C.cols) {
+        // Fewer samples than columns (millisecond windows): interpolate linearly between
+        // samples, so a column's value is the trace at that column's centre.
+        for (var c = 0u; c < C.cols; c++) {
+            let pos = max((f32(c) + 0.5) * f32(C.span) / f32(C.cols) - 0.5, 0.0);
+            let i0 = min(u32(pos), C.span - 1u);
+            let i1 = min(i0 + 1u, C.span - 1u);
+            let f = pos - f32(i0);
+            let v = mix(cring[rb + (start + i0) % C.ring], cring[rb + (start + i1) % C.ring], f);
+            scols[base + c] = vec2<f32>(v, v);
+        }
+        return;
+    }
     for (var c = 0u; c < C.cols; c++) {
-        // Every column gets at least one sample, so short windows on wide plots stay joined.
-        let s0 = min(c * C.span / C.cols, C.span - 1u);
+        let s0 = c * C.span / C.cols;
         let s1 = min(max(s0 + 1u, (c + 1u) * C.span / C.cols), C.span);
         var mn = 1e30;
         var mx = -1e30;
