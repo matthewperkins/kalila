@@ -131,6 +131,8 @@ pub(super) struct ViewsShared {
     /// Spike detection settings (CAR) and per-channel thresholds, for the slope trigger.
     dsp: Arc<Mutex<DspSettings>>,
     stats: Arc<Mutex<ChannelStats>>,
+    /// Min/max pyramids of the recording (engine), for review of long spans.
+    pyramids: Arc<Mutex<engine::pyramid::Store>>,
     /// View whose CAR window is open.
     car_open: Option<u32>,
     /// Settings changed in a trace window: the main window saves the config.
@@ -206,7 +208,9 @@ struct ReviewGeom {
 const LIVE_MIN_S: f32 = 0.05;
 const LIVE_MAX_S: f32 = 20.0;
 const REVIEW_MIN_S: f32 = 0.005;
-const REVIEW_MAX_S: f32 = 60.0;
+/// Spans over `DIRECT_MAX_S` come from the min/max pyramid only.
+const REVIEW_MAX_S: f32 = 3600.0;
+const DIRECT_MAX_S: f32 = 60.0;
 
 /// Review spans in samples: at least one sample per column, within the review limits.
 fn review_span_limits(cols: u32, fs: f64) -> (u32, u32) {
@@ -299,11 +303,12 @@ fn set_row_filter(l: &StreamLayout, d: &mut TraceViewSettings, chans: &[usize], 
 
 /// µV/row text for the status line: one value, or one per filter in use.
 fn uv_text(d: &TraceViewSettings, used: &[ViewFilter]) -> String {
-    match used {
+    let base = match used {
         [] => format!("{:.0} µV/row", d.uv(d.filter)),
         [f] => format!("{:.0} µV/row", d.uv(*f)),
         _ => format!("{} µV/row", used.iter().map(|f| format!("{} {:.0}", f.letter(), d.uv(*f))).collect::<Vec<_>>().join(" ")),
-    }
+    };
+    if d.channel_uv.is_empty() { base } else { format!("{base} · per-row") }
 }
 
 /// Per-channel GPU info for a view (see traces.wgsl): gain; flags (bits 3-4 filter preset,
@@ -318,7 +323,7 @@ fn view_chinfo(l: &StreamLayout, d: &TraceViewSettings, filters: &[ViewFilter]) 
                 let f = filters[i];
                 let car = f == ViewFilter::Band;
                 let flags = 8 * f.index() as u32 + 2 * (car && in_set(&d.car.reference, i)) as u32 + 4 * (car && in_set(&d.car.subtract, i)) as u32;
-                [c.bit_volts, flags as f32, d.uv(f), 0.0]
+                [c.bit_volts, flags as f32, d.uv_of(chan_key(l, i).as_deref(), f), 0.0]
             }
             ChannelKind::Aux => [c.bit_volts, 0.0, 2.5, 0.0],
             ChannelKind::Adc => [c.bit_volts, 0.0, d.adc_v_per_row, 0.0],
@@ -360,6 +365,58 @@ fn filters_hash(filters: &[ViewFilter], band: (u32, u32)) -> u64 {
     filters.hash(&mut h);
     band.hash(&mut h);
     h.finish()
+}
+
+/// The band pyramid a view wants: its band over the electrodes of its headstages, with the
+/// display CAR exactly as the shader applies it (reference and subtraction on Band rows only).
+fn band_key(l: &StreamLayout, d: &TraceViewSettings) -> engine::pyramid::BandKey {
+    let band = d.band();
+    let chans = engine::pyramid::band_channels(l, &d.headstages);
+    let car = d.car.enabled.then(|| {
+        let filters = chan_filters(l, d);
+        let on = |set: &[usize]| set.iter().copied().filter(|&c| chans.contains(&c) && filters.get(c) == Some(&ViewFilter::Band)).collect::<Vec<_>>();
+        (on(&d.car.reference), on(&d.car.subtract))
+    });
+    engine::pyramid::BandKey { low_bits: band.low_hz.to_bits(), high_bits: band.high_hz.to_bits(), chans, car }
+}
+
+/// A review image from the pyramids: the column buffer (`nch × cols`, physical units), one
+/// TTL word per column, and whether every sample on screen (up to the live edge) was covered.
+/// None when the pyramids are not of this recording or the view's band pyramid is missing.
+fn pyramid_columns(st: &engine::pyramid::Store, src: &RecSource, view: u32, l: &StreamLayout, filters: &[ViewFilter], key: &review::Key) -> Option<(Vec<[f32; 2]>, Vec<u16>, bool)> {
+    let raw = st.raw.as_ref()?;
+    if st.src.as_ref().map(|s| &s.dat) != Some(&src.dat) || raw.nch != key.nch {
+        return None;
+    }
+    let nch = key.nch;
+    let cols = key.cols as usize;
+    let is_band = |i: usize| filters[i] == ViewFilter::Band && l.channels[i].kind == ChannelKind::Electrode;
+    let band = if (0..nch).any(is_band) { Some((st.band(view)?, &st.bands.get(&view)?.0)) } else { None };
+    let t0 = key.t0 - src.first_sample;
+    let span = key.span as u64;
+    let (rc, words) = raw.columns(t0, span, key.cols);
+    let bc = band.map(|(p, _)| p.columns(t0, span, key.cols).0);
+    let mut out = vec![[1e30f32, -1e30]; nch * cols];
+    for i in 0..nch {
+        let gain = l.channels[i].bit_volts;
+        let row = if is_band(i) { band.and_then(|(_, k)| k.chans.iter().position(|&c| c == i)) } else { None };
+        for c in 0..cols {
+            let m = match (row, &bc) {
+                (Some(r), Some(bc)) => bc[c * band.unwrap().0.nch + r],
+                (Some(_), None) => continue,
+                _ if is_band(i) => continue,
+                _ => rc[c * nch + i],
+            };
+            if m[0] <= m[1] {
+                out[i * cols + c] = [m[0] as f32 * gain, m[1] as f32 * gain];
+            }
+        }
+    }
+    let lo = t0.max(0) as u64;
+    let hi = ((t0 + span as i64).max(0) as u64).min(st.live_end);
+    let need = hi.saturating_sub(lo);
+    let complete = raw.covered_in(lo, hi) >= need && band.is_none_or(|(p, _)| p.covered_in(lo, hi) >= need);
+    Some((out, words, complete))
 }
 
 /// Global channel index of a view's slope-trigger channel, when the layout has it.
@@ -424,7 +481,7 @@ fn electrode_groups(l: &StreamLayout, only: &[String]) -> Vec<(String, Vec<(usiz
 
 
 impl ViewsShared {
-    pub fn new(settings: Vec<TraceViewSettings>, audio: Arc<Mutex<AudioSettings>>, audio_stats: Arc<AudioStats>, dsp: Arc<Mutex<DspSettings>>, stats: Arc<Mutex<ChannelStats>>) -> Self {
+    pub fn new(settings: Vec<TraceViewSettings>, audio: Arc<Mutex<AudioSettings>>, audio_stats: Arc<AudioStats>, dsp: Arc<Mutex<DspSettings>>, stats: Arc<Mutex<ChannelStats>>, pyramids: Arc<Mutex<engine::pyramid::Store>>) -> Self {
         let mut s = Self {
             settings,
             states: Vec::new(),
@@ -435,6 +492,7 @@ impl ViewsShared {
             audio_stats,
             dsp,
             stats,
+            pyramids,
             car_open: None,
             dirty: false,
             monitor_changed: false,
@@ -472,6 +530,7 @@ impl ViewsShared {
 
     /// New layout or acquisition: every view starts again (and leaves review).
     pub fn reset_all(&mut self) {
+        log::debug!("trace views reset (new layout or acquisition)");
         for v in &mut self.states {
             v.reset();
             v.review = None;
@@ -493,6 +552,18 @@ impl ViewsShared {
         if nch != self.nch {
             self.nch = nch;
             self.reset_all();
+        }
+        // Tell the pyramid builder which band pyramid each window wants.
+        {
+            let l = self.layout.as_ref().expect("checked above");
+            let mut st = self.pyramids.lock();
+            st.want.retain(|id, _| self.settings.iter().any(|v| v.id == *id));
+            for v in &self.settings {
+                let key = band_key(l, v);
+                if st.want.get(&v.id) != Some(&key) {
+                    st.want.insert(v.id, key);
+                }
+            }
         }
         let Some(rx) = &self.rx else { return };
         let mut newest: Option<Instant> = None;
@@ -653,6 +724,7 @@ impl ViewsShared {
         let l = self.layout.clone();
         let id = self.settings[vi].id;
         let reviewing = self.states[vi].review.is_some();
+        let ttl_seen = self.states[vi].ttl.seen() | self.states[vi].review.as_ref().and_then(|r| r.shown.as_ref()).map_or(0, |s| s.ttl.seen());
         let stats = self.stats.clone();
         let d = &mut self.settings[vi];
         let old = d.clone();
@@ -692,12 +764,7 @@ impl ViewsShared {
             }
             // Filtering palette: one column per preset, with "every row", its µV/row, and
             // its own setting (HP corner, CAR). The row chips beside the traces set single rows.
-            let car_on = car_applies(d, &used) || (used.is_empty() && d.car.enabled && d.filter == ViewFilter::Band);
-            let label = format!("Filtering: {}{}", if mixed { "mixed".to_string() } else { d.filter_label(uniform) }, if car_on { " · CAR" } else { "" });
-            let btn = ui.button(label).on_hover_text(if mixed { "Rows use different filters (set with the chips beside the traces)" } else { "Display filter, µV/row per filter, band corners and CAR" });
-            if mixed {
-                hatch(ui.painter(), btn.rect.shrink(1.0));
-            }
+            let btn = ui.button("Filter settings").on_hover_text("Raw or Band on every row, µV/row per filter, band corners and CAR (the chips beside the traces set single rows)");
             egui::Popup::from_toggle_button_response(&btn).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 egui::Grid::new(("filter-palette", id)).num_columns(3).spacing([10.0, 6.0]).min_col_width(64.0).show(ui, |ui| {
@@ -724,11 +791,15 @@ impl ViewsShared {
                         });
                     }
                     ui.end_row();
-                    ui.label("µV/row").on_hover_text("Each filter keeps its own range; Ctrl+wheel over a row scales that row's filter");
+                    ui.label("µV/row").on_hover_text("Each filter keeps its own range. Ctrl+wheel over a row scales that row alone, Ctrl+Shift+wheel its whole filter; setting a value here puts every row of that filter back on it");
                     for f in ViewFilter::ALL {
                         let mut uv = d.uv(f);
                         if ui.add(egui::DragValue::new(&mut uv).range(10.0..=5000.0).speed(2.0)).changed() {
                             d.set_uv(f, uv);
+                            let keys: Vec<String> = d.channel_uv.keys().filter(|k| d.filter_of(Some(k)) == f).cloned().collect();
+                            for k in keys {
+                                d.channel_uv.remove(&k);
+                            }
                         }
                     }
                     ui.end_row();
@@ -839,6 +910,31 @@ impl ViewsShared {
                     }
                 } else {
                     ui.checkbox(&mut d.ttl_overlay, "TTL overlay").on_hover_text("Shade traces while a TTL input is high; one lane per line seen high since acquisition start");
+                    if d.ttl_overlay {
+                        let nlines = l.as_ref().map(|l| l.ttl_lines).unwrap_or(8).clamp(1, 16);
+                        let shown = (0..nlines).filter(|i| d.ttl_hidden & (1 << i) == 0).count();
+                        let btn = ui.small_button(if shown == nlines { "lines: all".to_string() } else { format!("lines: {shown}/{nlines}") }).on_hover_text("Which TTL lines the overlay shows");
+                        egui::Popup::from_toggle_button_response(&btn).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                            for i in 0..nlines {
+                                let mut on = d.ttl_hidden & (1 << i) == 0;
+                                let seen = ttl_seen & (1 << i) != 0;
+                                let c = if seen { crate::ttl::line_color(i) } else { Color32::from_gray(110) };
+                                let r = ui.checkbox(&mut on, RichText::new(format!("TTL{}", i + 1)).color(c));
+                                let r = if seen { r } else { r.on_hover_text("Not seen high yet") };
+                                if r.changed() {
+                                    d.ttl_hidden ^= 1 << i;
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("all").clicked() {
+                                    d.ttl_hidden = 0;
+                                }
+                                if ui.small_button("none").clicked() {
+                                    d.ttl_hidden = u16::MAX;
+                                }
+                            });
+                        });
+                    }
                 }
             });
         }
@@ -902,7 +998,7 @@ impl ViewsShared {
         // Triggered: a time axis instead. Review adds a time axis and the recording strip.
         let ttl_lines: Vec<usize> = if d.ttl_overlay && !trig {
             let seen = vs.ttl.seen() | vs.review.as_ref().and_then(|r| r.shown.as_ref()).map_or(0, |s| s.ttl.seen());
-            (0..l.ttl_lines.min(16)).filter(|&i| seen & (1 << i) != 0).collect()
+            (0..l.ttl_lines.min(16)).filter(|&i| seen & (1 << i) != 0 && d.ttl_hidden & (1 << i) == 0).collect()
         } else {
             Vec::new()
         };
@@ -916,17 +1012,42 @@ impl ViewsShared {
         // Shift+wheel or a sideways swipe, Alt+wheel to zoom, arrows, Home and End.
         let resp = ui.interact(rect, ui.scope_id().with(("traces", d.id)), egui::Sense::click_and_drag());
         if resp.hovered() {
-            let (scroll, ctrl, alt) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl, i.modifiers.alt));
-            if scroll != 0.0 && !alt {
-                // Ctrl+wheel scales the filter of the row under the pointer (every filter
-                // in use when it isn't over an electrode row).
+            // egui turns Ctrl+wheel into a zoom factor (and no scroll delta): > 1 for wheel up.
+            let (scroll, ctrl, alt, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl, i.modifiers.alt, i.zoom_delta()));
+            if (scroll != 0.0 || (ctrl && zoom != 1.0)) && !alt {
                 let over = resp.hover_pos().filter(|p| plot.contains(*p)).map(|p| first + (((p.y - plot.min.y) / plot.height() * rows as f32) as usize).min(rows - 1));
-                let row_f = over.map(|r| row_ch[rowtab[r][0] as usize] as usize).filter(|&c| l.channels[c].kind == ChannelKind::Electrode).map(|c| filters[c]);
+                // The electrodes of the row under the pointer (all those overlaid in it).
+                let row_chans: Vec<usize> = over
+                    .map(|r| {
+                        let [s0, n] = rowtab[r];
+                        (s0..s0 + n).map(|i| row_ch[i as usize] as usize).filter(|&c| l.channels[c].kind == ChannelKind::Electrode).collect()
+                    })
+                    .unwrap_or_default();
+                let shift = ui.input(|i| i.modifiers.shift);
                 let v = &mut self.settings[vi];
                 if ctrl {
-                    let scale = 1.0 - scroll * 0.002;
-                    for f in row_f.map_or_else(|| if used.is_empty() { vec![d.filter] } else { used.clone() }, |f| vec![f]) {
-                        v.set_uv(f, d.uv(f) * scale);
+                    // Wheel up: fewer µV per row, so the traces grow.
+                    let scale = 1.0 / zoom.clamp(0.5, 2.0);
+                    if !row_chans.is_empty() && !shift {
+                        // Ctrl+wheel over a row: that row alone.
+                        for &c in &row_chans {
+                            if let Some(k) = chan_key(&l, c) {
+                                let uv = (d.uv_of(Some(&k), filters[c]) * scale).clamp(10.0, 5000.0);
+                                v.channel_uv.insert(k, uv);
+                            }
+                        }
+                    } else {
+                        // Ctrl+Shift+wheel over a row: its whole filter; off the rows: every
+                        // filter in use. Per-row overrides on those filters scale along.
+                        let fs: Vec<ViewFilter> = if row_chans.is_empty() { if used.is_empty() { vec![d.filter] } else { used.clone() } } else { row_chans.iter().map(|&c| filters[c]).collect() };
+                        for f in ViewFilter::ALL.into_iter().filter(|f| fs.contains(f)) {
+                            v.set_uv(f, d.uv(f) * scale);
+                        }
+                        for (k, uv) in v.channel_uv.iter_mut() {
+                            if fs.contains(&d.filter_of(Some(k))) {
+                                *uv = (*uv * scale).clamp(10.0, 5000.0);
+                            }
+                        }
                     }
                 } else {
                     let step = (scroll / 20.0).round() as isize;
@@ -1091,6 +1212,7 @@ impl ViewsShared {
             x_shift: 0.0,
             x_scale: 1.0,
             rot: 0,
+            columns: None,
         };
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         let p = ui.painter_at(rect);
@@ -1157,7 +1279,7 @@ impl ViewsShared {
             {
                 let rh = plot.height() / rows as f32;
                 let yc = plot.min.y + (r as f32 + 0.5) * rh;
-                let uv = d.uv(filters[c]);
+                let uv = d.uv_of(chan_key(&l, c).as_deref(), filters[c]);
                 let y = (yc - level * rh / uv).clamp(plot.min.y, plot.max.y);
                 let col = Color32::from_rgb(255, 170, 60);
                 let handle = egui::Rect::from_min_max(egui::pos2(plot.min.x, y - 4.0), egui::pos2(plot.max.x, y + 4.0));
@@ -1260,6 +1382,9 @@ impl ViewsShared {
 
     /// Back to live; the time base is brought into the live range (review reaches further).
     fn leave_review(&mut self, vi: usize) {
+        if self.states[vi].review.is_some() {
+            log::debug!("review '{}': back to live", self.settings[vi].name);
+        }
         self.states[vi].review = None;
         let w = &mut self.settings[vi].window_s;
         let live = w.clamp(LIVE_MIN_S, LIVE_MAX_S);
@@ -1293,6 +1418,7 @@ impl ViewsShared {
         let lead = (used.iter().map(|&f| review::lead_in_s(f, &band)).fold(0.0, f64::max) * fs).round() as i64;
         let id = d.id;
         let newest = self.newest_sample;
+        let pyr = self.pyramids.clone();
         let vs = &mut self.states[vi];
         // Not stalled: this window is drawing, just not the live samples.
         vs.last_drawn = Instant::now();
@@ -1300,31 +1426,6 @@ impl ViewsShared {
         let Some(rv) = vs.review.as_mut() else { return };
         rv.clamp(src.first_sample, end, min_span, max_span);
         let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filters: filters.to_vec(), band: band_bits(d), car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
-        // One image in flight at a time; it always completes (cancelling it every frame while
-        // the pointer moves would mean never updating). Meanwhile the shown image is drawn
-        // panned and zoomed to the current stretch, so the traces follow the pointer.
-        if rv.filling.is_none() && rv.shown.as_ref().is_none_or(|s| s.key != key) {
-            rv.generation += 1;
-            // A pan to the right by less than a window appends to the shown image: the
-            // filter state continues from its end, with no lead-in and no refiltering.
-            let append = rv.shown.as_ref().filter(|s| {
-                let d = key.t0 - s.key.t0;
-                d > 0 && d < s.key.span as i64 && review::Key { t0: s.key.t0, ..key.clone() } == s.key
-            });
-            let (req, buf, append) = match append {
-                Some(s) => {
-                    let from = s.key.t0 + s.key.span as i64;
-                    let n = (key.t0 - s.key.t0) as usize;
-                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from, n, words_from: from, words_n: n }, s.buf, true)
-                }
-                None => {
-                    let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
-                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from: rv.t0 - lead, n: (lead + rv.span as i64) as usize, words_from: rv.t0, words_n: rv.span as usize }, buf, false)
-                }
-            };
-            let _ = self.reader.tx.send(req);
-            rv.filling = Some(review::Filling { key: key.clone(), generation: rv.generation, buf, append, loaded: None, started: Instant::now(), loaded_at: None });
-        }
         let row_h_px = plot.height() * ppp / rows as f32;
         let frame = |view: u32, config: TraceConfig, reset: bool, upload: Arc<Vec<i16>>, n_new: u32, pos0: u32, paint: bool, xf: (f32, f32, u32)| TraceFrame {
             view,
@@ -1351,7 +1452,61 @@ impl ViewsShared {
             x_shift: xf.0,
             x_scale: xf.1,
             rot: xf.2,
+            columns: None,
         };
+        // Spans of a bucket or more per column come from the min/max pyramid: the whole
+        // column buffer is computed here and uploaded in one go, so the image changes with the
+        // pointer. While the pyramid is still being backfilled (band changed, or the raw one is
+        // closing a gap), the covered part is drawn and the rest redrawn every 300 ms.
+        let use_pyr = rv.span as u64 / cols.max(1) as u64 >= engine::pyramid::BUCKET;
+        let mut served = false;
+        if use_pyr && rv.filling.is_none() {
+            let stale = rv.shown.as_ref().is_none_or(|s| s.key != key);
+            let refresh = rv.shown.as_ref().is_some_and(|s| s.key == key && s.pyramid.is_some_and(|(at, complete)| !complete && at.elapsed() > Duration::from_millis(300)));
+            if stale || refresh {
+                let st = pyr.lock();
+                if let Some((columns, words, complete)) = pyramid_columns(&st, &src, id, l, filters, &key) {
+                    drop(st);
+                    let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
+                    let config = TraceConfig { nch, cols, window: rv.span.max(1), bank: bank.clone(), nslots: 0 };
+                    let mut fr = frame(review_key(id, buf), config.clone(), true, Arc::new(Vec::new()), 0, 0, false, (0.0, 1.0, 0));
+                    fr.columns = Some(Arc::new(columns));
+                    ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
+                    rv.shown = Some(review::Shown { key: key.clone(), buf, config, ttl: TtlOverlay::from_columns(&words), pos_t0: 0, pyramid: Some((Instant::now(), complete)) });
+                    if !complete {
+                        ui.ctx().request_repaint_after(Duration::from_millis(300));
+                    }
+                }
+            }
+            served = rv.shown.as_ref().is_some_and(|s| s.key == key);
+        }
+        // Spans too long to read directly wait for the pyramid.
+        let direct_ok = rv.span as f64 / fs <= DIRECT_MAX_S as f64;
+        // One image in flight at a time; it always completes (cancelling it every frame while
+        // the pointer moves would mean never updating). Meanwhile the shown image is drawn
+        // panned and zoomed to the current stretch, so the traces follow the pointer.
+        if !served && direct_ok && rv.filling.is_none() && rv.shown.as_ref().is_none_or(|s| s.key != key) {
+            rv.generation += 1;
+            // A pan to the right by less than a window appends to the shown image: the
+            // filter state continues from its end, with no lead-in and no refiltering.
+            let append = rv.shown.as_ref().filter(|s| {
+                let d = key.t0 - s.key.t0;
+                d > 0 && d < s.key.span as i64 && review::Key { t0: s.key.t0, ..key.clone() } == s.key
+            });
+            let (req, buf, append) = match append {
+                Some(s) => {
+                    let from = s.key.t0 + s.key.span as i64;
+                    let n = (key.t0 - s.key.t0) as usize;
+                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from, n, words_from: from, words_n: n }, s.buf, true)
+                }
+                None => {
+                    let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
+                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from: rv.t0 - lead, n: (lead + rv.span as i64) as usize, words_from: rv.t0, words_n: rv.span as usize }, buf, false)
+                }
+            };
+            let _ = self.reader.tx.send(req);
+            rv.filling = Some(review::Filling { key: key.clone(), generation: rv.generation, buf, append, loaded: None, started: Instant::now(), loaded_at: None });
+        }
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         // Feed the back buffer (in chunks small enough for the GPU's binding limit).
         let mut complete = false;
@@ -1394,7 +1549,7 @@ impl ViewsShared {
                     ttl.ingest(&ld.words, 0, span, f.key.cols);
                 }
                 let config = TraceConfig { nch, cols: f.key.cols, window: span, bank: bank.clone(), nslots: 0 };
-                rv.shown = Some(review::Shown { key: f.key, buf: f.buf, config, ttl, pos_t0: 0 });
+                rv.shown = Some(review::Shown { key: f.key, buf: f.buf, config, ttl, pos_t0: 0, pyramid: None });
             }
         }
         // Draw the shown image where its stretch falls in the current one.
@@ -1420,12 +1575,13 @@ impl ViewsShared {
             let (st0, sspan) = (sh.key.t0, sh.key.span as i64);
             review_notes = Some((st0, sspan));
         } else {
-            p.text(plot.center(), egui::Align2::CENTER_CENTER, "Reading the recording…", egui::FontId::proportional(15.0), dim);
+            let msg = if use_pyr && !direct_ok { "Building the overview of the recording…" } else { "Reading the recording…" };
+            p.text(plot.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(15.0), dim);
         }
         // Time axis (time since the recording started).
         let axis_y = strip.min.y + ttl_h + 1.0;
         let span_s = span as f64 / fs;
-        let step = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0].into_iter().find(|s| span_s / s <= 8.0).unwrap_or(120.0);
+        let step = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0].into_iter().find(|s| span_s / s <= 8.0).unwrap_or(3600.0);
         let x_of = |s: i64| plot.min.x + ((s - t0) as f64 / span.max(1) as f64) as f32 * plot.width();
         let mut t = (rel(t0) / step).ceil() * step;
         while t <= rel(t0 + span) + 1e-9 {
@@ -1450,7 +1606,13 @@ impl ViewsShared {
         }
         // Badge and the way back.
         let behind = (newest - (t0 + span)).max(0) as f64 / fs;
-        let loading = if rv.filling.is_some() { " · reading" } else { "" };
+        let loading = if rv.filling.is_some() {
+            " · reading"
+        } else if rv.shown.as_ref().is_some_and(|s| s.pyramid.is_some_and(|(_, complete)| !complete)) {
+            " · building the overview"
+        } else {
+            ""
+        };
         let err = rv.error.clone();
         let badge = format!("REVIEW  {} – {}  ·  {} behind live{loading}", review::fmt_time(rel(t0), span_s < 1.0), review::fmt_time(rel(t0 + span), span_s < 1.0), review::fmt_time(behind, false));
         let live_r = egui::Rect::from_min_size(egui::pos2(plot.max.x - 74.0, plot.min.y + 4.0), egui::vec2(70.0, 20.0));

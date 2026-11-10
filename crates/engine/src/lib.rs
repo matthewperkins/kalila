@@ -11,6 +11,7 @@
 
 pub mod audio;
 pub mod dsp;
+pub mod pyramid;
 pub mod record;
 
 use anyhow::{Result, bail};
@@ -51,6 +52,7 @@ pub struct PipelineStats {
     pub display_dropped: AtomicU64,
     pub dsp_dropped: AtomicU64,
     pub audio_dropped: AtomicU64,
+    pub pyramid_dropped: AtomicU64,
     /// Time (µs) the acquisition thread spent blocked on the recorder queue, total.
     pub rec_backpressure_us: AtomicU64,
     pub rec_queue: AtomicU64,
@@ -100,6 +102,8 @@ pub struct Engine {
     pub dsp_settings: Arc<Mutex<DspSettings>>,
     pub channel_stats: Arc<Mutex<ChannelStats>>,
     pub rec_status: Arc<RecStatus>,
+    /// Min/max pyramids of the recording being written (scroll-back review of long spans).
+    pub pyramids: Arc<Mutex<pyramid::Store>>,
     rec_tx: Sender<RecMsg>,
     rec_thread: Option<JoinHandle<()>>,
     live_tx: Option<Sender<LiveCommand>>,
@@ -130,6 +134,7 @@ impl Engine {
             dsp_settings: Arc::new(Mutex::new(DspSettings::default())),
             channel_stats: Arc::new(Mutex::new(ChannelStats::default())),
             rec_status,
+            pyramids: Arc::new(Mutex::new(pyramid::Store::default())),
             rec_tx,
             rec_thread: Some(rec_thread),
             live_tx: None,
@@ -313,6 +318,7 @@ impl Engine {
         self.pipeline.display_dropped.store(0, Ordering::Relaxed);
         self.pipeline.dsp_dropped.store(0, Ordering::Relaxed);
         self.pipeline.audio_dropped.store(0, Ordering::Relaxed);
+        self.pipeline.pyramid_dropped.store(0, Ordering::Relaxed);
         self.pipeline.rec_backpressure_us.store(0, Ordering::Relaxed);
         self.pipeline.blocks.store(0, Ordering::Relaxed);
 
@@ -322,6 +328,8 @@ impl Engine {
         let (disp_tx, disp_rx) = bounded::<Arc<Block>>(blocks_per_s / 2 + 4);
         let (dsp_tx, dsp_rx) = bounded::<Arc<Block>>(blocks_per_s + 4);
         let (aud_tx, aud_rx) = bounded::<Arc<Block>>(blocks_per_s / 4 + 4);
+        // The pyramid builder runs at idle priority, so it gets a longer queue (2 s).
+        let (pyr_tx, pyr_rx) = bounded::<Arc<Block>>(blocks_per_s * 2 + 4);
         let (spk_tx, spk_rx) = bounded::<Spike>(20_000);
         let _ = self.rec_tx.send(RecMsg::AcquisitionStarted(layout.clone()));
 
@@ -336,6 +344,15 @@ impl Engine {
             let settings = self.dsp_settings.clone();
             let cs = self.channel_stats.clone();
             workers.push(std::thread::Builder::new().name("dsp".into()).spawn(move || dsp_thread(rx, spk_tx, settings, cs, fs, nel)).unwrap());
+        }
+        // Min/max pyramids of the recording.
+        {
+            let rx = pyr_rx;
+            let store = self.pyramids.clone();
+            let status = self.rec_status.clone();
+            let pipe = self.pipeline.clone();
+            let layout = layout.clone();
+            workers.push(std::thread::Builder::new().name("pyramid".into()).spawn(move || pyramid::pyramid_thread(rx, store, status, pipe, layout)).unwrap());
         }
         // Audio feeder (owns the cpal stream).
         {
@@ -367,7 +384,7 @@ impl Engine {
             .name("acquisition".into())
             .spawn(move || {
                 rt2.store(set_realtime(), Ordering::Relaxed);
-                let r = acquisition_loop(board.as_mut(), &stop2, &live_rx, &disp_tx, &dsp_tx, &aud_tx, &rec_tx, &rec_status, rec_limit, &health, &pipe);
+                let r = acquisition_loop(board.as_mut(), &stop2, &live_rx, &disp_tx, &dsp_tx, &aud_tx, &pyr_tx, &rec_tx, &rec_status, rec_limit, &health, &pipe);
                 if let Err(e) = &r {
                     error!("acquisition loop ended with error: {e:#}");
                 }
@@ -461,6 +478,7 @@ fn acquisition_loop(
     disp: &Sender<Arc<Block>>,
     dsp: &Sender<Arc<Block>>,
     aud: &Sender<Arc<Block>>,
+    pyr: &Sender<Arc<Block>>,
     rec: &Sender<RecMsg>,
     rec_status: &RecStatus,
     rec_limit: u64,
@@ -502,7 +520,7 @@ fn acquisition_loop(
             let _ = rec.send(RecMsg::Data(blk.clone()));
             pipe.rec_queue.store(rec.len() as u64, Ordering::Relaxed);
         }
-        for (tx, ctr) in [(disp, &pipe.display_dropped), (dsp, &pipe.dsp_dropped), (aud, &pipe.audio_dropped)] {
+        for (tx, ctr) in [(disp, &pipe.display_dropped), (dsp, &pipe.dsp_dropped), (aud, &pipe.audio_dropped), (pyr, &pipe.pyramid_dropped)] {
             if let Err(TrySendError::Full(_)) = tx.try_send(blk.clone()) {
                 ctr.fetch_add(1, Ordering::Relaxed);
             }

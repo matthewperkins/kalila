@@ -179,6 +179,9 @@ pub struct TraceFrame {
     pub x_shift: f32,
     pub x_scale: f32,
     pub rot: u32,
+    /// Review from the min/max pyramid: the whole column buffer (`nch × cols` (min, max) in
+    /// physical units, `(1e30, -1e30)` = empty), written as is; no samples are ingested.
+    pub columns: Option<Arc<Vec<[f32; 2]>>>,
 }
 
 /// GPU-state key of a window's review buffers (0 and 1); its live state uses the bare view id.
@@ -379,6 +382,10 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
         g.ensure(device, queue, f);
         let r = g.res.as_mut().unwrap();
         let trig = f.config.nslots > 0;
+        if let Some(c) = &f.columns {
+            let n = (f.config.nch * f.config.cols as usize).min(c.len());
+            queue.write_buffer(&r.cols, 0, bytemuck::cast_slice(&c[..n]));
+        }
         if f.n_new > 0 {
             let bytes: &[u8] = bytemuck::cast_slice(&f.upload[..f.n_new as usize * f.config.nch]);
             // write_buffer requires a 4-byte multiple.

@@ -128,6 +128,9 @@ pub struct TraceViewSettings {
     /// Per-channel filters, keyed by `"<headstage>:<index in headstage>"` (so they survive
     /// regrouping rows and channel-count changes on other ports). Empty = all use `filter`.
     pub channel_filter: std::collections::BTreeMap<String, ViewFilter>,
+    /// Per-channel µV/row overrides (Ctrl+wheel over a row), keyed like `channel_filter`.
+    /// Empty = every electrode uses its filter's scale (`uv_by_filter`).
+    pub channel_uv: std::collections::BTreeMap<String, f32>,
     /// Corners of the Band filter (Hz; 4th-order Butterworth each side); 0 = that side off.
     pub band_low_hz: f32,
     pub band_high_hz: f32,
@@ -143,6 +146,8 @@ pub struct TraceViewSettings {
     pub adc_v_per_row: f32,
     /// Shade the traces while a TTL input is high, plus a per-line strip at the bottom.
     pub ttl_overlay: bool,
+    /// TTL lines left out of the overlay: bit n = TTL n+1 (e.g. a camera trigger).
+    pub ttl_hidden: u16,
     /// Electrode channels drawn on top of each other in one row (1, 2, 4 or 8).
     pub per_row: u32,
     /// Triggered sweeps: each sweep starts at a rising edge of `trig_line`; the last
@@ -185,6 +190,7 @@ impl Default for TraceViewSettings {
             adc: true,
             filter: ViewFilter::Band,
             channel_filter: Default::default(),
+            channel_uv: Default::default(),
             band_low_hz: 300.0,
             band_high_hz: 6000.0,
             window_s: 2.0,
@@ -195,6 +201,7 @@ impl Default for TraceViewSettings {
             thickness: 1.0,
             adc_v_per_row: 5.0,
             ttl_overlay: true,
+            ttl_hidden: 0,
             per_row: 1,
             triggered: false,
             trig_line: 1,
@@ -225,6 +232,11 @@ impl TraceViewSettings {
     }
     pub fn set_uv(&mut self, f: ViewFilter, v: f32) {
         self.uv_by_filter[f.index()] = v.clamp(10.0, 5000.0);
+    }
+    /// µV/row of the electrode with key `key` drawn with filter `f`: its own override, else
+    /// the filter's scale.
+    pub fn uv_of(&self, key: Option<&str>, f: ViewFilter) -> f32 {
+        key.and_then(|k| self.channel_uv.get(k)).copied().unwrap_or_else(|| self.uv(f))
     }
     /// Filter of the electrode with key `key` (see `channel_filter`).
     pub fn filter_of(&self, key: Option<&str>) -> ViewFilter {
@@ -429,8 +441,15 @@ mod tests {
         assert_eq!(v.filter_of(Some("B1:3")), ViewFilter::Band);
         assert_eq!(v.filter_of(Some("B1:4")), ViewFilter::Raw);
         assert_eq!(v.filter_of(None), ViewFilter::Raw);
+        // A per-row override beats the filter's scale, for that channel only.
+        v.channel_uv.insert("B1:3".into(), 80.0);
+        assert_eq!((v.uv_of(Some("B1:3"), ViewFilter::Band), v.uv_of(Some("B1:4"), ViewFilter::Band)), (80.0, 300.0));
+        v.ttl_hidden = 0b1;
         let back: TraceViewSettings = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
         assert_eq!(back, v);
+        // Configs from before these fields load with no overrides and every TTL line shown.
+        let old: TraceViewSettings = serde_json::from_str(r#"{"filter":"Raw"}"#).unwrap();
+        assert!(old.channel_uv.is_empty() && old.ttl_hidden == 0);
         assert_eq!(band_label(300.0, 6000.0), "300–6k");
         assert_eq!(band_label(10.0, 0.0), "10 Hz–");
         assert_eq!(band_label(0.5, 300.0), "0.5–300");

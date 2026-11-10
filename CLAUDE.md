@@ -108,6 +108,8 @@ Open Ephys Binary format, for compatibility with existing analysis tools
 Committed per feature where the code separates; the GUI features share one commit, since
 `app.rs`/`traces.rs` interleave them.
 - TTL-input overlay (`app/src/ttl.rs`): bands plus per-line lanes. Verified on the board.
+  A "lines" pop-out beside the toggle hides single lines (`ttl_hidden`), live and in review,
+  e.g. the camera trigger (2026-11-10, checked on the sim live and in review).
 - Outputs panel (DAC routing, DAC 1 follows audio, manual TTL out, threshold → TTL out,
   DAC high-pass, noise slicer). Sent live and at every acquisition start (`sync_outputs`);
   new `LiveCommand::SetTtlMode`. **Not yet checked on a scope or the Grass AM10.**
@@ -186,7 +188,41 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
     allows 0.05–20 s (one window of samples is kept in RAM); review 5 ms–60 s, clamped on
     return to live.
   - A badge shows how far behind live the view is; an overview strip below jumps on click or drag.
-- Not yet: a min/max pyramid for spans over 60 s, typed notes, signal-level triggers.
+- Later: the min/max pyramid (phase 2, below), typed notes and the slope trigger.
+
+## Scroll-back review, phase 2: min/max pyramids (simulator, 2026-11-10)
+
+`crates/engine/src/pyramid.rs`; GUI side in `review_view` (`pyramid_columns`, `band_key`).
+Spans of at least 64 samples per column (about 1.7 s at 814 columns) are drawn from pyramids
+instead of reading and filtering samples, so panning a 60 s or 30 min window costs one
+column pass (a few ms) and the image follows the pointer. The review span limit is now 1 h,
+clamped to the recording's length; spans over 60 s never fall back to direct reads.
+- **Pyramids.** Per bucket of 64 samples, then ×4 per level (8 levels), `[min, max]` as i16
+  per channel; coarser buckets merge incrementally from finer ones, so the live edge is
+  right at every level. Two kinds, built live from the acquisition blocks by the "pyramid"
+  thread (its own lossy queue, `pyramid_dropped` in `PipelineStats`):
+  - **raw:** every channel, plus the OR of the TTL words per bucket (the review TTL lanes);
+  - **band:** one per trace window (`Store::want`, set each frame in `ViewsShared::drain`):
+    the electrodes of the window's headstages, band-passed with its corners and its display
+    CAR exactly as the shader applies it. Stored in raw LSB units.
+- **Backfill.** Coverage holes (the recording's first block, dropped blocks, a band filter's
+  warm-up, or a whole new band pyramid after the corners or CAR change) are filled from
+  `continuous.dat`, newest first, 2 s per chunk with a 10 ms pause, at `SCHED_IDLE`, and
+  paused while the recorder reports backpressure. A band change waits 2 s before the
+  rebuild starts. On the sim it ran at about 45× real time (a 2 h recording in under 3 min).
+  Backfilled raw holes have no TTL words (the reader's edge files aren't consulted there).
+- **Safety.** The builder is a consumer like the display: it never touches acquisition or
+  the recorder, and reads the file read-only. The only coupling is CPU/disk, hence the idle
+  priority and the backpressure check.
+- **RAM.** About 0.56 GB/h for 62 raw channels plus 0.29 GB/h per 32-channel band pyramid;
+  the rig's configuration is about 0.7 GB/h. Nothing is written to disk. There is no cap
+  yet: a session over about 6 h would need one (or the finest level spilled to a file).
+- **GUI.** `TraceFrame::columns` uploads a whole column buffer (physical units) without
+  ingest. While a pyramid is incomplete the badge says "building the overview" and the
+  image is redrawn every 300 ms. `RUST_LOG=engine=debug` logs backfill progress and RAM.
+- Unexplained once: in one scripted run the window left review on its own about 6 s after a
+  band change; not reproduced in two later runs. `leave_review` and `reset_all` now log at
+  debug level, so the next occurrence names its cause.
 
 ## Per-row display filters (simulator, 2026-11-08; Raw/Band since 2026-11-10)
 
@@ -205,10 +241,16 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
   band; `chinfo` flag bits 3–4 pick raw or band per channel.
 - **Controls:**
   - the R·B chips beside each row set that row's filter;
-  - a "Filtering" button in the toolbar opens a palette with a column per filter: "all rows",
-    its µV/row (`uv_by_filter`), the band corners and CAR. The button reads "mixed", hatched,
-    when rows differ;
-  - Ctrl+wheel over a row scales that row's filter.
+  - a "Filter settings" button in the toolbar (always that label, a plain button) opens a
+    palette with a column per filter: "all rows", its µV/row (`uv_by_filter`), the band
+    corners and CAR. Its "all rows" cells are hatched when rows differ;
+  - **Y range per row** (checked on the sim): Ctrl+wheel over a row scales that row alone
+    (`TraceViewSettings::channel_uv`, keyed like `channel_filter`, sent per channel in
+    `chinfo`); Ctrl+Shift+wheel scales the row's whole filter, overrides included; off the
+    rows, every filter in use. Setting a filter's µV/row in the palette clears the overrides
+    on that filter. The status line adds "· per-row" while any override is set. egui turns
+    Ctrl+wheel into `zoom_delta()` with no scroll delta, so that is what is read; before
+    2026-11-10 the code read the scroll delta and Ctrl+wheel did nothing.
 - **CAR** uses and corrects only the Band channels.
 - Display only; recordings, spike detection and audio are untouched.
 

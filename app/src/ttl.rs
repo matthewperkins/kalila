@@ -56,6 +56,12 @@ impl TtlOverlay {
         self.seen = 0;
     }
 
+    /// An overlay from one TTL word per column (the OR of the words in that column), e.g.
+    /// from the min/max pyramid.
+    pub fn from_columns(words: &[u16]) -> Self {
+        Self { cols: words.iter().map(|&w| VALID | w as u32).collect(), cur: u32::MAX, seen: words.iter().fold(0, |a, &w| a | w) }
+    }
+
     /// Forget column contents (display geometry changed) but keep the lanes.
     pub fn clear_cols(&mut self) {
         self.cols.clear();

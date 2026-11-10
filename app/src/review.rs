@@ -214,6 +214,9 @@ pub struct Shown {
     pub ttl: crate::ttl::TtlOverlay,
     /// Window position of the sample `key.t0` (0 after a fresh fill; appends advance it).
     pub pos_t0: u32,
+    /// Drawn from the min/max pyramid: when, and whether every column was covered (if not,
+    /// the backfill is still running and the image is redrawn periodically).
+    pub pyramid: Option<(std::time::Instant, bool)>,
 }
 
 impl Shown {
@@ -266,6 +269,8 @@ impl ReviewView {
 
     /// Keep the span within limits and the stretch inside the recording `[first, end)`.
     pub fn clamp(&mut self, first: i64, end: i64, min_span: u32, max_span: u32) {
+        // No wider than the recording so far (once it is longer than the minimum span).
+        let max_span = max_span.min((end - first).clamp(min_span.max(1) as i64, u32::MAX as i64) as u32);
         self.span = self.span.clamp(min_span.max(1), max_span.max(min_span.max(1)));
         let last_t0 = (end - self.span as i64).max(first);
         self.t0 = self.t0.clamp(first, last_t0);
@@ -322,10 +327,10 @@ mod tests {
         // Zoom out 2x about the right edge: the right edge stays put.
         v.zoom(2.0, 1.0);
         assert_eq!((v.t0, v.span), (4800, 200));
-        // Shorter recording than the span: starts at the first sample.
+        // Shorter recording than the span: the span shrinks to it, from the first sample.
         v.span = 1000;
         v.clamp(1000, 1500, 10, 1000);
-        assert_eq!(v.t0, 1000);
+        assert_eq!((v.t0, v.span), (1000, 500));
     }
 
     #[test]
