@@ -4,43 +4,41 @@ use engine::rhythm::BoardSettings;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Display filter presets of a trace view (display only; recordings stay raw).
+/// Display filters of a trace view (display only; recordings stay raw): raw, or the view's
+/// bandpass (`TraceViewSettings::band_low_hz`/`band_high_hz`).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ViewFilter {
     Raw,
-    Spikes,
-    Lfp,
-    /// Raw minus drift: a gentle high-pass at `TraceViewSettings::hp_hz` (movement artefacts).
-    Hp,
+    #[serde(alias = "Spikes", alias = "Lfp", alias = "Hp")]
+    Band,
 }
 
 impl ViewFilter {
-    pub const ALL: [ViewFilter; 4] = [ViewFilter::Raw, ViewFilter::Hp, ViewFilter::Spikes, ViewFilter::Lfp];
+    pub const ALL: [ViewFilter; 2] = [ViewFilter::Raw, ViewFilter::Band];
     /// Index into per-filter tables (and the shader's preset number).
     pub fn index(self) -> usize {
         match self {
             ViewFilter::Raw => 0,
-            ViewFilter::Spikes => 1,
-            ViewFilter::Lfp => 2,
-            ViewFilter::Hp => 3,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            ViewFilter::Raw => "Raw",
-            ViewFilter::Spikes => "300–6k",
-            ViewFilter::Lfp => "LFP",
-            ViewFilter::Hp => "HP",
+            ViewFilter::Band => 1,
         }
     }
     /// One letter, for the per-row chips.
     pub fn letter(self) -> &'static str {
         match self {
             ViewFilter::Raw => "R",
-            ViewFilter::Spikes => "S",
-            ViewFilter::Lfp => "L",
-            ViewFilter::Hp => "H",
+            ViewFilter::Band => "B",
         }
+    }
+}
+
+/// "300–6k", "10 Hz–" (no low-pass) or "–300" (no high-pass); 0 = that corner is off.
+pub fn band_label(low_hz: f32, high_hz: f32) -> String {
+    let hz = |f: f32| if f >= 1000.0 { format!("{}k", (f / 1000.0 * 10.0).round() / 10.0) } else if f >= 10.0 { format!("{f:.0}") } else { format!("{f:.1}") };
+    match (low_hz > 0.0, high_hz > 0.0) {
+        (true, true) => format!("{}–{}", hz(low_hz), hz(high_hz)),
+        (true, false) => format!("{} Hz–", hz(low_hz)),
+        (false, true) => format!("–{}", hz(high_hz)),
+        (false, false) => "Band (off)".into(),
     }
 }
 
@@ -130,13 +128,14 @@ pub struct TraceViewSettings {
     /// Per-channel filters, keyed by `"<headstage>:<index in headstage>"` (so they survive
     /// regrouping rows and channel-count changes on other ports). Empty = all use `filter`.
     pub channel_filter: std::collections::BTreeMap<String, ViewFilter>,
-    /// High-pass corner of the HP preset (Hz).
-    pub hp_hz: f32,
+    /// Corners of the Band filter (Hz; 4th-order Butterworth each side); 0 = that side off.
+    pub band_low_hz: f32,
+    pub band_high_hz: f32,
     pub window_s: f32,
     /// µV/row for a filter without its own entry in `uv_by_filter`.
     pub uv_per_row: f32,
     /// µV/row per filter (by `ViewFilter::index`); 0 = use `uv_per_row`.
-    pub uv_by_filter: [f32; 4],
+    pub uv_by_filter: [f32; 2],
     pub rows: usize,
     pub first_row: usize,
     pub thickness: f32,
@@ -184,12 +183,13 @@ impl Default for TraceViewSettings {
             headstages: Vec::new(),
             aux: true,
             adc: true,
-            filter: ViewFilter::Spikes,
+            filter: ViewFilter::Band,
             channel_filter: Default::default(),
-            hp_hz: 10.0,
+            band_low_hz: 300.0,
+            band_high_hz: 6000.0,
             window_s: 2.0,
             uv_per_row: 250.0,
-            uv_by_filter: [0.0; 4],
+            uv_by_filter: [0.0; 2],
             rows: 32,
             first_row: 0,
             thickness: 1.0,
@@ -229,6 +229,58 @@ impl TraceViewSettings {
     /// Filter of the electrode with key `key` (see `channel_filter`).
     pub fn filter_of(&self, key: Option<&str>) -> ViewFilter {
         key.and_then(|k| self.channel_filter.get(k)).copied().unwrap_or(self.filter)
+    }
+    /// The Band filter as a `BandSpec` (corners clamped to what the GPU bank handles).
+    pub fn band(&self) -> engine::dsp::BandSpec {
+        engine::dsp::BandSpec { low_hz: if self.band_low_hz > 0.0 { self.band_low_hz.clamp(0.1, 5000.0) as f64 } else { 0.0 }, high_hz: if self.band_high_hz > 0.0 { self.band_high_hz.clamp(10.0, 15000.0) as f64 } else { 0.0 }, order: 4 }
+    }
+    pub fn band_label(&self) -> String {
+        band_label(self.band_low_hz, self.band_high_hz)
+    }
+    /// Label of a filter as shown in the toolbar.
+    pub fn filter_label(&self, f: ViewFilter) -> String {
+        match f {
+            ViewFilter::Raw => "Raw".into(),
+            ViewFilter::Band => self.band_label(),
+        }
+    }
+}
+
+/// Configs from before the Band filter (2026-11-10) had four presets per view (Raw, Spikes,
+/// Lfp, Hp with `hp_hz`) and a 4-entry `uv_by_filter`. Each view keeps one band: the preset
+/// most of its rows used (Spikes 300–6k, Lfp 1–300, Hp `hp_hz`–), and that preset's µV/row.
+fn migrate_view_presets(view: &mut serde_json::Value) {
+    use serde_json::{Value, json};
+    let Some(o) = view.as_object_mut() else { return };
+    let preset = |v: &Value| v.as_str().filter(|s| ["Spikes", "Lfp", "Hp"].contains(s)).map(str::to_string);
+    let mut votes: Vec<(String, usize)> = Vec::new();
+    let mut vote = |p: Option<String>, w: usize| {
+        if let Some(p) = p {
+            match votes.iter_mut().find(|(q, _)| *q == p) {
+                Some(e) => e.1 += w,
+                None => votes.push((p, w)),
+            }
+        }
+    };
+    vote(o.get("filter").and_then(preset), 1);
+    if let Some(m) = o.get("channel_filter").and_then(Value::as_object) {
+        for v in m.values() {
+            vote(preset(v), 1);
+        }
+    }
+    let hp = o.get("hp_hz").and_then(Value::as_f64).unwrap_or(10.0);
+    let (low, high, idx) = match votes.iter().max_by_key(|(_, n)| *n).map(|(p, _)| p.as_str()) {
+        Some("Lfp") => (1.0, 300.0, 2),
+        Some("Hp") => (hp, 0.0, 3),
+        _ => (300.0, 6000.0, 1),
+    };
+    if !votes.is_empty() {
+        o.insert("band_low_hz".into(), json!(low));
+        o.insert("band_high_hz".into(), json!(high));
+    }
+    if let Some(uv) = o.get("uv_by_filter").and_then(Value::as_array).filter(|a| a.len() == 4) {
+        let uv = json!([uv[0], uv[idx]]);
+        o.insert("uv_by_filter".into(), uv);
     }
 }
 
@@ -329,7 +381,12 @@ impl Config {
     /// Parse a saved config. Configs from before trace windows had the trace settings in
     /// `display` (same field names, the display CAR in `display.car`): they become view 1.
     fn parse(s: &str) -> serde_json::Result<Self> {
-        let v: serde_json::Value = serde_json::from_str(s)?;
+        let mut v: serde_json::Value = serde_json::from_str(s)?;
+        if let Some(views) = v.get_mut("views").and_then(serde_json::Value::as_array_mut) {
+            views.iter_mut().for_each(migrate_view_presets);
+        } else if let Some(d) = v.get_mut("display") {
+            migrate_view_presets(d);
+        }
         let mut cfg: Self = serde_json::from_value(v.clone())?;
         if v.get("views").is_none() {
             let mut view: TraceViewSettings = v.get("display").cloned().map(serde_json::from_value).transpose()?.unwrap_or_default();
@@ -366,17 +423,35 @@ mod tests {
         let mut v = TraceViewSettings { uv_per_row: 300.0, ..Default::default() };
         assert_eq!(v.uv(ViewFilter::Raw), 300.0, "unset scales fall back to uv_per_row");
         v.set_uv(ViewFilter::Raw, 1200.0);
-        assert_eq!((v.uv(ViewFilter::Raw), v.uv(ViewFilter::Spikes)), (1200.0, 300.0));
+        assert_eq!((v.uv(ViewFilter::Raw), v.uv(ViewFilter::Band)), (1200.0, 300.0));
         v.filter = ViewFilter::Raw;
-        v.channel_filter.insert("B1:3".into(), ViewFilter::Hp);
-        assert_eq!(v.filter_of(Some("B1:3")), ViewFilter::Hp);
+        v.channel_filter.insert("B1:3".into(), ViewFilter::Band);
+        assert_eq!(v.filter_of(Some("B1:3")), ViewFilter::Band);
         assert_eq!(v.filter_of(Some("B1:4")), ViewFilter::Raw);
         assert_eq!(v.filter_of(None), ViewFilter::Raw);
-        // Old configs (no per-channel fields) still load.
-        let old: TraceViewSettings = serde_json::from_str(r#"{"filter":"Lfp","uv_per_row":800.0}"#).unwrap();
-        assert!(old.channel_filter.is_empty() && old.hp_hz == 10.0 && old.uv(ViewFilter::Lfp) == 800.0);
         let back: TraceViewSettings = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
         assert_eq!(back, v);
+        assert_eq!(band_label(300.0, 6000.0), "300–6k");
+        assert_eq!(band_label(10.0, 0.0), "10 Hz–");
+        assert_eq!(band_label(0.5, 300.0), "0.5–300");
+    }
+
+    #[test]
+    fn old_presets_become_the_band() {
+        // A Port B window as saved before the Band filter: Myomatrix rows on HP 100 Hz, four
+        // rows on 300–6k, the rest raw. HP wins; its µV/row (1000) becomes the band's.
+        let old = r#"{"views": [{"filter": "Raw", "hp_hz": 100.0, "uv_by_filter": [4000.0, 150.0, 2000.0, 1000.0],
+            "channel_filter": {"A2:0": "Spikes", "B1:0": "Hp", "B1:1": "Hp", "B1:8": "Raw"}},
+            {"filter": "Spikes", "uv_by_filter": [0.0, 200.0, 0.0, 0.0]}]}"#;
+        let c = Config::parse(old).unwrap();
+        let v = &c.views[0];
+        assert_eq!((v.band_low_hz, v.band_high_hz), (100.0, 0.0));
+        assert_eq!((v.uv(ViewFilter::Raw), v.uv(ViewFilter::Band)), (4000.0, 1000.0));
+        assert_eq!(v.filter_of(Some("A2:0")), ViewFilter::Band);
+        assert_eq!(v.filter_of(Some("B1:8")), ViewFilter::Raw);
+        let v = &c.views[1];
+        assert_eq!((v.filter, v.band_low_hz, v.band_high_hz, v.uv(ViewFilter::Band)), (ViewFilter::Band, 300.0, 6000.0, 200.0));
+        assert_eq!(v.band_label(), "300–6k");
     }
     use super::*;
 
@@ -388,7 +463,8 @@ mod tests {
         let c = Config::parse(old).unwrap();
         assert_eq!(c.views.len(), 1);
         let v = &c.views[0];
-        assert_eq!((v.filter, v.window_s, v.uv_per_row, v.per_row), (ViewFilter::Lfp, 7.0, 800.0, 4));
+        assert_eq!((v.filter, v.window_s, v.uv_per_row, v.per_row), (ViewFilter::Band, 7.0, 800.0, 4));
+        assert_eq!((v.band_low_hz, v.band_high_hz), (1.0, 300.0));
         assert_eq!(v.car, ViewCar { enabled: true, reference: vec![1, 2], subtract: vec![2] });
         // The global (spikes/audio) CAR keeps its switches and sets.
         assert!(c.display.car.spikes && !c.display.car.audio);

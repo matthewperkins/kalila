@@ -82,8 +82,8 @@ pub struct TraceConfig {
     pub nslots: u32,
 }
 
-/// Every display filter preset of a view in one table, so each channel can use its own
-/// (`chinfo` flag bits 3-4 pick the preset).
+/// Every display filter of a view in one table, so each channel can use its own
+/// (`chinfo` flag bits 3-4 pick the preset: 0 raw, 1 the view's band).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct FilterBank {
     /// b0 b1 b2 a1 a2
@@ -93,16 +93,13 @@ pub struct FilterBank {
 }
 
 impl FilterBank {
-    pub fn new(fs: f64, hp_hz: f32) -> Self {
+    pub fn new(fs: f64, band: engine::dsp::BandSpec) -> Self {
         use crate::config::ViewFilter;
-        use engine::dsp::BandSpec;
         let mut b = FilterBank::default();
         for f in ViewFilter::ALL {
             let secs = match f {
                 ViewFilter::Raw => vec![],
-                ViewFilter::Spikes => BandSpec::SPIKES.sections(fs),
-                ViewFilter::Lfp => BandSpec::LFP.sections(fs),
-                ViewFilter::Hp => BandSpec { low_hz: hp_hz.clamp(0.1, 1000.0) as f64, high_hz: 0.0, order: 2 }.sections(fs),
+                ViewFilter::Band => band.sections(fs),
             };
             let start = b.sections.len();
             let secs: Vec<[f32; 5]> = secs.into_iter().take(4.min(MAX_SECTIONS - start)).map(|q| [q.b0, q.b1, q.b2, q.a1, q.a2]).collect();
@@ -486,27 +483,25 @@ mod tests {
     }
 
     #[test]
-    fn filter_bank_holds_every_preset() {
+    fn filter_bank_holds_the_band() {
+        use engine::dsp::BandSpec;
         let fs = 30000.0;
-        let b = FilterBank::new(fs, 10.0);
-        assert!(b.sections.len() <= MAX_SECTIONS);
-        let preset = |f: ViewFilter| {
+        let preset = |b: &FilterBank, f: ViewFilter| {
+            assert!(b.sections.len() <= MAX_SECTIONS);
             let v = b.fsec[f.index()];
             let (s0, n) = ((v & 0xff) as usize, (v >> 8) as usize);
             assert!(n <= 4, "shader keeps 4 sections of state per channel");
             b.sections[s0..s0 + n].to_vec()
         };
-        assert!(preset(ViewFilter::Raw).is_empty());
-        let hp = preset(ViewFilter::Hp);
+        let b = FilterBank::new(fs, BandSpec { low_hz: 10.0, high_hz: 0.0, order: 4 });
+        assert!(preset(&b, ViewFilter::Raw).is_empty());
+        let hp = preset(&b, ViewFilter::Band);
         assert!((gain(&hp, fs, 10.0) - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.02);
         assert!(gain(&hp, fs, 1.0) < 0.02, "drift is removed");
         assert!((gain(&hp, fs, 200.0) - 1.0).abs() < 0.01, "EMG band passes");
-        let sp = preset(ViewFilter::Spikes);
+        let sp = preset(&FilterBank::new(fs, BandSpec::SPIKES), ViewFilter::Band);
         assert!((gain(&sp, fs, 1500.0) - 1.0).abs() < 0.05 && gain(&sp, fs, 50.0) < 1e-3);
-        let lfp = preset(ViewFilter::Lfp);
+        let lfp = preset(&FilterBank::new(fs, BandSpec { low_hz: 1.0, high_hz: 300.0, order: 4 }), ViewFilter::Band);
         assert!((gain(&lfp, fs, 30.0) - 1.0).abs() < 0.05 && gain(&lfp, fs, 3000.0) < 0.02);
-        // The HP corner follows the setting.
-        let b2 = FilterBank::new(fs, 30.0);
-        assert_ne!(b, b2);
     }
 }

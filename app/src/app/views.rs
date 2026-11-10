@@ -277,9 +277,9 @@ fn used_filters(l: &StreamLayout, filters: &[ViewFilter], row_ch: &[u32]) -> Vec
     ViewFilter::ALL.into_iter().filter(|f| row_ch.iter().any(|&c| l.channels[c as usize].kind == ChannelKind::Electrode && filters[c as usize] == *f)).collect()
 }
 
-/// Display CAR applies to the 300–6k electrodes only (reference and subtraction alike).
+/// Display CAR applies to the Band electrodes only (reference and subtraction alike).
 fn car_applies(d: &TraceViewSettings, used: &[ViewFilter]) -> bool {
-    d.car.enabled && used.contains(&ViewFilter::Spikes)
+    d.car.enabled && used.contains(&ViewFilter::Band)
 }
 
 /// Set channels' filters (a row chip); if that leaves one filter for every drawn electrode,
@@ -316,7 +316,7 @@ fn view_chinfo(l: &StreamLayout, d: &TraceViewSettings, filters: &[ViewFilter]) 
         .map(|(i, c)| match c.kind {
             ChannelKind::Electrode => {
                 let f = filters[i];
-                let car = f == ViewFilter::Spikes;
+                let car = f == ViewFilter::Band;
                 let flags = 8 * f.index() as u32 + 2 * (car && in_set(&d.car.reference, i)) as u32 + 4 * (car && in_set(&d.car.subtract, i)) as u32;
                 [c.bit_volts, flags as f32, d.uv(f), 0.0]
             }
@@ -340,22 +340,25 @@ fn hatch(p: &egui::Painter, r: egui::Rect) {
     }
 }
 
-/// Hover text of a filter preset.
-fn filter_help(f: ViewFilter, hp_hz: f32) -> String {
+/// Hover text of a filter.
+fn filter_help(f: ViewFilter, d: &TraceViewSettings) -> String {
     match f {
         ViewFilter::Raw => "Raw: unfiltered".into(),
-        ViewFilter::Hp => format!("HP: high-pass at {hp_hz:.1} Hz (raw minus drift and movement)"),
-        ViewFilter::Spikes => "300–6k: spike band (display CAR applies here)".into(),
-        ViewFilter::Lfp => "LFP: 1–300 Hz".into(),
+        ViewFilter::Band => format!("Band: {} (4th-order Butterworth each side; the window's corners; display CAR applies here)", d.band_label()),
     }
 }
 
+/// The band corners as hashable bits.
+fn band_bits(d: &TraceViewSettings) -> (u32, u32) {
+    (d.band_low_hz.to_bits(), d.band_high_hz.to_bits())
+}
+
 /// Identifies the per-channel filters (a change clears the sweeps).
-fn filters_hash(filters: &[ViewFilter], hp_hz: f32) -> u64 {
+fn filters_hash(filters: &[ViewFilter], band: (u32, u32)) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     filters.hash(&mut h);
-    hp_hz.to_bits().hash(&mut h);
+    band.hash(&mut h);
     h.finish()
 }
 
@@ -372,7 +375,7 @@ fn trig_channel(l: &StreamLayout, d: &TraceViewSettings) -> Option<usize> {
 fn sweep_hash(d: &TraceViewSettings, pre: u32, post: u32, nslots: u32, filters: &[ViewFilter], cols: u32) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (pre, post, nslots, cols, filters_hash(filters, d.hp_hz)).hash(&mut h);
+    (pre, post, nslots, cols, filters_hash(filters, band_bits(d))).hash(&mut h);
     (d.trig_source, d.trig_line, &d.trig_channel, d.trig_slope, d.trig_align, d.trig_window).hash(&mut h);
     (d.trig_level_uv == 0.0, d.trig_holdoff_ms.to_bits(), d.trig_level2_uv.to_bits()).hash(&mut h);
     h.finish()
@@ -689,24 +692,28 @@ impl ViewsShared {
             }
             // Filtering palette: one column per preset, with "every row", its µV/row, and
             // its own setting (HP corner, CAR). The row chips beside the traces set single rows.
-            let car_on = car_applies(d, &used) || (used.is_empty() && d.car.enabled && d.filter == ViewFilter::Spikes);
-            let label = format!("Filtering: {}{}", if mixed { "mixed" } else { uniform.label() }, if car_on { " · CAR" } else { "" });
-            let btn = ui.button(label).on_hover_text(if mixed { "Rows use different filters (set with the chips beside the traces)" } else { "Display filter, µV/row per filter, HP corner and CAR" });
+            let car_on = car_applies(d, &used) || (used.is_empty() && d.car.enabled && d.filter == ViewFilter::Band);
+            let label = format!("Filtering: {}{}", if mixed { "mixed".to_string() } else { d.filter_label(uniform) }, if car_on { " · CAR" } else { "" });
+            let btn = ui.button(label).on_hover_text(if mixed { "Rows use different filters (set with the chips beside the traces)" } else { "Display filter, µV/row per filter, band corners and CAR" });
             if mixed {
                 hatch(ui.painter(), btn.rect.shrink(1.0));
             }
             egui::Popup::from_toggle_button_response(&btn).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                egui::Grid::new(("filter-palette", id)).num_columns(5).spacing([10.0, 6.0]).min_col_width(64.0).show(ui, |ui| {
+                egui::Grid::new(("filter-palette", id)).num_columns(3).spacing([10.0, 6.0]).min_col_width(64.0).show(ui, |ui| {
                     ui.label("");
                     for f in ViewFilter::ALL {
-                        ui.vertical_centered(|ui| ui.strong(f.label()).on_hover_text(filter_help(f, d.hp_hz)));
+                        let label = match f {
+                            ViewFilter::Raw => "Raw".to_string(),
+                            ViewFilter::Band => format!("Band {}", d.band_label()),
+                        };
+                        ui.vertical_centered(|ui| ui.strong(label).on_hover_text(filter_help(f, d)));
                     }
                     ui.end_row();
                     ui.label("All channels");
                     for f in ViewFilter::ALL {
                         ui.vertical_centered(|ui| {
-                            let r = ui.selectable_label(!mixed && uniform == f, " all rows ").on_hover_text(format!("{} on every row (clears per-row choices)", f.label()));
+                            let r = ui.selectable_label(!mixed && uniform == f, " all rows ").on_hover_text(format!("{} on every row (clears per-row choices)", d.filter_label(f)));
                             if mixed && used.contains(&f) {
                                 hatch(ui.painter(), r.rect.shrink(1.0));
                             }
@@ -725,25 +732,22 @@ impl ViewsShared {
                         }
                     }
                     ui.end_row();
+                    ui.label("Corners").on_hover_text("High-pass and low-pass corners of the Band filter (4th-order Butterworth each); 0 = that side off");
                     ui.label("");
-                    for f in ViewFilter::ALL {
-                        match f {
-                            ViewFilter::Hp => {
-                                ui.add(egui::DragValue::new(&mut d.hp_hz).range(0.5..=300.0).speed(0.2).suffix(" Hz")).on_hover_text("High-pass corner of the HP filter (2nd-order Butterworth)");
-                            }
-                            ViewFilter::Spikes => {
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut d.car.enabled, "CAR").on_hover_text("Display-only common average reference, on the 300–6k rows");
-                                    if ui.small_button("…").on_hover_text(format!("CAR channels: reference {} · subtract {}", d.car.reference.len(), d.car.subtract.len())).clicked() {
-                                        open_car = true;
-                                    }
-                                });
-                            }
-                            _ => {
-                                ui.label("");
-                            }
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut d.band_low_hz).range(0.0..=5000.0).speed(1.0).suffix(" Hz")).on_hover_text("High-pass corner (0 = none)");
+                        ui.label("–");
+                        ui.add(egui::DragValue::new(&mut d.band_high_hz).range(0.0..=15000.0).speed(10.0).suffix(" Hz")).on_hover_text("Low-pass corner (0 = none)");
+                    });
+                    ui.end_row();
+                    ui.label("");
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut d.car.enabled, "CAR").on_hover_text("Display-only common average reference, on the Band rows");
+                        if ui.small_button("…").on_hover_text(format!("CAR channels: reference {} · subtract {}", d.car.reference.len(), d.car.subtract.len())).clicked() {
+                            open_car = true;
                         }
-                    }
+                    });
                     ui.end_row();
                 });
             });
@@ -940,7 +944,7 @@ impl ViewsShared {
         }
         let in_review = !trig && self.states[vi].review.is_some();
         let window = (d.window_s as f64 * fs).round().max(cols as f64) as u32;
-        let bank = FilterBank::new(fs, d.hp_hz);
+        let bank = FilterBank::new(fs, d.band());
         if in_review {
             let g = ReviewGeom { rect, plot, strip, ttl_h, label_w, cols, rows, first, k, ppp };
             self.review_view(ui, &resp, vi, &l, &d, &g, bank, &filters, &row_ch, &rowtab, &ttl_lines);
@@ -1285,7 +1289,8 @@ impl ViewsShared {
         let order = Arc::new(row_ch.to_vec());
         let rowtab_gpu = Arc::new(rowtab.to_vec());
         let colors = Arc::new(self.view_colors(l, row_ch, rowtab));
-        let lead = (used.iter().map(|&f| review::lead_in_s(f, d.hp_hz)).fold(0.0, f64::max) * fs).round() as i64;
+        let band = d.band();
+        let lead = (used.iter().map(|&f| review::lead_in_s(f, &band)).fold(0.0, f64::max) * fs).round() as i64;
         let id = d.id;
         let newest = self.newest_sample;
         let vs = &mut self.states[vi];
@@ -1294,7 +1299,7 @@ impl ViewsShared {
         vs.last_data = Instant::now();
         let Some(rv) = vs.review.as_mut() else { return };
         rv.clamp(src.first_sample, end, min_span, max_span);
-        let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filters: filters.to_vec(), hp: d.hp_hz.to_bits(), car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
+        let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filters: filters.to_vec(), band: band_bits(d), car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
         // One image in flight at a time; it always completes (cancelling it every frame while
         // the pointer moves would mean never updating). Meanwhile the shown image is drawn
         // panned and zoomed to the current stretch, so the traces follow the pointer.
@@ -1506,7 +1511,7 @@ impl ViewsShared {
                     let seg_w = CHIP_W / ViewFilter::ALL.len() as f32;
                     for (j, f) in ViewFilter::ALL.into_iter().enumerate() {
                         let seg = egui::Rect::from_min_size(egui::pos2(chip.min.x + j as f32 * seg_w, chip.min.y), egui::vec2(seg_w, h));
-                        let sr = ui.interact(seg, ui.scope_id().with(("rowfilt", id, first + r, j)), egui::Sense::click()).on_hover_text(filter_help(f, self.settings[vi].hp_hz));
+                        let sr = ui.interact(seg, ui.scope_id().with(("rowfilt", id, first + r, j)), egui::Sense::click()).on_hover_text(filter_help(f, &self.settings[vi]));
                         let on = here.contains(&f);
                         let fill = if on { ui.visuals().selection.bg_fill } else if sr.hovered() { Color32::from_gray(60) } else { Color32::from_gray(34) };
                         p.rect_filled(seg.shrink(0.5), 2.0, fill);
@@ -1676,10 +1681,10 @@ impl App {
             for (i, v) in sh.settings.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     changed |= ui.checkbox(&mut v.open, "").on_hover_text("Show this window").changed();
-                    let car = if v.car.enabled && (v.filter == ViewFilter::Spikes || v.channel_filter.values().any(|f| *f == ViewFilter::Spikes)) { " · CAR" } else { "" };
+                    let car = if v.car.enabled && (v.filter == ViewFilter::Band || v.channel_filter.values().any(|f| *f == ViewFilter::Band)) { " · CAR" } else { "" };
                     let chans = if v.headstages.is_empty() { "all".to_string() } else { v.headstages.join(", ") };
                     ui.label(RichText::new(&v.name).strong());
-                    ui.weak(format!("{chans} · {}{car}", if v.channel_filter.is_empty() { v.filter.label() } else { "per-row filters" }));
+                    ui.weak(format!("{chans} · {}{car}", if v.channel_filter.is_empty() { v.filter_label(v.filter) } else { "per-row filters".into() }));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Delete").clicked() {
                             delete = Some(i);

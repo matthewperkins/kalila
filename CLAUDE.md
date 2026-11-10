@@ -168,7 +168,7 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
   flushed length, and never touches acquisition or the recorder. Without a recording there is
   nothing to review; the window shows a note instead.
 - **Filtering.** Each read includes a lead-in so the display filter settles: Raw 0 s,
-  300–6k 0.05 s, LFP 1.5 s. Two GPU states per view (`review_key`) are double-buffered; the back
+  Band max(0.05, 3 / f_low) s. Two GPU states per view (`review_key`) are double-buffered; the back
   one is fed in chunks without painting and swapped in when complete.
 - **Snappiness (2026-11-10).** While a fill is in flight the last complete image is drawn
   shifted and zoomed to where its stretch now falls (`RenderU` `x_shift`/`x_scale`/`rot`, and
@@ -188,20 +188,28 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
   - A badge shows how far behind live the view is; an overview strip below jumps on click or drag.
 - Not yet: a min/max pyramid for spans over 60 s, typed notes, signal-level triggers.
 
-## Per-row display filters (simulator, 2026-11-08)
+## Per-row display filters (simulator, 2026-11-08; Raw/Band since 2026-11-10)
 
-- **Presets:** Raw, HP, 300–6k and LFP. HP is a 2nd-order high-pass, 10 Hz by default, adjustable;
-  it shows raw minus drift and movement, for the Myomatrix EMG on Port B.
-- **Per channel:** each electrode can have its own preset (`TraceViewSettings::channel_filter`,
-  keyed `"<headstage>:<index>"`). All presets share one GPU filter bank (`FilterBank`, at most
-  8 sections), and `chinfo` flag bits 3–4 pick the preset per channel.
+- **Two filters per window:** Raw, and **Band**, a bandpass whose corners belong to the window
+  (`TraceViewSettings::band_low_hz`/`band_high_hz`, 4th-order Butterworth each side, 0 = that
+  side off, so "10 Hz–" is the Myomatrix high-pass and "300–6k" the spike band). Port A and
+  Port B windows can have different bands. There is no fixed corner for speed reasons: an IIR
+  costs the same whatever its corners; only the review lead-in depends on the low corner
+  (`review::lead_in_s`, 3 / f_low). The spike detector, audio monitor and slope trigger keep
+  their own fixed 300–6k band in the engine.
+  - Before 2026-11-10 there were four presets (Raw, HP, 300–6k, LFP). `Config::parse`
+    migrates: a view's band becomes the preset most of its rows used, with that preset's
+    µV/row, and every non-raw row becomes Band (`migrate_view_presets`).
+- **Per channel:** each electrode is Raw or Band (`TraceViewSettings::channel_filter`, keyed
+  `"<headstage>:<index>"`). The GPU filter bank (`FilterBank`, at most 8 sections) holds the
+  band; `chinfo` flag bits 3–4 pick raw or band per channel.
 - **Controls:**
-  - the R·H·S·L chips beside each row set that row's filter;
-  - a "Filtering" button in the toolbar opens a palette with one column per preset: "all rows",
-    its µV/row (`uv_by_filter`), the HP corner and CAR. The button reads "mixed", hatched, when
-    rows differ;
+  - the R·B chips beside each row set that row's filter;
+  - a "Filtering" button in the toolbar opens a palette with a column per filter: "all rows",
+    its µV/row (`uv_by_filter`), the band corners and CAR. The button reads "mixed", hatched,
+    when rows differ;
   - Ctrl+wheel over a row scales that row's filter.
-- **CAR** uses and corrects only the 300–6k channels.
+- **CAR** uses and corrects only the Band channels.
 - Display only; recordings, spike detection and audio are untouched.
 
 ## Typed notes (simulator, 2026-11-09)
@@ -240,7 +248,7 @@ window's sweeps can start at a level crossing on one of its electrodes instead o
 - **Level:** the spike detector's threshold for that channel by default (so it follows σ), or a
   fixed µV: drag the dashed line on the channel's row, or click the "level" button. "detector"
   goes back. The line is drawn in the row's own µV scale, so it only lines up with the trace
-  when that row is on 300–6k.
+  when that row's band is near 300–6k.
 - **Slope** falling (negative level) or rising; **t0** at the trough (the extreme within 0.5 ms
   of the crossing, as the detector aligns) or at the crossing; **holdoff** on top of the 1 ms
   dead time; **window** discriminator (reject troughs beyond a second level), off by default.

@@ -15,7 +15,7 @@
 //
 // Per-channel `chinfo` = (gain, flags, units_per_row, center):
 //   gain          physical units per int16 LSB (µV for electrodes, V for AUX/ADC)
-//   flags         bits 3-4: display filter preset (0 raw, 1 300–6k, 2 LFP, 3 HP; AUX/ADC raw)
+//   flags         bits 3-4: display filter (0 raw, 1 the view's band; AUX/ADC raw)
 //                 bit 1: part of the CAR reference; bit 2: subtract the CAR
 //   units_per_row 0 = use the global µV/row; otherwise this channel's own row range
 //   center        value drawn at the row's centre line
