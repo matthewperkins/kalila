@@ -211,11 +211,15 @@ struct Render {
     uv_per_row: f32,
     row_h: f32,
     thickness: f32,
-    _pad: f32,
+    x_shift: f32, // review: pan offset of a stale image, in columns
     kmax: u32,   // channels per row (instances per row per slot)
     nslots: u32, // 0 = free-running; else sweep slots
     newest: u32, // slot of the newest sweep
     filled: u32, // sweeps available (≤ nslots)
+    x_scale: f32, // review: zoom of a stale image (columns drawn per data column)
+    rot: u32,     // review: data column drawn at column 0
+    _p1: u32,
+    _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> R: Render;
@@ -273,20 +277,23 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
     let col = vi / 6u;
     let corner = vi % 6u;
     let base = select(ch * R.cols, (slot * R.nch + ch) * R.cols, trig);
-    let m = colv(trig, base + col);
+    // Review images may be rotated: the data column at `col` is (col + rot) % cols.
+    let dc = (col + R.rot) % R.cols;
+    let m = colv(trig, base + dc);
     if (empty(m)) {
         return o;
     }
     // Free-running: hide stale data just ahead of the sweep cursor.
-    let d = (col + R.cols - R.cursor) % R.cols;
+    let d = (dc + R.cols - R.cursor) % R.cols;
     if (!trig && d >= 1u && d <= R.gap) {
         return o;
     }
     var lo = m.x;
     var hi = m.y;
     if (col > 0u) {
-        let p = colv(trig, base + col - 1u);
-        let dp = (col - 1u + R.cols - R.cursor) % R.cols;
+        let dcp = (dc + R.cols - 1u) % R.cols;
+        let p = colv(trig, base + dcp);
+        let dp = (dcp + R.cols - R.cursor) % R.cols;
         if (!empty(p) && (trig || !(dp >= 1u && dp <= R.gap))) {
             lo = min(lo, p.y);
             hi = max(hi, p.x);
@@ -299,8 +306,11 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
     let half = 0.5 * R.thickness;
     let yt = yc - (hi - ci.w) * k - half;
     let yb = yc - (lo - ci.w) * k + half;
-    let x0 = f32(col) * R.vp.x / f32(R.cols);
-    let x1 = f32(col + 1u) * R.vp.x / f32(R.cols);
+    let x0 = (f32(col) * R.x_scale + R.x_shift) * R.vp.x / f32(R.cols);
+    let x1 = (f32(col + 1u) * R.x_scale + R.x_shift) * R.vp.x / f32(R.cols);
+    if (x1 < 0.0 || x0 > R.vp.x) {
+        return o;
+    }
     var px = vec2<f32>(0.0);
     switch corner {
         case 0u: { px = vec2<f32>(x0, yt); }

@@ -170,6 +170,16 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
 - **Filtering.** Each read includes a lead-in so the display filter settles: Raw 0 s,
   300–6k 0.05 s, LFP 1.5 s. Two GPU states per view (`review_key`) are double-buffered; the back
   one is fed in chunks without painting and swapped in when complete.
+- **Snappiness (2026-11-10).** While a fill is in flight the last complete image is drawn
+  shifted and zoomed to where its stretch now falls (`RenderU` `x_shift`/`x_scale`/`rot`, and
+  the same in `TtlGeom`), so a drag moves at once. A fill is never cancelled; when it completes,
+  the newest stretch is requested. A pan forward by less than a window *appends* just the new
+  samples to the shown state (filter state continues, no lead-in). The reader reads straight
+  into the `i16` buffer. `RUST_LOG=oers=debug` logs each fill with its read time.
+  - Measured on the sim (62 ch, Raw): 3 s fills in 11–27 ms; 33 s in 0.85–0.98 s. The file
+    read is 20–80 ms of that; the rest is the GPU `filt` pass, which runs one serial thread
+    per channel (an IIR is sequential), about 57 ms per 8 MB chunk. Raw is no faster because
+    it goes through the same loop. The fix for long spans is the min/max pyramid (phase 2).
 - **Controls.**
   - Drag, Shift+wheel or ←/→ pan; panning back or Home enters review; End or "LIVE ▸" leaves.
   - Alt+wheel and `+`/`-` set the time base in both modes, like typing into the time box. Live

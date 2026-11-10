@@ -91,9 +91,9 @@ fn serve(r: &Req, files: &mut HashMap<PathBuf, File>, ttl: &mut TtlEdges) -> Res
         let start = (r.from - r.src.first_sample).clamp(0, avail);
         let end = (r.from - r.src.first_sample + r.n as i64).clamp(start, avail);
         let n = (end - start) as usize;
-        let mut bytes = vec![0u8; n * nch * 2];
-        f.read_exact_at(&mut bytes, start as u64 * nch as u64 * 2)?;
-        let data = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        // Read straight into the sample buffer (the file is little-endian, as the host).
+        let mut data = vec![0i16; n * nch];
+        f.read_exact_at(bytemuck::cast_slice_mut(&mut data), start as u64 * nch as u64 * 2)?;
         Ok((r.src.first_sample + start, data))
     };
     match read() {
@@ -212,15 +212,31 @@ pub struct Shown {
     pub buf: u8,
     pub config: crate::traces::TraceConfig,
     pub ttl: crate::ttl::TtlOverlay,
+    /// Window position of the sample `key.t0` (0 after a fresh fill; appends advance it).
+    pub pos_t0: u32,
 }
 
-/// The image being built in the other GPU state (double buffering: the shown one stays on
-/// screen until this one is complete, so dragging never blanks the traces).
+impl Shown {
+    /// The data column at the left edge, with the shader's column mapping.
+    pub fn rot(&self) -> u32 {
+        let (span, cols) = (self.key.span.max(1), self.key.cols);
+        ((self.pos_t0 as f32 * cols as f32 / span as f32) as u32).min(cols.saturating_sub(1))
+    }
+}
+
+/// The image being built: either in the other GPU state (double buffering: the shown one
+/// stays on screen until this one is complete, so dragging never blanks the traces), or an
+/// append of the samples just after the shown image into its own state (a pan to the right
+/// by less than a window, which continues the filter state instead of refiltering it all).
 pub struct Filling {
     pub key: Key,
     pub generation: u64,
     pub buf: u8,
+    pub append: bool,
     pub loaded: Option<Loaded>,
+    pub started: std::time::Instant,
+    /// When the reader's answer arrived.
+    pub loaded_at: Option<std::time::Instant>,
 }
 
 pub struct Loaded {
@@ -277,11 +293,17 @@ impl ReviewView {
         }
         self.error = None;
         let span = f.key.span.max(1) as i64;
-        // The lead-in (t0 - from samples) lands at the end of the window and is then
-        // overwritten, so the visible stretch starts at window position 0.
-        let lead = (f.key.t0 - r.from).max(0);
-        let pos0 = ((span - lead % span) % span) as u32;
+        let pos0 = if f.append {
+            // Right after the shown image, whose end sits at its own start position.
+            self.shown.as_ref().map_or(0, |s| s.pos_t0)
+        } else {
+            // The lead-in (t0 - from samples) lands at the end of the window and is then
+            // overwritten, so the visible stretch starts at window position 0.
+            let lead = (f.key.t0 - r.from).max(0);
+            ((span - lead % span) % span) as u32
+        };
         f.loaded = Some(Loaded { data: r.data, fed: 0, pos0, words: r.words });
+        f.loaded_at = Some(std::time::Instant::now());
     }
 }
 
@@ -310,7 +332,7 @@ mod tests {
     fn lead_in_ends_at_window_position_zero() {
         let key = Key { t0: 1000, span: 300, cols: 100, nch: 1, filters: vec![crate::config::ViewFilter::Spikes], hp: 0, car: None };
         let mut v = ReviewView::new(1000, 300);
-        v.filling = Some(Filling { key, generation: 3, buf: 0, loaded: None });
+        v.filling = Some(Filling { key, generation: 3, buf: 0, append: false, loaded: None, started: std::time::Instant::now(), loaded_at: None });
         // Read from 950: 50 lead-in samples, so the first one goes to position 250.
         v.accept(Resp { view: 0, generation: 3, from: 950, data: vec![0; 350], words: vec![], error: None });
         let l = v.filling.as_ref().unwrap().loaded.as_ref().unwrap();

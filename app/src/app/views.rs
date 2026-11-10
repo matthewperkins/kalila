@@ -1084,6 +1084,9 @@ impl ViewsShared {
             car: car_on,
             gap: None,
             paint: true,
+            x_shift: 0.0,
+            x_scale: 1.0,
+            rot: 0,
         };
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         let p = ui.painter_at(rect);
@@ -1178,7 +1181,7 @@ impl ViewsShared {
                 }
             }
         } else {
-            vs.ttl.draw(&p, &TtlGeom { plot, strip, label_x: rect.min.x + 4.0, ppp, cursor: cursor_col, gap: None }, &ttl_lines);
+            vs.ttl.draw(&p, &TtlGeom::live(plot, strip, rect.min.x + 4.0, ppp, cursor_col, None), &ttl_lines);
             // Notes: absolute sample → position in the sweep (window position = counter % window).
             let base = self.newest_sample - (vs.pending.len() / nch) as i64 - vs.counter as i64;
             let (counter, w64) = (vs.counter as i64, window as i64);
@@ -1292,15 +1295,33 @@ impl ViewsShared {
         let Some(rv) = vs.review.as_mut() else { return };
         rv.clamp(src.first_sample, end, min_span, max_span);
         let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filters: filters.to_vec(), hp: d.hp_hz.to_bits(), car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
-        if rv.shown.as_ref().is_none_or(|s| s.key != key) && rv.filling.as_ref().is_none_or(|f| f.key != key) {
+        // One image in flight at a time; it always completes (cancelling it every frame while
+        // the pointer moves would mean never updating). Meanwhile the shown image is drawn
+        // panned and zoomed to the current stretch, so the traces follow the pointer.
+        if rv.filling.is_none() && rv.shown.as_ref().is_none_or(|s| s.key != key) {
             rv.generation += 1;
-            let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
-            let req = review::Req { view: id, generation: rv.generation, src: src.clone(), from: rv.t0 - lead, n: (lead + rv.span as i64) as usize, words_from: rv.t0, words_n: rv.span as usize };
+            // A pan to the right by less than a window appends to the shown image: the
+            // filter state continues from its end, with no lead-in and no refiltering.
+            let append = rv.shown.as_ref().filter(|s| {
+                let d = key.t0 - s.key.t0;
+                d > 0 && d < s.key.span as i64 && review::Key { t0: s.key.t0, ..key.clone() } == s.key
+            });
+            let (req, buf, append) = match append {
+                Some(s) => {
+                    let from = s.key.t0 + s.key.span as i64;
+                    let n = (key.t0 - s.key.t0) as usize;
+                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from, n, words_from: from, words_n: n }, s.buf, true)
+                }
+                None => {
+                    let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
+                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from: rv.t0 - lead, n: (lead + rv.span as i64) as usize, words_from: rv.t0, words_n: rv.span as usize }, buf, false)
+                }
+            };
             let _ = self.reader.tx.send(req);
-            rv.filling = Some(review::Filling { key: key.clone(), generation: rv.generation, buf, loaded: None });
+            rv.filling = Some(review::Filling { key: key.clone(), generation: rv.generation, buf, append, loaded: None, started: Instant::now(), loaded_at: None });
         }
         let row_h_px = plot.height() * ppp / rows as f32;
-        let frame = |view: u32, config: TraceConfig, reset: bool, upload: Arc<Vec<i16>>, n_new: u32, pos0: u32, paint: bool| TraceFrame {
+        let frame = |view: u32, config: TraceConfig, reset: bool, upload: Arc<Vec<i16>>, n_new: u32, pos0: u32, paint: bool, xf: (f32, f32, u32)| TraceFrame {
             view,
             config,
             reset,
@@ -1322,6 +1343,9 @@ impl ViewsShared {
             car: car_on,
             gap: Some(0),
             paint,
+            x_shift: xf.0,
+            x_scale: xf.1,
+            rot: xf.2,
         };
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         // Feed the back buffer (in chunks small enough for the GPU's binding limit).
@@ -1335,8 +1359,18 @@ impl ViewsShared {
             let config = TraceConfig { nch, cols: f.key.cols, window: span, bank: bank.clone(), nslots: 0 };
             let upload = Arc::new(ld.data[ld.fed * nch..(ld.fed + chunk) * nch].to_vec());
             let pos0 = ((ld.pos0 as u64 + ld.fed as u64) % span as u64) as u32;
-            let fr = frame(review_key(id, f.buf), config, ld.fed == 0, upload, chunk as u32, pos0, false);
+            let fr = frame(review_key(id, f.buf), config, ld.fed == 0 && !f.append, upload, chunk as u32, pos0, false, (0.0, 1.0, 0));
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
+            if f.append && let Some(sh) = rv.shown.as_mut() {
+                // Ingests run before this frame's draw, so the shown image advances with each
+                // chunk (the stretch may be shorter than asked if the recorder hadn't flushed
+                // that far; the rest comes with the next request).
+                let w0 = ld.fed.min(ld.words.len());
+                let w1 = (ld.fed + chunk).min(ld.words.len());
+                sh.ttl.ingest(&ld.words[w0..w1], sh.pos_t0, span, f.key.cols);
+                sh.key.t0 += chunk as i64;
+                sh.pos_t0 = ((sh.pos_t0 as u64 + chunk as u64) % span as u64) as u32;
+            }
             ld.fed += chunk;
             complete = ld.fed >= total;
             if !complete {
@@ -1345,16 +1379,27 @@ impl ViewsShared {
         }
         if complete && let Some(f) = rv.filling.take() {
             let ld = f.loaded.expect("complete implies loaded");
-            let mut ttl = TtlOverlay::default();
-            ttl.reset();
-            if !ld.words.is_empty() {
-                ttl.ingest(&ld.words, 0, f.key.span.max(1), f.key.cols);
+            let span = f.key.span.max(1);
+            let read_ms = f.loaded_at.map_or(0.0, |t| (t - f.started).as_secs_f32() * 1e3);
+            log::debug!("review '{}': {} {} samples in {:.1} ms (read {:.1} ms)", d.name, if f.append { "appended" } else { "filled" }, ld.data.len() / nch.max(1), f.started.elapsed().as_secs_f32() * 1e3, read_ms);
+            if !f.append {
+                let mut ttl = TtlOverlay::default();
+                ttl.reset();
+                if !ld.words.is_empty() {
+                    ttl.ingest(&ld.words, 0, span, f.key.cols);
+                }
+                let config = TraceConfig { nch, cols: f.key.cols, window: span, bank: bank.clone(), nslots: 0 };
+                rv.shown = Some(review::Shown { key: f.key, buf: f.buf, config, ttl, pos_t0: 0 });
             }
-            let config = TraceConfig { nch, cols: f.key.cols, window: f.key.span.max(1), bank: bank.clone(), nslots: 0 };
-            rv.shown = Some(review::Shown { key: f.key, buf: f.buf, config, ttl });
         }
+        // Draw the shown image where its stretch falls in the current one.
+        let xf = rv.shown.as_ref().map_or((0.0, 1.0, 0), |sh| {
+            let x_scale = sh.key.span as f32 / rv.span.max(1) as f32;
+            let x_shift = (sh.key.t0 - rv.t0) as f64 / rv.span.max(1) as f64 * cols as f64;
+            (x_shift as f32, x_scale, sh.rot())
+        });
         if let Some(sh) = rv.shown.as_ref() {
-            let fr = frame(review_key(id, sh.buf), sh.config.clone(), false, Arc::new(Vec::new()), 0, 0, true);
+            let fr = frame(review_key(id, sh.buf), sh.config.clone(), false, Arc::new(Vec::new()), 0, 0, true, xf);
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
         }
         // Overlay.
@@ -1366,7 +1411,7 @@ impl ViewsShared {
         let ttl_strip = egui::Rect::from_min_max(strip.min, egui::pos2(strip.max.x, strip.min.y + ttl_h));
         let mut review_notes: Option<(i64, i64)> = None;
         if let Some(sh) = rv.shown.as_ref() {
-            sh.ttl.draw(&p, &TtlGeom { plot, strip: ttl_strip, label_x: rect.min.x + 4.0, ppp, cursor: 0, gap: Some(0) }, ttl_lines);
+            sh.ttl.draw(&p, &TtlGeom { plot, strip: ttl_strip, label_x: rect.min.x + 4.0, ppp, cursor: 0, gap: Some(0), rot: xf.2, x_shift: xf.0, x_scale: xf.1 }, ttl_lines);
             let (st0, sspan) = (sh.key.t0, sh.key.span as i64);
             review_notes = Some((st0, sspan));
         } else {
@@ -1405,7 +1450,7 @@ impl ViewsShared {
         let badge = format!("REVIEW  {} – {}  ·  {} behind live{loading}", review::fmt_time(rel(t0), span_s < 1.0), review::fmt_time(rel(t0 + span), span_s < 1.0), review::fmt_time(behind, false));
         let live_r = egui::Rect::from_min_size(egui::pos2(plot.max.x - 74.0, plot.min.y + 4.0), egui::vec2(70.0, 20.0));
         p.text(egui::pos2(live_r.min.x - 8.0, live_r.center().y), egui::Align2::RIGHT_CENTER, badge, egui::FontId::monospace(11.0), accent);
-        let go_live = ui.put(live_r, egui::Button::new("LIVE ▸")).on_hover_text("Back to live (End)").clicked();
+        let go_live = ui.put(live_r, egui::Button::new("LIVE >")).on_hover_text("Back to live (End)").clicked();
         if let Some(e) = err {
             p.text(plot.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(13.0), Color32::from_rgb(240, 120, 100));
         }

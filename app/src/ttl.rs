@@ -28,6 +28,17 @@ pub struct TtlGeom {
     pub cursor: u32,
     /// Columns hidden ahead of the cursor; `None` = the live default (as the traces).
     pub gap: Option<u32>,
+    /// Review: the data column drawn at column 0, and the image's pan offset (columns) and
+    /// zoom relative to the plot (as the traces). Live: (0, 0, 1).
+    pub rot: u32,
+    pub x_shift: f32,
+    pub x_scale: f32,
+}
+
+impl TtlGeom {
+    pub fn live(plot: egui::Rect, strip: egui::Rect, label_x: f32, ppp: f32, cursor: u32, gap: Option<u32>) -> Self {
+        Self { plot, strip, label_x, ppp, cursor, gap, rot: 0, x_shift: 0.0, x_scale: 1.0 }
+    }
 }
 
 #[derive(Default)]
@@ -81,13 +92,14 @@ impl TtlOverlay {
 
     /// Runs `[start, end)` of columns where `line` is high, skipping empty columns and the
     /// stale gap just ahead of the cursor (hidden like the traces).
-    fn runs(&self, line: usize, cursor: u32, gap: u32) -> Vec<(u32, u32)> {
+    fn runs(&self, line: usize, cursor: u32, gap: u32, rot: u32) -> Vec<(u32, u32)> {
         let n = self.cols.len() as u32;
         let mut out = Vec::new();
         let mut start = None;
         for col in 0..n {
-            let d = (col + n - cursor) % n;
-            let v = self.cols[col as usize];
+            let dc = (col + rot) % n;
+            let d = (dc + n - cursor) % n;
+            let v = self.cols[dc as usize];
             let high = v & VALID != 0 && v & (1 << line) != 0 && !(d >= 1 && d <= gap);
             match (high, start) {
                 (true, None) => start = Some(col),
@@ -106,7 +118,7 @@ impl TtlOverlay {
 
     /// Draw bands over `g.plot` and one lane per line in `g.strip`.
     pub fn draw(&self, p: &egui::Painter, g: &TtlGeom, lines: &[usize]) {
-        let TtlGeom { plot, strip, label_x, ppp, cursor, gap } = *g;
+        let TtlGeom { plot, strip, label_x, ppp, cursor, gap, rot, x_shift, x_scale } = *g;
         if lines.is_empty() || self.cols.is_empty() {
             return;
         }
@@ -118,9 +130,12 @@ impl TtlOverlay {
             let y0 = strip.min.y + k as f32 * lane_h;
             let lane = egui::Rect::from_min_max(egui::pos2(strip.min.x, y0 + 0.5), egui::pos2(strip.max.x, y0 + lane_h - 0.5));
             p.rect_filled(lane, 0.0, Color32::from_gray(22));
-            for (s, e) in self.runs(line, cursor, gap) {
-                let x0 = plot.min.x + s as f32 / ppp;
-                let x1 = plot.min.x + e as f32 / ppp;
+            for (s, e) in self.runs(line, cursor, gap, rot) {
+                let x0 = (plot.min.x + (s as f32 * x_scale + x_shift) / ppp).max(plot.min.x);
+                let x1 = (plot.min.x + (e as f32 * x_scale + x_shift) / ppp).min(plot.max.x);
+                if x1 <= x0 {
+                    continue;
+                }
                 p.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, plot.min.y), egui::pos2(x1.max(x0 + 1.0 / ppp), plot.max.y)), 0.0, band);
                 p.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, lane.min.y), egui::pos2(x1.max(x0 + 1.0 / ppp), lane.max.y)), 0.0, c);
             }
@@ -143,12 +158,14 @@ mod tests {
         let words: Vec<u16> = (0..100).map(|i| (20..50).contains(&i) as u16).collect();
         t.ingest(&words, 0, 100, 10);
         assert_eq!(t.seen(), 1);
-        assert_eq!(t.runs(0, 9, 0), vec![(2, 5)]);
+        assert_eq!(t.runs(0, 9, 0, 0), vec![(2, 5)]);
         // Cursor at column 1: columns 2..=3 are the gap ahead of it and hidden.
-        assert_eq!(t.runs(0, 1, 2), vec![(4, 5)]);
+        assert_eq!(t.runs(0, 1, 2, 0), vec![(4, 5)]);
+        // Rotated by 2 (review: data column 2 drawn at column 0): the run moves left.
+        assert_eq!(t.runs(0, 9, 0, 2), vec![(0, 3)]);
         // Next sweep: line low everywhere; entering each column resets it.
         t.ingest(&[0; 100], 0, 100, 10);
-        assert_eq!(t.runs(0, 9, 0), vec![]);
+        assert_eq!(t.runs(0, 9, 0, 0), vec![]);
         assert_eq!(t.seen(), 1, "seen persists until reset");
     }
 }

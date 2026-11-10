@@ -58,11 +58,17 @@ struct RenderU {
     uv_per_row: f32,
     row_h: f32,
     thickness: f32,
-    _pad: f32,
+    /// Review: draw column c at x = (c · x_scale + x_shift) columns (pan/zoom of a stale
+    /// image while the next one loads), reading data column (c + rot) % cols.
+    x_shift: f32,
     kmax: u32,
     nslots: u32,
     newest: u32,
     filled: u32,
+    x_scale: f32,
+    rot: u32,
+    _p1: u32,
+    _p2: u32,
 }
 
 /// Geometry/config that requires reallocation or a reset when changed.
@@ -171,6 +177,11 @@ pub struct TraceFrame {
     pub gap: Option<u32>,
     /// Draw this frame. False while a review image is built in its back buffer.
     pub paint: bool,
+    /// Review: the image's pan offset (columns) and zoom factor relative to the view, and the
+    /// data column shown at column 0. Live: (0, 1, 0).
+    pub x_shift: f32,
+    pub x_scale: f32,
+    pub rot: u32,
 }
 
 /// GPU-state key of a window's review buffers (0 and 1); its live state uses the bare view id.
@@ -426,11 +437,15 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
             uv_per_row: f.uv_per_row,
             row_h: f.row_h_px,
             thickness: f.thickness_px,
-            _pad: 0.0,
+            x_shift: f.x_shift,
             kmax: f.kmax.max(1),
             nslots: f.config.nslots,
             newest: f.sweep.newest,
             filled: f.sweep.filled,
+            x_scale: f.x_scale,
+            rot: f.rot % f.config.cols.max(1),
+            _p1: 0,
+            _p2: 0,
         };
         queue.write_buffer(&g.render_u, 0, bytemuck::bytes_of(&ru));
         r.instances = f.nrows * f.kmax.max(1) * f.config.nslots.max(1);
