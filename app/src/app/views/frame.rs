@@ -63,6 +63,16 @@ pub(super) struct ViewFrame<'a> {
     pub edits: Vec<Edit>,
 }
 
+/// A time-axis label centred under its tick at `x`, top or bottom at `y`, shifted inward at
+/// the plot's edges so it isn't cut off.
+fn tick_label(p: &egui::Painter, x: f32, y: f32, top: bool, text: String, plot: egui::Rect, color: Color32) {
+    let g = p.layout_no_wrap(text, egui::FontId::monospace(10.0), color);
+    let size = g.size();
+    let x0 = (x - size.x / 2.0).clamp(plot.min.x, (plot.max.x - size.x).max(plot.min.x));
+    let y0 = if top { y } else { y - size.y };
+    p.galley(egui::pos2(x0, y0), g, color);
+}
+
 /// Trace colours for one view: monitored channels by stereo position; electrodes sharing a
 /// row by their position in the row; otherwise by headstage.
 pub(super) fn view_colors(l: &StreamLayout, mon: &[usize], order: &[u32], rowtab: &[[u32; 2]]) -> Vec<[f32; 4]> {
@@ -444,7 +454,7 @@ impl ViewFrame<'_> {
             while t <= post_ms + 1e-3 {
                 let x = t_to_x(t);
                 p.line_segment([egui::pos2(x, plot.max.y), egui::pos2(x, plot.max.y + 4.0)], Stroke::new(1.0, dim));
-                p.text(egui::pos2(x, rect.max.y - 1.0), egui::Align2::CENTER_BOTTOM, format!("{t:.decimals$}"), egui::FontId::monospace(10.0), dim);
+                tick_label(&p, x, rect.max.y - 1.0, false, format!("{t:.decimals$}"), plot, dim);
                 t += step;
             }
             p.text(egui::pos2(rect.min.x + 4.0, rect.max.y - 1.0), egui::Align2::LEFT_BOTTOM, "ms", egui::FontId::monospace(10.0), dim);
@@ -713,7 +723,7 @@ impl ViewFrame<'_> {
         while t <= rel(t0 + span) + 1e-9 {
             let x = x_of(src.first_sample + (t * fs).round() as i64);
             p.line_segment([egui::pos2(x, axis_y), egui::pos2(x, axis_y + 4.0)], Stroke::new(1.0, dim));
-            p.text(egui::pos2(x, axis_y + 4.0), egui::Align2::CENTER_TOP, review::fmt_time(t, step < 0.1), egui::FontId::monospace(10.0), dim);
+            tick_label(&p, x, axis_y + 4.0, true, review::fmt_time(t, step < 0.1), plot, dim);
             t += step;
         }
         // The whole recording so far, with the stretch on screen.

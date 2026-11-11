@@ -97,6 +97,9 @@ pub struct App {
     dirty_cfg: Instant,
     /// Wheel movement over the spike grid not yet turned into rows (`wheel_rows`).
     spike_scroll: f32,
+    /// Audio underruns: (start of the current minute, the total then, the count in the minute
+    /// before), so the chip shows recent trouble, not the total since startup.
+    underrun_window: std::cell::Cell<(Instant, u64, u64)>,
     autostart: bool,
     // outputs
     was_acquiring: bool,
@@ -153,6 +156,7 @@ impl App {
             close_refused: None,
             dirty_cfg: Instant::now(),
             spike_scroll: 0.0,
+            underrun_window: std::cell::Cell::new((Instant::now(), 0, 0)),
             autostart,
             was_acquiring: false,
             ttl_out_word: 0,
@@ -328,7 +332,19 @@ impl App {
             chip(ui, self.engine.rt_priority(), if self.engine.rt_priority() { "RT".into() } else { "no RT".into() }, "Acquisition thread real-time scheduling (SCHED_FIFO). See README to enable.");
             let a = &self.engine.audio_stats;
             if a.running.load(Ordering::Relaxed) {
-                chip(ui, a.underruns.load(Ordering::Relaxed) < 5, format!("audio {:.1} ms", a.latency_us.load(Ordering::Relaxed) as f32 / 1000.0), "Audio latency after acquisition (ring + device buffer + filters). Underruns shown red.");
+                // Red at 5 or more underruns within about the last minute (this minute so far, or
+                // the whole previous one); the rig normally sees about one per 30 s.
+                let total = a.underruns.load(Ordering::Relaxed);
+                let mut w = self.underrun_window.get();
+                if total < w.1 {
+                    w = (Instant::now(), total, 0); // counter reset (audio restarted)
+                }
+                if w.0.elapsed() >= Duration::from_secs(60) {
+                    w = (Instant::now(), total, total - w.1);
+                }
+                self.underrun_window.set(w);
+                let recent = (total - w.1).max(w.2);
+                chip(ui, recent < 5, format!("audio {:.1} ms", a.latency_us.load(Ordering::Relaxed) as f32 / 1000.0), &format!("Audio latency after acquisition (ring + device buffer + filters). Red at 5 or more underruns within the last minute or so ({recent} recently, {total} since start)."));
             }
             let (lat, lat_max) = { let sh = self.shared.lock(); (sh.disp_latency, sh.disp_latency_max) };
             chip(ui, lat_max < 25.0, format!("display {lat:.1} ms"), "Sample arrival → GPU submit (excludes compositor scan-out).");
