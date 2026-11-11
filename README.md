@@ -54,8 +54,9 @@ It prints once per second. Expect `dropped=0 gaps=0 bad=0`, `hwbuf` near 0 %, an
 recorder back-pressure `bp=0ms`. Then open `/tmp/oers-test` with
 `open_ephys.analysis.Session` and compare against a short recording from the stock GUI with
 the same headstages: channel count, µV scale, and TTL timing. The register command lists
-are verified byte-identical to Intan's C++. The frame layout and init/scan sequence are
-ported line by line, but **have not yet run against a real board.**
+are verified byte-identical to Intan's C++, and the frame layout and init/scan sequence are
+ported line by line from the stock plugin. See "What has been tested" below for what has
+run on a real board.
 
 ## Reliability design
 
@@ -93,7 +94,7 @@ depth adjustable; 0 = off) → +3 dB presence at 2.8 kHz → limiter that is exa
 below 0.5 FS → stereo placement → windowed-sinc resampling with a clock-drift servo.
 **A/B: reference** bypasses the expander and EQ. Noise σ uses a two-pass median that excludes
 spikes, so high-rate regions don't inflate it (tested at 80 Hz tonic firing). Click a
-channel label to listen; Shift+click to add up to 8 channels.
+channel label to listen; Ctrl+click or Shift+click to add up to 8 channels.
 
 ## Config
 
@@ -106,10 +107,48 @@ channel label to listen; Shift+click to add up to 8 channels.
 board" action). Run it again if you move the checkout. A desktop launch has no terminal, so
 the log goes to `~/.local/state/oers/oers.log`.
 
+## What has been tested
+
+oers has run on **one rig** so far. Until it has run on others, make your first
+recordings alongside the stock GUI (or compare a short recording from each with the same
+headstages), as below.
+
+**Tested on hardware** (ECP5/FT600 ONI board, gateware v2.0.0, board ID 0x100; RHD2132
+in 16-channel mode on port A, RHD2216 on port B; NVIDIA RTX 2000 Ada, Hyprland):
+* Board init, port scan and cable delay.
+* Recording: 600 s soaks with no dropped samples, no gaps and no bad frames; 18,000,096
+  contiguous samples at exactly 30 kHz.
+* Against a stock GUI 1.1.0 / plugin 1.1.6 recording with the same headstages: neural
+  channels match channel for channel (0.195 µV/bit), AUX and ADC scale and offset match,
+  TTL line numbers, timing and `full_words` match.
+* The GUI on the board: traces, TTL overlay, spike tiles, audio monitor, scroll-back review
+  of the ongoing recording. Triggered sweeps, the slope trigger and typed notes have been
+  checked on the simulator only.
+* CPU while recording: about a third of the stock GUI's (stock's record thread busy-polls).
+
+**Not yet tested:**
+* Any other headstage (RHD2164, RHD2132 in 32-channel mode, an RHD2216 on its own, more
+  than one per port), other board IDs or gateware versions, and v3 boards (whose ADC is
+  inverted; the code handles it, untested).
+* The ADC inputs with real signals beyond a pulse; DAC and TTL outputs (not yet checked on
+  a scope); DAC routing in 16-channel mode.
+* Other GPUs, AMD/Intel drivers, X11 and Wayland compositors other than Hyprland.
+* Sessions longer than a few hours. Scroll-back review keeps an overview of the recording
+  in RAM (about 0.7 GB per hour on the rig, with no cap yet), so a very long session on
+  a machine with little memory could run short.
+
+Only Linux is supported.
+
 ## Not yet ported
 
 Impedance measurement, BNO/IMU display (IMU data *is* recorded), the general processor graph
 and other plugins, and a spike recording format.
+
+## License
+
+GPL-3.0-or-later (see [LICENSE](LICENSE)), as for the Open Ephys GUI and acquisition-board
+plugin this is ported from. The vendored `liboni` (`crates/oni-sys/liboni`) keeps its own MIT
+licence. FTDI's D3XX library is closed source and not included; see "Rig setup".
 
 ## Icon
 
