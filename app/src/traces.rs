@@ -147,8 +147,9 @@ pub struct TraceFrame {
     pub view: u32,
     pub config: TraceConfig,
     pub reset: bool,
-    /// Raw interleaved int16 samples (n_new × nch).
+    /// Raw interleaved int16 samples: n_new × nch of them, starting at `upload_off`.
     pub upload: Arc<Vec<i16>>,
+    pub upload_off: usize,
     pub n_new: u32,
     /// Window position of the first new sample.
     pub pos0: u32,
@@ -387,7 +388,7 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
             queue.write_buffer(&r.cols, 0, bytemuck::cast_slice(&c[..n]));
         }
         if f.n_new > 0 {
-            let bytes: &[u8] = bytemuck::cast_slice(&f.upload[..f.n_new as usize * f.config.nch]);
+            let bytes: &[u8] = bytemuck::cast_slice(&f.upload[f.upload_off..f.upload_off + f.n_new as usize * f.config.nch]);
             // write_buffer requires a 4-byte multiple.
             if bytes.len() % 4 == 0 {
                 queue.write_buffer(&r.raw, 0, bytes);

@@ -277,11 +277,10 @@ impl Recording {
             }
             let bytes = unsafe { std::slice::from_raw_parts(b.data.as_ptr() as *const u8, b.data.len() * 2) };
             self.main.dat.write_all(bytes)?;
-            self.main.tmp_i64.clear();
-            self.main.tmp_i64.extend((0..b.len() as i64).map(|i| b.first_sample + i));
-            let tmp = std::mem::take(&mut self.main.tmp_i64);
-            self.main.samples.write(&tmp)?;
-            self.main.tmp_i64 = tmp;
+            let m = &mut self.main;
+            m.tmp_i64.clear();
+            m.tmp_i64.extend((0..b.len() as i64).map(|i| b.first_sample + i));
+            m.samples.write(&m.tmp_i64)?;
             self.main.timestamps.write(&b.timestamps)?;
             // TTL edges.
             for (i, &w) in b.ttl.iter().enumerate() {

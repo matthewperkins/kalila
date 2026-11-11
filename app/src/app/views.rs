@@ -25,6 +25,8 @@ pub(super) struct ViewState {
     /// block shifted a whole window (tens of MB for a 20 s window), which starved the UI thread
     /// whenever a window missed a few frames and froze all windows for many seconds.
     pending: VecDeque<i16>,
+    /// This frame's upload, reused once the renderer has dropped last frame's reference.
+    upload: Arc<Vec<i16>>,
     /// TTL words for the samples in `pending` (one per sample).
     pending_ttl: VecDeque<u16>,
     ttl: TtlOverlay,
@@ -62,6 +64,7 @@ impl ViewState {
         Self {
             id,
             pending: VecDeque::new(),
+            upload: Arc::default(),
             pending_ttl: VecDeque::new(),
             ttl: TtlOverlay::default(),
             counter: 0,
@@ -1118,7 +1121,13 @@ impl ViewsShared {
         let words: Vec<u16> = vs.pending_ttl.drain(..(n_new as usize).min(vs.pending_ttl.len())).collect();
         let words = &words[..];
         vs.ttl.ingest(words, pos0, window, cols);
-        let upload: Arc<Vec<i16>> = Arc::new(vs.pending.drain(..n_new as usize * nch).collect());
+        if Arc::get_mut(&mut vs.upload).is_none() {
+            vs.upload = Arc::default(); // last frame's still held by the renderer
+        }
+        let buf = Arc::get_mut(&mut vs.upload).expect("unique");
+        buf.clear();
+        buf.extend(vs.pending.drain(..n_new as usize * nch));
+        let upload = vs.upload.clone();
         // The crossing level: the detector's threshold (sign per slope) or the fixed one.
         let level_uv = tc.map(|c| {
             let mag = if d.trig_level_uv > 0.0 { d.trig_level_uv } else { self.stats.lock().threshold_uv.get(c).copied().unwrap_or(0.0).abs() };
@@ -1192,6 +1201,7 @@ impl ViewsShared {
             config,
             reset,
             upload,
+            upload_off: 0,
             n_new,
             pos0,
             cursor_col,
@@ -1427,11 +1437,12 @@ impl ViewsShared {
         rv.clamp(src.first_sample, end, min_span, max_span);
         let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filters: filters.to_vec(), band: band_bits(d), car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
         let row_h_px = plot.height() * ppp / rows as f32;
-        let frame = |view: u32, config: TraceConfig, reset: bool, upload: Arc<Vec<i16>>, n_new: u32, pos0: u32, paint: bool, xf: (f32, f32, u32)| TraceFrame {
+        let frame = |view: u32, config: TraceConfig, reset: bool, (upload, upload_off): (Arc<Vec<i16>>, usize), n_new: u32, pos0: u32, paint: bool, xf: (f32, f32, u32)| TraceFrame {
             view,
             config,
             reset,
             upload,
+            upload_off,
             n_new,
             pos0,
             cursor_col: 0,
@@ -1469,7 +1480,7 @@ impl ViewsShared {
                     drop(st);
                     let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
                     let config = TraceConfig { nch, cols, window: rv.span.max(1), bank: bank.clone(), nslots: 0 };
-                    let mut fr = frame(review_key(id, buf), config.clone(), true, Arc::new(Vec::new()), 0, 0, false, (0.0, 1.0, 0));
+                    let mut fr = frame(review_key(id, buf), config.clone(), true, (Arc::new(Vec::new()), 0), 0, 0, false, (0.0, 1.0, 0));
                     fr.columns = Some(Arc::new(columns));
                     ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
                     rv.shown = Some(review::Shown { key: key.clone(), buf, config, ttl: TtlOverlay::from_columns(&words), pos_t0: 0, pyramid: Some((Instant::now(), complete)) });
@@ -1517,7 +1528,7 @@ impl ViewsShared {
             let chunk = ((8usize << 20) / nch.max(1)).max(1).min(total - ld.fed);
             let span = f.key.span.max(1);
             let config = TraceConfig { nch, cols: f.key.cols, window: span, bank: bank.clone(), nslots: 0 };
-            let upload = Arc::new(ld.data[ld.fed * nch..(ld.fed + chunk) * nch].to_vec());
+            let upload = (ld.data.clone(), ld.fed * nch);
             let pos0 = ((ld.pos0 as u64 + ld.fed as u64) % span as u64) as u32;
             let fr = frame(review_key(id, f.buf), config, ld.fed == 0 && !f.append, upload, chunk as u32, pos0, false, (0.0, 1.0, 0));
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
@@ -1559,7 +1570,7 @@ impl ViewsShared {
             (x_shift as f32, x_scale, sh.rot())
         });
         if let Some(sh) = rv.shown.as_ref() {
-            let fr = frame(review_key(id, sh.buf), sh.config.clone(), false, Arc::new(Vec::new()), 0, 0, true, xf);
+            let fr = frame(review_key(id, sh.buf), sh.config.clone(), false, (Arc::new(Vec::new()), 0), 0, 0, true, xf);
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
         }
         // Overlay.

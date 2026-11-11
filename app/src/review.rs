@@ -243,7 +243,8 @@ pub struct Filling {
 }
 
 pub struct Loaded {
-    pub data: Vec<i16>,
+    /// Shared with the GPU uploads, which take it chunk by chunk without copying.
+    pub data: std::sync::Arc<Vec<i16>>,
     /// Samples already handed to the GPU.
     pub fed: usize,
     /// Window position of the first sample read (the lead-in ends exactly at position 0).
@@ -307,7 +308,7 @@ impl ReviewView {
             let lead = (f.key.t0 - r.from).max(0);
             ((span - lead % span) % span) as u32
         };
-        f.loaded = Some(Loaded { data: r.data, fed: 0, pos0, words: r.words });
+        f.loaded = Some(Loaded { data: std::sync::Arc::new(r.data), fed: 0, pos0, words: r.words });
         f.loaded_at = Some(std::time::Instant::now());
     }
 }
