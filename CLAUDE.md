@@ -220,9 +220,9 @@ clamped to the recording's length; spans over 60 s never fall back to direct rea
 - **GUI.** `TraceFrame::columns` uploads a whole column buffer (physical units) without
   ingest. While a pyramid is incomplete the badge says "building the overview" and the
   image is redrawn every 300 ms. `RUST_LOG=engine=debug` logs backfill progress and RAM.
-- Unexplained once: in one scripted run the window left review on its own about 6 s after a
-  band change; not reproduced in two later runs. `leave_review` and `reset_all` now log at
-  debug level, so the next occurrence names its cause.
+- Scripted runs that enter or leave review unprompted: most likely real pointer input reaching
+  the simulator's windows, which sit over the user's own oers (on 2026-11-11 the user was
+  moving a window at the time). `leave_review` and `reset_all` log at debug level.
 
 ## Per-row display filters (simulator, 2026-11-08; Raw/Band since 2026-11-10)
 
