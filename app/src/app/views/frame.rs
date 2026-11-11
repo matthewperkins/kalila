@@ -157,7 +157,7 @@ impl ViewFrame<'_> {
             return;
         }
         if !ctrl {
-            let step = (scroll / 20.0).round() as isize;
+            let step = wheel_rows(&mut self.vs.row_scroll, scroll);
             let r = (first as isize - step).clamp(0, (nrows_all - rows) as isize) as usize;
             if r != d.first_row {
                 self.edits.push(Edit::FirstRow(r));

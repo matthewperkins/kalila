@@ -95,6 +95,8 @@ pub struct App {
     /// When a window close was last refused because a recording is running (shows a message).
     close_refused: Option<Instant>,
     dirty_cfg: Instant,
+    /// Wheel movement over the spike grid not yet turned into rows (`wheel_rows`).
+    spike_scroll: f32,
     autostart: bool,
     // outputs
     was_acquiring: bool,
@@ -149,6 +151,7 @@ impl App {
             toast: None,
             close_refused: None,
             dirty_cfg: Instant::now(),
+            spike_scroll: 0.0,
             autostart,
             was_acquiring: false,
             ttl_out_word: 0,
@@ -821,8 +824,9 @@ impl App {
         let hovered = ui.rect_contains_pointer(rect);
         let scroll = if hovered { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
         let mut first_row = self.cfg.display.spike_first_row.min(max_first);
-        if scroll != 0.0 {
-            first_row = (first_row as isize - (scroll / 20.0).round() as isize).clamp(0, max_first as isize) as usize;
+        let step = wheel_rows(&mut self.spike_scroll, scroll);
+        if step != 0 {
+            first_row = (first_row as isize - step).clamp(0, max_first as isize) as usize;
             self.dirty_cfg = Instant::now();
         }
         self.cfg.display.spike_first_row = first_row;
@@ -1116,6 +1120,26 @@ fn channel_colors(l: &StreamLayout, mon: &[usize], per_row: usize) -> Vec<[f32; 
 
 /// Apply a channel click to the audio-monitored set: replace it, or (with `add`) toggle each
 /// channel in or out of the mix (at most 8).
+/// Points of wheel movement per row scrolled.
+const WHEEL_PT_PER_ROW: f32 = 20.0;
+
+/// Whole rows to scroll for this frame's wheel movement (positive = wheel up). egui spreads a
+/// notch over several frames, so the movement is summed in `acc` until it makes a row;
+/// rounding each frame's share on its own lost most of a gentle notch. A change of direction
+/// starts afresh.
+fn wheel_rows(acc: &mut f32, scroll: f32) -> isize {
+    if scroll == 0.0 {
+        return 0;
+    }
+    if *acc * scroll < 0.0 {
+        *acc = 0.0;
+    }
+    *acc += scroll;
+    let rows = (*acc / WHEEL_PT_PER_ROW).trunc();
+    *acc -= rows * WHEEL_PT_PER_ROW;
+    rows as isize
+}
+
 fn apply_monitor_click(a: &mut engine::audio::AudioSettings, chs: Vec<usize>, add: bool) {
     if add {
         for ch in chs {
@@ -1146,4 +1170,28 @@ fn text_to_channels(s: &str, max: usize) -> Vec<usize> {
     v.dedup();
     v.truncate(8);
     v
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::wheel_rows;
+
+    #[test]
+    fn a_notch_spread_over_frames_scrolls_its_rows() {
+        // One 40-point notch as egui smooths it: no single frame reaches half a row.
+        let mut acc = 0.0;
+        let frames = [9.0, 8.0, 7.0, 5.0, 4.0, 3.0, 2.0, 1.5, 0.5];
+        let rows: isize = frames.iter().map(|&s| wheel_rows(&mut acc, s)).sum();
+        assert_eq!(rows, 2);
+        assert!(acc.abs() < 1e-3);
+    }
+
+    #[test]
+    fn direction_change_starts_afresh() {
+        let mut acc = 0.0;
+        assert_eq!(wheel_rows(&mut acc, 15.0), 0);
+        assert_eq!(wheel_rows(&mut acc, -15.0), 0, "the 15 up is dropped, not cancelled");
+        assert_eq!(wheel_rows(&mut acc, -6.0), -1);
+        assert_eq!(wheel_rows(&mut acc, -45.0), -2);
+    }
 }

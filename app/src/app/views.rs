@@ -66,6 +66,8 @@ pub(super) struct ViewState {
     stalled: bool,
     /// Scroll-back review (None = live).
     pub review: Option<ReviewView>,
+    /// Wheel movement not yet turned into rows (`wheel_rows`).
+    row_scroll: f32,
     /// A short message on the plot (e.g. why review can't start), until the instant.
     note: Option<(Instant, String)>,
 }
@@ -93,6 +95,7 @@ impl ViewState {
             last_data: Instant::now(),
             stalled: false,
             review: None,
+            row_scroll: 0.0,
             note: None,
         }
     }
