@@ -151,6 +151,11 @@ Committed per feature where the code separates; the GUI features share one commi
     while the root is hidden.
   - GPU state is one `TraceGpu` per view in `TraceGpus` (egui-wgpu shares one renderer, and so
     the callback resources, across viewports).
+- **One frame of a window** (`app/src/app/views/frame.rs`, since 2026-11-11): `ViewFrame`
+  holds the window's settings read-only, its `ViewState`, and borrowed handles to the rest
+  of `ViewsShared`. It never writes settings; wheel scaling, row scrolling, zoom, the trigger
+  level, row chips and monitor clicks are queued as `Edit`s and applied by
+  `ViewsShared::apply_edits` after the frame, so one frame draws with one set of settings.
 - **Staging buffers.** Each view keeps up to one window of undrawn samples in `VecDeque`s and
   uploads a backlog in chunks of ≤ 32768 samples per frame.
   - The earlier `Vec` + `drain(..)` shifted the whole window for every block: ~74 MB × 940/s
