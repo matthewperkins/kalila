@@ -5,6 +5,18 @@ A rewrite of the Open Ephys GUI's acquisition path for the **ONI/FT600 acquisiti
 monitor. Rust everywhere except the vendored C `liboni` and the FT600 ONI driver, which
 wraps FTDI's closed-source D3XX library.
 
+| | |
+|---|---|
+| ![Trace window, live](docs/screenshots/traces-live.png) | ![Scroll-back review](docs/screenshots/review.png) |
+| **Live traces** (one window per port): 300–6k band with common-average reference, TTL lane underneath, the audio-monitored channel in yellow. | **Scroll-back review** of the ongoing recording: drag back in time, a typed note marker, TTL lanes, the overview strip and how far behind live. |
+| ![Slope-triggered sweeps](docs/screenshots/slope-trigger.png) | ![Filter settings](docs/screenshots/filter-settings.png) |
+| **Triggered sweeps** on a spike threshold crossing (drag the dashed level line), every row at the same moment. | **Raw or Band per row**, the band's corners, µV/row and CAR in one palette. |
+
+![Main window](docs/screenshots/main-window.png)
+
+**Main window:** board, recording and trace-window controls, spike tiles with persistence.
+All screenshots are from the built-in simulator (`oers --sim`), so the signals are synthetic.
+
 ```
 crates/oni-sys   liboni 4.6 (C, vendored, statically linked) + FFI
 crates/rhythm    board driver (port of AcqBoardONI/Rhd2000ONIBoard), frame parser, simulator
