@@ -122,6 +122,7 @@ impl App {
         let mut engine = Engine::new(cfg.record_root.clone());
         *engine.audio_settings.lock() = cfg.audio.clone();
         *engine.dsp_settings.lock() = cfg.dsp.clone();
+        engine.pyramids.lock().budget = (cfg.review_ram_gb.max(0.1) as f64 * 1e9) as usize;
         let choice = if cfg.open_hardware_on_start { BoardChoice::Hardware } else { BoardChoice::Simulated(cfg.sim_headstages.clone()) };
         engine.open_board(choice, cfg.board.clone());
         let audio_text = channels_to_text(&cfg.audio.channels);
@@ -331,6 +332,10 @@ impl App {
             }
             let (lat, lat_max) = { let sh = self.shared.lock(); (sh.disp_latency, sh.disp_latency_max) };
             chip(ui, lat_max < 25.0, format!("display {lat:.1} ms"), "Sample arrival → GPU submit (excludes compositor scan-out).");
+            let (rv_bytes, rv_budget) = { let st = self.engine.pyramids.lock(); (st.bytes(), st.budget) };
+            if rv_bytes > 0 {
+                chip(ui, rv_bytes <= rv_budget, format!("review {:.2} / {:.1} GB", rv_bytes as f64 / 1e9, rv_budget as f64 / 1e9), "RAM held by the scroll-back overview of this recording (review_ram_gb in the config). Over it, the oldest fine detail is released; short spans there are read from the file instead.");
+            }
             let dd = p.display_dropped.load(Ordering::Relaxed) + p.dsp_dropped.load(Ordering::Relaxed) + p.audio_dropped.load(Ordering::Relaxed);
             if dd > 0 {
                 chip(ui, false, format!("viz drops {dd}"), "Blocks skipped by display/DSP/audio consumers (never affects recording).");

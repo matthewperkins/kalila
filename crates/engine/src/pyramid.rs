@@ -10,6 +10,13 @@
 //!   raw pyramid). Changing the band replaces the pyramid, and the stretch recorded so far is
 //!   **backfilled** from `continuous.dat`, newest first, at idle priority.
 //!
+//! **RAM budget.** Levels are stored in chunks of `CHUNK_SAMPLES` (about 9 min at 30 kHz),
+//! aligned across levels. When the pyramids together exceed `Store::budget`, the oldest
+//! chunks of the finest level are released (then of level 1), in every pyramid alike; the
+//! chunk at the live edge is always kept, and coarser levels are never released. Spans the
+//! released levels would serve (under about 28 s at 814 columns) are then read from the file
+//! directly by the GUI: `columns` returns `None` for them.
+//!
 //! Everything here is a consumer: the builder thread reads blocks from its own lossy queue
 //! and the recording file read-only. It never touches acquisition or the recorder. Gaps
 //! (dropped blocks, the recording's first block, a filter's warm-up) are holes in the
@@ -38,8 +45,18 @@ const CHUNK: u64 = 960 * BUCKET;
 const CHUNK_PAUSE: Duration = Duration::from_millis(10);
 /// Backfill waits this long after a band change (so dragging a corner starts one rebuild).
 const SETTLE: Duration = Duration::from_secs(2);
-/// Capacity is reserved in steps of this many finest buckets (about 1 h at 30 kHz).
-const RESERVE_BUCKETS: usize = 1 << 20;
+/// Samples per storage chunk, on every level (2^24: 9.3 min at 30 kHz). A whole number of
+/// buckets at the coarsest level.
+#[cfg(not(test))]
+const CHUNK_SAMPLES: u64 = 1 << 24;
+#[cfg(test)]
+const CHUNK_SAMPLES: u64 = 1 << 20;
+const _: () = assert!(CHUNK_SAMPLES.is_multiple_of(BUCKET << (2 * (LEVELS as u64 - 1))));
+/// Levels whose old chunks may be released under the RAM budget. The spans they serve are
+/// short enough for the GUI to read directly (≤ `DIRECT_MAX_S` there).
+pub const RELEASABLE: usize = 2;
+/// Default RAM budget for all pyramids together.
+pub const DEFAULT_BUDGET: usize = 1_500_000_000;
 
 /// Which band pyramid a trace window wants.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -66,12 +83,56 @@ impl BandKey {
     }
 }
 
-/// One level: `[min, max]` per (bucket, channel), channels interleaved; untouched buckets
-/// hold `EMPTY`. Coarser buckets are merged incrementally from the finer ones, so a bucket
-/// at the live edge holds the aggregate of what has arrived so far.
+/// One level: `[min, max]` per (bucket, channel), channels interleaved, in chunks of
+/// `per` buckets allocated when first written; untouched buckets hold `EMPTY`. Coarser
+/// buckets are merged incrementally from the finer ones, so a bucket at the live edge holds
+/// the aggregate of what has arrived so far.
 struct Level {
-    data: Vec<[i16; 2]>,
-    ttl: Vec<u16>,
+    /// Buckets per chunk.
+    per: usize,
+    data: Vec<Option<Box<[[i16; 2]]>>>,
+    ttl: Vec<Option<Box<[u16]>>>,
+    /// Chunks below this have been released (and are no longer written).
+    floor: usize,
+}
+
+impl Level {
+    fn new(k: usize) -> Self {
+        Self { per: (CHUNK_SAMPLES / (BUCKET << (2 * k))) as usize, data: Vec::new(), ttl: Vec::new(), floor: 0 }
+    }
+    /// Bucket `b`'s `nch` values, allocating its chunk; None if the chunk was released.
+    fn slot(&mut self, b: usize, nch: usize, with_ttl: bool) -> Option<(&mut [[i16; 2]], Option<&mut u16>)> {
+        let (c, o) = (b / self.per, b % self.per);
+        if c < self.floor {
+            return None;
+        }
+        if self.data.len() <= c {
+            self.data.resize_with(c + 1, || None);
+            self.ttl.resize_with(c + 1, || None);
+        }
+        let per = self.per;
+        let d = self.data[c].get_or_insert_with(|| vec![EMPTY; per * nch].into_boxed_slice());
+        let t = if with_ttl { Some(&mut self.ttl[c].get_or_insert_with(|| vec![0; per].into_boxed_slice())[o]) } else { None };
+        Some((&mut d[o * nch..(o + 1) * nch], t))
+    }
+    /// Bucket `b`'s values and TTL word, if its chunk holds data.
+    fn get(&self, b: usize, nch: usize) -> Option<(&[[i16; 2]], u16)> {
+        let (c, o) = (b / self.per, b % self.per);
+        let d = self.data.get(c)?.as_ref()?;
+        let t = self.ttl.get(c).and_then(|t| t.as_ref()).map_or(0, |t| t[o]);
+        Some((&d[o * nch..(o + 1) * nch], t))
+    }
+    fn bytes(&self) -> usize {
+        self.data.iter().flatten().map(|d| d.len() * 4).sum::<usize>() + self.ttl.iter().flatten().map(|t| t.len() * 2).sum::<usize>()
+    }
+    /// Release the chunks below `floor`.
+    fn release_below(&mut self, floor: usize) {
+        self.floor = self.floor.max(floor);
+        for c in 0..self.floor.min(self.data.len()) {
+            self.data[c] = None;
+            self.ttl[c] = None;
+        }
+    }
 }
 
 pub struct Pyramid {
@@ -85,11 +146,16 @@ pub struct Pyramid {
 
 impl Pyramid {
     pub fn new(nch: usize, with_ttl: bool) -> Self {
-        Self { nch: nch.max(1), with_ttl, levels: (0..LEVELS).map(|_| Level { data: Vec::new(), ttl: Vec::new() }).collect(), covered: Vec::new() }
+        Self { nch: nch.max(1), with_ttl, levels: (0..LEVELS).map(Level::new).collect(), covered: Vec::new() }
     }
 
     pub fn bytes(&self) -> usize {
-        self.levels.iter().map(|l| l.data.len() * 4 + l.ttl.len() * 2).sum()
+        self.levels.iter().map(Level::bytes).sum()
+    }
+
+    /// Release level `k`'s chunks below chunk `floor` (see `Store::enforce_budget`).
+    fn release_below(&mut self, k: usize, floor: usize) {
+        self.levels[k].release_below(floor);
     }
 
     pub fn covered(&self) -> &[(u64, u64)] {
@@ -139,7 +205,7 @@ impl Pyramid {
         }
         let b0 = start / BUCKET;
         let b1 = b0 + n / BUCKET;
-        self.grow(b1);
+        let with_ttl = self.with_ttl;
         let mut mm = vec![EMPTY; nch];
         for b in b0..b1 {
             mm.fill(EMPTY);
@@ -159,17 +225,19 @@ impl Pyramid {
             };
             let mut idx = b as usize;
             for (k, l) in self.levels.iter_mut().enumerate() {
-                let base = idx * nch;
-                if k == 0 {
-                    l.data[base..base + nch].copy_from_slice(&mm);
-                } else {
-                    for (d, m) in l.data[base..base + nch].iter_mut().zip(&mm) {
-                        d[0] = d[0].min(m[0]);
-                        d[1] = d[1].max(m[1]);
+                // A released chunk (old, over the RAM budget) is not written again.
+                if let Some((d, t)) = l.slot(idx, nch, with_ttl) {
+                    if k == 0 {
+                        d.copy_from_slice(&mm);
+                    } else {
+                        for (d, m) in d.iter_mut().zip(&mm) {
+                            d[0] = d[0].min(m[0]);
+                            d[1] = d[1].max(m[1]);
+                        }
                     }
-                }
-                if self.with_ttl {
-                    l.ttl[idx] |= word;
+                    if let Some(t) = t {
+                        *t |= word;
+                    }
                 }
                 idx >>= 2;
             }
@@ -177,66 +245,53 @@ impl Pyramid {
         self.add_covered(start, start + n);
     }
 
-    /// Make room for finest buckets `[0, b1)` on every level.
-    fn grow(&mut self, b1: u64) {
-        let nch = self.nch;
-        let mut need = b1 as usize;
-        for (k, l) in self.levels.iter_mut().enumerate() {
-            if l.data.len() < need * nch {
-                let step = (RESERVE_BUCKETS >> (2 * k)).max(1024);
-                let cap = need.div_ceil(step) * step;
-                l.data.reserve_exact(cap * nch - l.data.len());
-                l.data.resize(need * nch, EMPTY);
-                if self.with_ttl {
-                    l.ttl.reserve_exact(cap - l.ttl.len());
-                    l.ttl.resize(need, 0);
-                }
-            }
-            need = need.div_ceil(4);
-        }
-    }
-
     /// Per-column (min, max) of every channel for `cols` columns over `[t0, t0 + span)`
     /// (recording-relative samples; `t0` may be negative), as `cols × nch` with `EMPTY`
     /// where nothing is covered, plus the OR of the TTL words per column. Columns at least
     /// one bucket wide come out exact to within a bucket at each edge.
-    pub fn columns(&self, t0: i64, span: u64, cols: u32) -> (Vec<[i16; 2]>, Vec<u16>) {
+    ///
+    /// If the level this span needs has been released for part of it (RAM budget), the result
+    /// is None, so the caller reads the file instead; with `coarser_ok` (spans too long to
+    /// read), the finest level still held is used, with buckets wider than a column.
+    pub fn columns(&self, t0: i64, span: u64, cols: u32, coarser_ok: bool) -> Option<(Vec<[i16; 2]>, Vec<u16>)> {
         let nch = self.nch;
         let cols = cols.max(1) as usize;
-        let mut out = vec![EMPTY; cols * nch];
-        let mut words = vec![0u16; cols];
         let spc = span / cols as u64;
         // The coarsest level whose buckets fit in a column (at least the finest).
-        let k = (0..LEVELS).rev().find(|&k| BUCKET << (2 * k) <= spc.max(BUCKET)).unwrap_or(0);
+        let mut k = (0..LEVELS).rev().find(|&k| BUCKET << (2 * k) <= spc.max(BUCKET)).unwrap_or(0);
+        while (t0.max(0) as u64) < self.levels[k].floor as u64 * CHUNK_SAMPLES {
+            if !coarser_ok || k + 1 == LEVELS {
+                return None;
+            }
+            k += 1;
+        }
         let bsz = BUCKET << (2 * k);
         let l = &self.levels[k];
-        let nb = (l.data.len() / nch) as u64;
+        let mut out = vec![EMPTY; cols * nch];
+        let mut words = vec![0u16; cols];
         for c in 0..cols {
             let s0 = t0 + (c as u64 * span / cols as u64) as i64;
             let s1 = (t0 + ((c + 1) as u64 * span / cols as u64) as i64).max(s0 + 1);
             if s1 <= 0 {
                 continue;
             }
-            let b0 = (s0.max(0) as u64 / bsz).min(nb);
-            let b1 = ((s1 as u64).div_ceil(bsz)).min(nb);
+            let b0 = s0.max(0) as u64 / bsz;
+            let b1 = (s1 as u64).div_ceil(bsz);
             let o = &mut out[c * nch..(c + 1) * nch];
             for b in b0..b1 {
-                let base = b as usize * nch;
-                for (m, v) in o.iter_mut().zip(&l.data[base..base + nch]) {
+                let Some((vals, word)) = l.get(b as usize, nch) else { continue };
+                for (m, v) in o.iter_mut().zip(vals) {
                     m[0] = m[0].min(v[0]);
                     m[1] = m[1].max(v[1]);
                 }
-                if self.with_ttl {
-                    words[c] |= l.ttl[b as usize];
-                }
+                words[c] |= word;
             }
         }
-        (out, words)
+        Some((out, words))
     }
 }
 
 /// The pyramids of the recording being written, shared with the GUI.
-#[derive(Default)]
 pub struct Store {
     /// The recording they belong to (`None` before the first block of one is seen).
     pub src: Option<RecSource>,
@@ -249,12 +304,74 @@ pub struct Store {
     pub live_end: u64,
     /// Backfill in progress for some pyramid (holes remain below `live_end`).
     pub backfilling: bool,
+    /// RAM budget for all pyramids together (bytes); see the module docs.
+    pub budget: usize,
+    /// Per releasable level: chunks below this are released in every pyramid.
+    floor: [usize; RELEASABLE],
+    /// The budget couldn't be met: warned, and not again until it is met once more.
+    over_warned: bool,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self { src: None, raw: None, bands: Default::default(), want: Default::default(), live_end: 0, backfilling: false, budget: DEFAULT_BUDGET, floor: [0; RELEASABLE], over_warned: false }
+    }
 }
 
 impl Store {
     pub fn bytes(&self) -> usize {
         self.raw.as_ref().map_or(0, |p| p.bytes()) + self.bands.values().map(|(_, p)| p.bytes()).sum::<usize>()
     }
+    fn pyramids_mut(&mut self) -> impl Iterator<Item = &mut Pyramid> {
+        self.raw.iter_mut().chain(self.bands.values_mut().map(|(_, p)| p))
+    }
+
+    /// A new recording: everything released and the floors back at its start.
+    fn reset(&mut self, src: Option<RecSource>) {
+        self.raw = src.as_ref().map(|s| Pyramid::new(s.nch, true));
+        self.src = src;
+        self.bands.clear();
+        self.live_end = 0;
+        self.floor = [0; RELEASABLE];
+        self.over_warned = false;
+    }
+
+    /// A new pyramid starts with the floors the others have.
+    fn add_band(&mut self, view: u32, key: BandKey) {
+        let mut p = Pyramid::new(key.chans.len(), false);
+        for (k, &f) in self.floor.iter().enumerate() {
+            p.release_below(k, f);
+        }
+        self.bands.insert(view, (key, p));
+    }
+
+    /// Over the budget: release the oldest chunks of the finest level (then of level 1) in
+    /// every pyramid, never the chunk at the live edge.
+    pub fn enforce_budget(&mut self) {
+        // The chunk holding the newest sample.
+        let live = (self.live_end.saturating_sub(1) / CHUNK_SAMPLES) as usize;
+        if self.bytes() <= self.budget {
+            self.over_warned = false;
+            return;
+        }
+        while self.bytes() > self.budget {
+            let Some(k) = (0..RELEASABLE).find(|&k| self.floor[k] < live) else {
+                if !self.over_warned {
+                    self.over_warned = true;
+                    log::warn!("review pyramids: {:.2} GB, over the {:.2} GB budget with only the coarse levels and the newest stretch left", self.bytes() as f64 / 1e9, self.budget as f64 / 1e9);
+                }
+                return;
+            };
+            self.floor[k] += 1;
+            let f = self.floor[k];
+            for p in self.pyramids_mut() {
+                p.release_below(k, f);
+            }
+            let fs = self.src.as_ref().map_or(30000.0, |s| s.sample_rate);
+            log::info!("review pyramids: level {k} released before {:.1} min of the recording ({:.0} MB left)", (f as u64 * CHUNK_SAMPLES) as f64 / fs / 60.0, self.bytes() as f64 / 1e6);
+        }
+    }
+
     /// The band pyramid serving window `view`, if it is the one the window wants.
     pub fn band(&self, view: u32) -> Option<&Pyramid> {
         let (k, p) = self.bands.get(&view)?;
@@ -340,10 +457,7 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
         {
             let mut st = store.lock();
             if st.src.as_ref().map(|s| &s.dat) != src.as_ref().map(|s| &s.dat) {
-                st.src = src.clone();
-                st.raw = src.as_ref().map(|s| Pyramid::new(s.nch, true));
-                st.bands.clear();
-                st.live_end = 0;
+                st.reset(src.clone());
                 bands.clear();
                 stage.clear();
                 stage_ttl.clear();
@@ -361,7 +475,7 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
                     }
                     if !bands.iter().any(|(bv, _)| bv == v) {
                         bands.push((*v, band_live(k, fs)));
-                        st.bands.insert(*v, (k.clone(), Pyramid::new(k.chans.len(), false)));
+                        st.add_band(*v, k.clone());
                     }
                 }
             }
@@ -421,6 +535,7 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
                         }
                     }
                     st.live_end = stage_at + whole;
+                    st.enforce_budget();
                     drop(st);
                     stage.drain(..n * nch);
                     stage_ttl.drain(..n);
@@ -509,6 +624,7 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
                 }
             }
         }
+        st.enforce_budget();
         if last_log.elapsed() > Duration::from_secs(10) {
             last_log = Instant::now();
             log::debug!("pyramid backfill: {} at {:.1} s, {:.0} MB in RAM", view.map_or("raw".to_string(), |v| format!("band of view {v}")), c0 as f64 / fs, st.bytes() as f64 / 1e6);
@@ -548,20 +664,20 @@ mod tests {
         p.ingest(0, &data, &ttl);
         assert_eq!(p.covered(), &[(0, 4 * BUCKET)]);
         // One column per bucket.
-        let (c, w) = p.columns(0, 4 * BUCKET, 4);
+        let (c, w) = p.columns(0, 4 * BUCKET, 4, false).unwrap();
         assert_eq!(c[0], [0, 63]);
         assert_eq!(c[1], [-63, 0]);
         assert_eq!(c[2 * 2], [128, 191]);
         assert_eq!(w, vec![0, 0, 1, 0]);
         // One column over all four: the level-1 bucket aggregates them.
-        let (c, w) = p.columns(0, 4 * BUCKET, 1);
+        let (c, w) = p.columns(0, 4 * BUCKET, 1, false).unwrap();
         assert_eq!(c[0], [0, 255]);
         assert_eq!(w, vec![1]);
         // Columns before the recording or past its end are empty.
-        let (c, _) = p.columns(-(BUCKET as i64), 2 * BUCKET, 2);
+        let (c, _) = p.columns(-(BUCKET as i64), 2 * BUCKET, 2, false).unwrap();
         assert_eq!(c[0], EMPTY);
         assert_eq!(c[2], [0, 63]);
-        let (c, _) = p.columns(4 * BUCKET as i64, BUCKET, 1);
+        let (c, _) = p.columns(4 * BUCKET as i64, BUCKET, 1, false).unwrap();
         assert_eq!(c[0], EMPTY);
     }
 
@@ -586,7 +702,7 @@ mod tests {
         assert_eq!(p.covered(), &[(0, n as u64)]);
         for (t0, cols) in [(0, 2000u32), (0, 500), (0, 125), (0, 31), (0, 7), (0, 2), (40_000, 300), (40_000, 1000), (12_345, 50)] {
             let m = n - t0;
-            let (c, w) = p.columns(t0 as i64, m as u64, cols);
+            let (c, w) = p.columns(t0 as i64, m as u64, cols, false).unwrap();
             for col in 0..cols as usize {
                 let s0 = t0 + col * m / cols as usize;
                 let s1 = t0 + (col + 1) * m / cols as usize;
@@ -610,6 +726,58 @@ mod tests {
                 assert_eq!(w[col], word, "cols {cols} col {col} level {k}");
             }
         }
+    }
+
+    #[test]
+    fn the_budget_releases_old_fine_levels_first() {
+        let nch = 2;
+        let chunks = 5u64;
+        let n = (chunks * CHUNK_SAMPLES) as usize;
+        let data: Vec<i16> = (0..n * nch).map(|i| ((i * 7919) % 20011) as i16 - 10000).collect();
+        let mut st = Store { raw: Some(Pyramid::new(nch, false)), ..Default::default() };
+        // Fill in one-chunk steps, as live blocks would, with room for about 1.5 chunks of
+        // every level.
+        let per_chunk = {
+            let mut p = Pyramid::new(nch, false);
+            p.ingest(0, &data[..CHUNK_SAMPLES as usize * nch], &[]);
+            p.bytes()
+        };
+        st.budget = per_chunk * 3 / 2;
+        for c in 0..chunks {
+            let (s0, s1) = ((c * CHUNK_SAMPLES) as usize, ((c + 1) * CHUNK_SAMPLES) as usize);
+            st.raw.as_mut().unwrap().ingest(s0 as u64, &data[s0 * nch..s1 * nch], &[]);
+            st.live_end = s1 as u64;
+            st.enforce_budget();
+            assert!(st.bytes() <= st.budget, "chunk {c}: {} > {}", st.bytes(), st.budget);
+        }
+        // Level 0 is released up to the live chunk; level 1 kept.
+        assert_eq!(st.floor[0], chunks as usize - 1);
+        let p = st.raw.as_ref().unwrap();
+        let cols = 100u32;
+        // An old span at finest-level resolution: not served (the GUI reads the file).
+        assert!(p.columns(0, 100 * BUCKET, cols, false).is_none());
+        // Unless the caller can't read the file for it: then the finest level still held.
+        let (c, _) = p.columns(0, 100 * BUCKET, cols, true).unwrap();
+        assert!(c[0][0] <= c[0][1], "level 1 data, wider than a column");
+        // An old span that a coarser level serves: still exact.
+        let span = 64 * 4 * BUCKET * cols as u64;
+        let (c, _) = p.columns(0, span, cols, false).unwrap();
+        let bsz = (BUCKET << 6) as usize;
+        for ch in 0..nch {
+            let s1 = span as usize / cols as usize;
+            let (mn, mx) = (0..s1.div_ceil(bsz) * bsz).map(|s| data[s * nch + ch]).fold((i16::MAX, i16::MIN), |(a, b), v| (a.min(v), b.max(v)));
+            assert_eq!(c[ch], [mn, mx]);
+        }
+        // The newest stretch at full resolution.
+        let t0 = (chunks - 1) * CHUNK_SAMPLES;
+        let (c, _) = p.columns(t0 as i64, 100 * BUCKET, cols, false).unwrap();
+        let s = t0 as usize;
+        let (mn, mx) = (s..s + BUCKET as usize).map(|s| data[s * nch]).fold((i16::MAX, i16::MIN), |(a, b), v| (a.min(v), b.max(v)));
+        assert_eq!(c[0], [mn, mx]);
+        // A late backfill into a released chunk doesn't bring it back.
+        let before = st.bytes();
+        st.raw.as_mut().unwrap().ingest(0, &data[..BUCKET as usize * nch], &[]);
+        assert_eq!(st.bytes(), before);
     }
 
     #[test]

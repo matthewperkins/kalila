@@ -133,9 +133,10 @@ in 16-channel mode on port A, RHD2216 on port B; NVIDIA RTX 2000 Ada, Hyprland):
 * The ADC inputs with real signals beyond a pulse; DAC and TTL outputs (not yet checked on
   a scope); DAC routing in 16-channel mode.
 * Other GPUs, AMD/Intel drivers, X11 and Wayland compositors other than Hyprland.
-* Sessions longer than a few hours. Scroll-back review keeps an overview of the recording
-  in RAM (about 0.7 GB per hour on the rig, with no cap yet), so a very long session on
-  a machine with little memory could run short.
+* Sessions longer than a few hours on the board. Scroll-back review keeps an overview of
+  the recording in RAM, capped at 1.5 GB by default (`review_ram_gb` in the config); past
+  that, only the newest stretch keeps full detail, and short spans further back are read
+  from the file. Tested on the simulator only.
 
 Only Linux is supported.
 

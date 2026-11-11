@@ -220,8 +220,20 @@ clamped to the recording's length; spans over 60 s never fall back to direct rea
   the recorder, and reads the file read-only. The only coupling is CPU/disk, hence the idle
   priority and the backpressure check.
 - **RAM.** About 0.56 GB/h for 62 raw channels plus 0.29 GB/h per 32-channel band pyramid;
-  the rig's configuration is about 0.7 GB/h. Nothing is written to disk. There is no cap
-  yet: a session over about 6 h would need one (or the finest level spilled to a file).
+  the rig's configuration is about 0.7 GB/h. Nothing is written to disk (ruled out: it would
+  compete with the recorder).
+- **RAM budget (2026-11-11).** `review_ram_gb` in the config, default 1.5 GB for all
+  pyramids together; the status line shows "review x / y GB". Levels are stored in chunks
+  of 2^24 samples (9.3 min at 30 kHz), aligned across levels. Over the budget,
+  `Store::enforce_budget` releases the oldest chunks of level 0 in every pyramid, then of
+  level 1 (`RELEASABLE`), never the chunk at the live edge or coarser levels; released
+  chunks are not written again by backfill. `Pyramid::columns` returns None where the
+  level a span needs is released, and the GUI reads the file directly (measured on the sim,
+  64 ch Raw: 6 s in 0.2 s, 18 s in 0.5 s; the shifted image follows the pointer meanwhile).
+  Checked in a 21 min sim run with a 0.15 GB budget: releases at each 9.3 min boundary. Only spans too long to read (> 60 s, possible at level 1 on windows over
+  ~2000 px) fall back to the finest held level, a little blocky. The user chose no blocky
+  preview otherwise. At 1.5 GB the rig keeps full detail for ~2 h, then for the newest
+  stretch only.
 - **GUI.** `TraceFrame::columns` uploads a whole column buffer (physical units) without
   ingest. While a pyramid is incomplete the badge says "building the overview" and the
   image is redrawn every 300 ms. `RUST_LOG=engine=debug` logs backfill progress and RAM.

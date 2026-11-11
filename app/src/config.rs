@@ -354,6 +354,10 @@ pub struct Config {
     pub present_mode: String,
     pub open_hardware_on_start: bool,
     pub sim_headstages: Vec<usize>,
+    /// RAM for the scroll-back overview (min/max pyramids) of the recording, all windows
+    /// together, in GB. Over it, the oldest fine detail is released (short old spans are then
+    /// read from the file).
+    pub review_ram_gb: f32,
 }
 
 impl Default for Config {
@@ -371,6 +375,7 @@ impl Default for Config {
             present_mode: "auto".into(),
             open_hardware_on_start: true,
             sim_headstages: vec![32, 32],
+            review_ram_gb: engine::pyramid::DEFAULT_BUDGET as f32 / 1e9,
         }
     }
 }

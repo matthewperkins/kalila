@@ -396,8 +396,14 @@ fn pyramid_columns(st: &engine::pyramid::Store, src: &RecSource, view: u32, l: &
     let band = if (0..nch).any(is_band) { Some((st.band(view)?, &st.bands.get(&view)?.0)) } else { None };
     let t0 = key.t0 - src.first_sample;
     let span = key.span as u64;
-    let (rc, words) = raw.columns(t0, span, key.cols);
-    let bc = band.map(|(p, _)| p.columns(t0, span, key.cols).0);
+    // None where the level this span needs was released under the RAM budget: the caller
+    // reads the file instead.
+    let coarser_ok = span as f64 / src.sample_rate > DIRECT_MAX_S as f64;
+    let (rc, words) = raw.columns(t0, span, key.cols, coarser_ok)?;
+    let bc = match band {
+        Some((p, _)) => Some(p.columns(t0, span, key.cols, coarser_ok)?.0),
+        None => None,
+    };
     let mut out = vec![[1e30f32, -1e30]; nch * cols];
     for i in 0..nch {
         let gain = l.channels[i].bit_volts;
