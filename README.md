@@ -11,6 +11,8 @@ wraps FTDI's closed-source D3XX library.
 | **Live traces** (one window per port): 300–6k band with common-average reference, TTL lane underneath, the audio-monitored channel in yellow. | **Scroll-back review** of the ongoing recording: drag back in time, a typed note marker, TTL lanes, the overview strip and how far behind live. |
 | ![Slope-triggered sweeps](docs/screenshots/slope-trigger.png) | ![Filter settings](docs/screenshots/filter-settings.png) |
 | **Triggered sweeps** on a spike threshold crossing (drag the dashed level line), every row at the same moment. | **Raw or Band per row**, the band's corners, µV/row and CAR in one palette. |
+| ![TTL-triggered sweeps](docs/screenshots/ttl-sweeps.png) | ![TTL line picker](docs/screenshots/ttl-lines.png) |
+| **Sweeps on a TTL edge** (here the laser line, TTL2), shaded while the line is high, for opto-tagging. The simulated units don't respond to the laser. | **Pick the TTL lines** the overlay shows, e.g. hide a camera trigger. |
 
 ![Main window](docs/screenshots/main-window.png)
 
