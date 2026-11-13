@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="packaging/icon/kalila-icon.svg" width="200" alt="kalila icon: the jackals Kalila and Dimna">
+</p>
+
 # kalila — Open Ephys acquisition in Rust
 
 (Called oers until November 2026.)
@@ -170,9 +174,6 @@ licence. FTDI's D3XX library is closed source and not included; see "Rig setup".
 
 ## Icon
 
-The icon shows Bastet and Sekhmet, adapted from drawings by Gunawan Kartapranata
-([CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)) and Jeff Dahl
-([CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)) on Wikimedia Commons. The
-icon is CC BY-SA 4.0; full credits and changes are in
-[packaging/icon/ICON-CREDITS.md](packaging/icon/ICON-CREDITS.md). It doesn't affect the
-licence of the code.
+The icon shows Kalila and Dimna, the two jackals of the *Tales of Bidpai* that kalila and its
+sibling dimna are named after. It is an original drawing, covered by the repository's licence;
+credits and inspiration are in [packaging/icon/ICON-CREDITS.md](packaging/icon/ICON-CREDITS.md).

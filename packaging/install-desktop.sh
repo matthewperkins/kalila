@@ -14,7 +14,6 @@ for sz in 32 48 64 128 256; do
 done
 # hyprtoolkit ignores theme dirs without an index.theme
 [ -f "$icons/index.theme" ] || cp /usr/share/icons/hicolor/index.theme "$icons/" 2>/dev/null || true
-# No scalable SVG: kalila-icon.svg links src/*.svg by relative path, which breaks once copied.
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -qtf "$icons" || true
 cat >"$apps/kalila.desktop" <<DESK
 [Desktop Entry]

@@ -42,7 +42,7 @@ fn main() -> eframe::Result {
         wgpu_options,
         viewport: {
             let v = eframe::egui::ViewportBuilder::default().with_title("kalila — Open Ephys acquisition").with_app_id("kalila").with_inner_size([1600.0, 1000.0]);
-            // Window icon: Bastet and Sekhmet (packaging/icon; credits in ICON-CREDITS.md).
+            // Window icon: Kalila and Dimna (packaging/icon; credits in ICON-CREDITS.md).
             match eframe::icon_data::from_png_bytes(include_bytes!("../../packaging/icon/kalila-128.png")) {
                 Ok(icon) => v.with_icon(std::sync::Arc::new(icon)),
                 Err(_) => v,
