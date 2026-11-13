@@ -229,6 +229,11 @@ impl App {
                 self.spike_times[sp.channel].push_back(now);
                 self.spike_new.push((sp.channel, slot, now as f32, Arc::new(sp)));
             }
+            // Drained only while the main window draws: when it's hidden for hours, keep just
+            // what can still be shown, the newest spike in each tile slot (nel × SLOTS).
+            if self.spike_new.len() > 2 * nel * SLOTS {
+                compact_newest_per_slot(&mut self.spike_new);
+            }
         }
         for q in &mut self.spike_times {
             while q.front().is_some_and(|&t| now - t > 2.0) {
@@ -1233,6 +1238,16 @@ fn style(ctx: &egui::Context) {
     });
 }
 
+/// Keeps the last entry for each (channel, slot), in order: later spikes overwrite earlier
+/// ones in a slot, so the dropped ones would never have been seen.
+fn compact_newest_per_slot<T>(v: &mut Vec<(usize, usize, f32, T)>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut keep: Vec<bool> = v.iter().rev().map(|e| seen.insert((e.0, e.1))).collect();
+    keep.reverse();
+    let mut k = keep.into_iter();
+    v.retain(|_| k.next().unwrap());
+}
+
 fn channels_to_text(v: &[usize]) -> String {
     v.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join(", ")
 }
@@ -1246,7 +1261,16 @@ fn text_to_channels(s: &str, max: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod wheel_tests {
-    use super::wheel_rows;
+    use super::{compact_newest_per_slot, wheel_rows};
+
+    #[test]
+    fn hidden_spike_backlog_keeps_the_newest_per_slot() {
+        // Channel 0 slots 0,1,0,1,0 and channel 1 slot 0, in time order (value = time).
+        let mut v = vec![(0, 0, 1.0, ()), (0, 1, 2.0, ()), (1, 0, 3.0, ()), (0, 0, 4.0, ()), (0, 1, 5.0, ()), (0, 0, 6.0, ())];
+        compact_newest_per_slot(&mut v);
+        let t: Vec<f32> = v.iter().map(|e| e.2).collect();
+        assert_eq!(t, vec![3.0, 5.0, 6.0]);
+    }
 
     #[test]
     fn a_notch_spread_over_frames_scrolls_its_rows() {

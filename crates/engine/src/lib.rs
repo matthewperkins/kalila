@@ -94,6 +94,9 @@ pub struct Engine {
     simulated: bool,
     job: Option<Job>,
     running: Option<Running>,
+    /// An acquisition thread that didn't stop in time (`stop_acquisition`): joined by `poll`
+    /// if it ever ends, else left behind.
+    stuck: Option<Running>,
     pub last_error: Option<String>,
     pub health: SharedHealth,
     pub pipeline: Arc<PipelineStats>,
@@ -126,6 +129,7 @@ impl Engine {
             simulated: false,
             job: None,
             running: None,
+            stuck: None,
             last_error: None,
             health: Arc::new(Health::default()),
             pipeline: Arc::new(PipelineStats::default()),
@@ -217,6 +221,20 @@ impl Engine {
                     }
                     Err(_) => self.last_error = Some(format!("{what}: thread panicked (board lost; reopen)")),
                 },
+            }
+        }
+        // A thread left behind by `stop_acquisition` that has ended after all.
+        if self.stuck.as_ref().is_some_and(|r| r.acq.is_finished()) {
+            let r = self.stuck.take().unwrap();
+            info!("the stuck acquisition thread has ended");
+            if self.board.is_some() || self.running.is_some() || self.job.is_some() {
+                // Another board is in use by now: close the old one.
+                drop(r.acq.join());
+                for w in r.workers {
+                    let _ = w.join();
+                }
+            } else {
+                self.finish_stopped(r);
             }
         }
         // Acquisition thread died on its own (e.g. USB unplugged)?
@@ -435,6 +453,27 @@ impl Engine {
         let Some(r) = self.running.take() else { return };
         r.stop.store(true, Ordering::SeqCst);
         self.live_tx = None;
+        // The thread checks `stop` between blocks. A board that stops streaming without an
+        // error could hold it in a read for good; don't freeze the GUI (or exit) on that.
+        let t = Instant::now();
+        while !r.acq.is_finished() && t.elapsed() < STOP_WAIT {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !r.acq.is_finished() {
+            error!("acquisition thread did not stop within {STOP_WAIT:?}; leaving it");
+            // Finish an open recording now: everything the board sent is already queued.
+            let _ = self.rec_tx.send(RecMsg::Stop);
+            self.last_error = Some("The board stopped responding, so acquisition could not stop cleanly (any recording was finished). Power-cycle the board or unplug its USB, then open it again.".into());
+            self.stuck = Some(r);
+            self.display_rx = None;
+            self.spike_rx = None;
+            return;
+        }
+        self.finish_stopped(r);
+    }
+
+    /// Join a stopped acquisition thread and its workers; the board comes back.
+    fn finish_stopped(&mut self, r: Running) {
         match r.acq.join() {
             Ok((b, res)) => {
                 if let Err(e) = res {
@@ -480,6 +519,9 @@ impl Drop for Engine {
         }
     }
 }
+
+/// How long Stop waits for the acquisition thread (it normally takes one block, ~1 ms).
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// Tells the recorder that acquisition has ended, when dropped.
 struct AcqStopped(Sender<RecMsg>);
@@ -527,9 +569,16 @@ fn acquisition_loop(
     _health: &Health,
     pipe: &PipelineStats,
 ) -> Result<()> {
-    // Block pool: reuse blocks once every consumer has released them (no steady-state allocation).
-    const POOL: usize = 256;
-    let mut pool: Vec<Arc<Block>> = (0..POOL).map(|_| Arc::new(Block::default())).collect();
+    // Block pool: reuse blocks once every consumer has released them, so the acquisition
+    // thread doesn't allocate in steady state. A block can sit in every lossy queue at once,
+    // so the pool covers their combined depth (a few seconds; ~16 MB at 64 channels): then a
+    // lagging consumer (the idle-priority pyramid builder, say) still doesn't cause
+    // allocation. Only a recorder backlog beyond that does (a disk stall: one allocation per
+    // block, sized up front).
+    let (nch, bs) = (board.layout().num_channels(), board.settings().block_samples.max(1));
+    let new_block = || Arc::new(Block::with_capacity(nch, bs));
+    let pool_len = [disp, dsp, aud, pyr].iter().map(|tx| tx.capacity().unwrap_or(0)).sum::<usize>() + 16;
+    let mut pool: Vec<Arc<Block>> = (0..pool_len).map(|_| new_block()).collect();
     let mut idx = 0;
     while !stop.load(Ordering::Relaxed) {
         while let Ok(c) = live_rx.try_recv() {
@@ -539,13 +588,13 @@ fn acquisition_loop(
         }
         let slot = &mut pool[idx];
         if Arc::get_mut(slot).is_none() {
-            *slot = Arc::new(Block::default()); // still in use downstream; allocate
+            *slot = new_block(); // still in use downstream (recorder backlog); allocate
         }
         let b = Arc::get_mut(slot).unwrap();
         board.read_block(b)?;
         b.acquired_at = Some(Instant::now());
         let blk = slot.clone();
-        idx = (idx + 1) % POOL;
+        idx = (idx + 1) % pool_len;
         pipe.blocks.fetch_add(1, Ordering::Relaxed);
 
         // Recorder: lossless while recording. If the disk falls behind we block here; the
@@ -666,6 +715,79 @@ mod tests {
         fn stop(&mut self) -> Result<()> {
             self.inner.stop()
         }
+    }
+
+    /// The simulator, hanging in `read_block` after `left` blocks until `release` fires (a
+    /// board that stops streaming without an error).
+    struct HangAfter {
+        inner: SimBoard,
+        left: usize,
+        release: crossbeam_channel::Receiver<()>,
+    }
+    impl Board for HangAfter {
+        fn info(&self) -> BoardInfo {
+            self.inner.info()
+        }
+        fn layout(&self) -> StreamLayout {
+            self.inner.layout()
+        }
+        fn settings(&self) -> &BoardSettings {
+            self.inner.settings()
+        }
+        fn apply_settings(&mut self, s: &BoardSettings) -> Result<()> {
+            self.inner.apply_settings(s)
+        }
+        fn available_sample_rates(&self) -> Vec<u32> {
+            self.inner.available_sample_rates()
+        }
+        fn scan_ports(&mut self) -> Result<()> {
+            self.inner.scan_ports()
+        }
+        fn start(&mut self, h: SharedHealth) -> Result<()> {
+            self.inner.start(h)
+        }
+        fn read_block(&mut self, blk: &mut Block) -> Result<()> {
+            if self.left == 0 {
+                let _ = self.release.recv();
+            } else {
+                self.left -= 1;
+            }
+            self.inner.read_block(blk)
+        }
+        fn live(&mut self, c: &LiveCommand) -> Result<()> {
+            self.inner.live(c)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+    }
+
+    #[test]
+    fn stop_does_not_hang_on_a_silent_board() {
+        let root = std::env::temp_dir().join(format!("oers-hang-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut e = Engine::new(root.clone());
+        e.audio_settings.lock().enabled = false;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        e.set_board(Box::new(HangAfter { inner: SimBoard::new(vec![16]), left: 300, release: rx }));
+        e.start_acquisition().unwrap();
+        e.start_recording();
+        wait_for("recording", || e.is_recording());
+        std::thread::sleep(Duration::from_millis(400)); // the board has gone silent by now
+        let t = Instant::now();
+        e.stop_acquisition();
+        assert!(t.elapsed() < STOP_WAIT + Duration::from_secs(1));
+        assert!(!e.is_acquiring() && !e.has_board());
+        assert!(e.last_error.as_deref().is_some_and(|m| m.contains("stopped responding")), "{:?}", e.last_error);
+        wait_for("the recording to be finished", || !e.is_recording());
+        // The read returns after all (say, the board was power-cycled): the board comes back.
+        tx.send(()).unwrap();
+        wait_for("the board back", || {
+            e.poll();
+            e.has_board()
+        });
+        drop(e);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn wait_for(what: &str, mut f: impl FnMut() -> bool) {

@@ -529,13 +529,19 @@ impl OniBoard {
         let ns = self.num_data_streams;
         let mut sb = ScanBlock { aux: vec![[[0u16; INIT_STEP]; 3]; ns] };
         let mut t = 0;
+        // DIFF: upstream waits for as long as it takes; a board that sends no Rhythm frames
+        // would leave the scan (and the board) busy for good. n frames take n / 30 kHz.
+        let deadline = Instant::now() + Duration::from_secs(2);
         while t < n {
+            if Instant::now() > deadline {
+                bail!("port scan: only {t} of {n} headstage frames arrived within 2 s");
+            }
             let f = self.ctx.read_frame()?;
             if f.dev_idx() != DEVICE_RHYTHM {
                 continue;
             }
-            let d = &f.data()[8..];
-            if u64::from_le_bytes(d[0..8].try_into().unwrap()) != RHD2000_MAGIC {
+            let d = f.data().get(8..).unwrap_or(&[]);
+            if d.len() < 12 + 6 * ns || u64::from_le_bytes(d[0..8].try_into().unwrap()) != RHD2000_MAGIC {
                 warn!("incorrect Rhythm header during scan");
                 t += 1;
                 continue;

@@ -173,6 +173,18 @@ Committed per feature where the code separates; the GUI features share one commi
     frames in a row the counter is taken to have restarted (`RESYNC_AFTER`).
   - A config that fails to parse is renamed `config.json.bad-<time>`, and the error bar
     says so (the defaults used to be saved over it).
+- **Bounds (group 2 of the reviews).**
+  - The acquisition thread's block pool covers the combined depth of the lossy queues
+    (~3500 blocks, ~16 MB at 64 ch, allocated with capacity at start), so a lagging
+    consumer no longer makes it allocate; only a recorder backlog beyond that does.
+  - Spikes waiting for the main window (`App::spike_new`) are compacted to the newest per
+    tile slot while it's hidden (`compact_newest_per_slot`); they used to grow ~1 GB/h.
+  - Stop waits at most `STOP_WAIT` (3 s) for the acquisition thread. If a silent board
+    holds it in a read, the thread is left in `Engine::stuck`, an open recording is
+    finished, and the error bar asks for a power-cycle; `poll` takes the board back if the
+    read ever returns (test `stop_does_not_hang_on_a_silent_board`).
+  - Port scan gives up after 2 s without enough headstage frames (upstream waits forever)
+    and skips short frames instead of panicking. Not yet run on the board.
 - **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
   under it (every GUI frame takes that lock, and the builder runs at idle priority).
 
