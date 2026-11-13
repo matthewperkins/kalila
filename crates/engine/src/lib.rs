@@ -676,6 +676,44 @@ mod tests {
         }
     }
 
+    /// The overview (pyramids) of a recording holds only what is in its file: not the blocks
+    /// acquired after Stop, nor a later acquisition run's (whose sample numbers restart at 0).
+    #[test]
+    fn the_overview_stops_at_the_end_of_the_recording() {
+        let root = std::env::temp_dir().join(format!("oers-pyr-end-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut e = Engine::new(root.clone());
+        e.audio_settings.lock().enabled = false;
+        e.set_board(Box::new(SimBoard::new(vec![16])));
+        e.start_acquisition().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        e.start_recording();
+        wait_for("recording", || e.is_recording());
+        std::thread::sleep(Duration::from_millis(700));
+        e.stop_recording();
+        wait_for("the recording to stop", || !e.is_recording());
+        let src = e.rec_status.source.lock().clone().unwrap();
+        let file_end = pyramid::available_samples(&src);
+        let check = |e: &Engine, when: &str| {
+            let st = e.pyramids.lock();
+            assert_eq!(st.src.as_ref().map(|s| &s.dat), Some(&src.dat), "{when}");
+            assert!(st.live_end > 0 && st.live_end <= file_end, "{when}: overview to {} > file {file_end}", st.live_end);
+        };
+        // Still acquiring, not recording.
+        std::thread::sleep(Duration::from_millis(1000));
+        check(&e, "after Stop");
+        let cols = |e: &Engine| e.pyramids.lock().raw.as_ref().and_then(|p| p.columns(0, file_end / 64 * 64, (file_end / 64) as u32, false)).unwrap().0;
+        let before = cols(&e);
+        // A new acquisition run: its samples 0.. would otherwise land on the recording's.
+        e.stop_acquisition();
+        e.start_acquisition().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        check(&e, "after a restart");
+        assert!(before == cols(&e), "the new run's samples changed the recording's overview");
+        drop(e);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_panic_in_acquisition_finalises_the_recording() {
         let root = std::env::temp_dir().join(format!("oers-acq-panic-test-{}", std::process::id()));

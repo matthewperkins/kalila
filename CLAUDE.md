@@ -147,6 +147,14 @@ Committed per feature where the code separates; the GUI features share one commi
   meant; when the layout changes, `App::remap_electrodes` moves them (`ElectrodeMap`) and
   drops those whose headstage is gone, with a toast. Checked on the sim (32+16 → 16+16).
   Old configs without keys are taken to mean the first layout they see.
+- **The overview holds only the file.** The pyramid builder folds live blocks into a
+  recording only while it is being written in this acquisition run (`earlier`/`this_run`
+  in `pyramid_thread`: sample numbers restart at 0 every run). Once it is not being written,
+  the live edge is the file's end (`live_end = available`), so blocks taken between Stop
+  and the recorder acting on it fall outside it. Test
+  `the_overview_stops_at_the_end_of_the_recording` (after Stop, and after a restart).
+- **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
+  under it (every GUI frame takes that lock, and the builder runs at idle priority).
 
 ## Trace windows (rig, 2026-11-06)
 

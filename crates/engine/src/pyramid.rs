@@ -446,6 +446,9 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
     let mut bp_at = Instant::now();
     let mut last_log = Instant::now();
     let mut last_chunk = Instant::now();
+    // The recording that already existed when this acquisition run began. Sample numbers
+    // restart at 0 with every run, so this run's blocks must never be folded into it.
+    let earlier = status.source.lock().as_ref().map(|s| s.dat.clone());
     loop {
         let block = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(b) => Some(b),
@@ -484,10 +487,18 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
         if src.nch != nch {
             continue;
         }
-        // Live blocks.
+        let avail = available(&src);
+        // Live blocks go in only while they belong to the recording: one started in this
+        // run and still being written, or (after Stop) blocks that reached its file. Blocks
+        // after the end are not in the file, and would also push the recording's own detail
+        // out of the RAM budget.
+        let this_run = earlier.as_ref() != Some(&src.dat);
+        let writing = this_run && status.recording.load(Ordering::Relaxed);
         if let Some(b) = block
+            && this_run
             && b.num_channels == nch
             && b.first_sample >= src.first_sample
+            && (writing || (b.first_sample - src.first_sample) as u64 + b.len() as u64 <= avail)
         {
             {
                 let at = (b.first_sample - src.first_sample) as u64;
@@ -543,6 +554,15 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
                 }
             }
         }
+        // Not being written: the file is the whole recording, so its end is the live edge.
+        // A tail the live path skipped is backfilled; blocks it took between Stop and the
+        // recorder acting on it (sent, but not written) fall beyond the edge.
+        if !writing {
+            let mut st = store.lock();
+            if st.live_end != avail {
+                st.live_end = avail;
+            }
+        }
         // Between blocks: backfill one chunk of the newest hole of one pyramid, at most one
         // per `CHUNK_PAUSE`. Not while the recorder is under backpressure: the disk comes first.
         if last_chunk.elapsed() < CHUNK_PAUSE {
@@ -556,7 +576,6 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
         if bp_at.elapsed() < Duration::from_secs(2) {
             continue;
         }
-        let avail = available(&src);
         let job = {
             let st = store.lock();
             let end = st.live_end.min(avail);
@@ -604,25 +623,28 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
+        // Filter before taking the lock, as the live path does: every GUI frame takes it, and
+        // this thread runs at idle priority (a chunk with a long lead-in filters for 0.1 s+).
+        let band_nchp = view.and_then(|v| bands.iter().find(|(bv, _)| *bv == v)).map(|(_, bl)| {
+            // A fresh filter for the chunk, settled over the lead-in.
+            let mut tmp = band_live(&bl.key, fs);
+            band_filter(&mut tmp, &data, nch, &mut fb);
+            bl.key.chans.len()
+        });
         let mut st = store.lock();
         st.backfilling = true;
-        match view {
-            None => {
+        match (view, band_nchp) {
+            (None, _) => {
                 if let Some(raw) = st.raw.as_mut() {
                     raw.ingest(c0, &data, &[]);
                 }
             }
-            Some(v) => {
-                if let Some((_, bl)) = bands.iter_mut().find(|(bv, _)| *bv == v) {
-                    // A fresh filter for the chunk, settled over the lead-in.
-                    let mut tmp = band_live(&bl.key, fs);
-                    band_filter(&mut tmp, &data, nch, &mut fb);
-                    let nchp = bl.key.chans.len();
-                    if let Some((_, p)) = st.bands.get_mut(&v) {
-                        p.ingest(c0, &fb[lead as usize * nchp..], &[]);
-                    }
+            (Some(v), Some(nchp)) => {
+                if let Some((_, p)) = st.bands.get_mut(&v) {
+                    p.ingest(c0, &fb[lead as usize * nchp..], &[]);
                 }
             }
+            (Some(_), None) => {}
         }
         st.enforce_budget();
         if last_log.elapsed() > Duration::from_secs(10) {
@@ -635,6 +657,10 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
 }
 
 /// Samples of the main stream readable so far.
+pub fn available_samples(src: &RecSource) -> u64 {
+    available(src)
+}
+
 fn available(src: &RecSource) -> u64 {
     std::fs::metadata(&src.dat).map(|m| m.len() / (2 * src.nch.max(1) as u64)).unwrap_or(0)
 }
