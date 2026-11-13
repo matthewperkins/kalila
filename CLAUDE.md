@@ -185,6 +185,18 @@ Committed per feature where the code separates; the GUI features share one commi
     read ever returns (test `stop_does_not_hang_on_a_silent_board`).
   - Port scan gives up after 2 s without enough headstage frames (upstream waits forever)
     and skips short frames instead of panicking. Not yet run on the board.
+- **Deterministic simulation test (group 3).** `crates/engine/tests/simulation.rs`: per
+  seed (200 by default; `OERS_SIM_SEED=<n>` reruns one), a frame stream like the board's
+  with seeded faults (dropped frames, duplicates, stale and corrupted and truncated frames,
+  other devices' frames, a counter wrapping at 2^32) runs through the board's own block
+  assembly (`rhythm::assemble`, now shared with `OniBoard::read_block`) and the real
+  recorder, with recordings opened and closed at seeded blocks. A checker proves from the
+  files that each recording holds exactly the samples accepted while it was open (every
+  row at its own sample number), TTL edges and `initial_state` replay from the samples,
+  the health counters equal the injected faults, and `RecSource::read` maps across gaps.
+  Mutation-checked: disabling the counter check, the recorder's gap list or TTL edges at
+  block starts each fails most seeds. Runs in ~5 s (release). Not covered yet: disk-write
+  faults, crash truncation, the GUI.
 - **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
   under it (every GUI frame takes that lock, and the builder runs at idle priority).
 

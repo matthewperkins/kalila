@@ -4,8 +4,9 @@
 //! plugin. Register writes, ordering and timing follow upstream; differences are
 //! marked `DIFF:` and exist only to make failures visible instead of silent.
 
+use crate::assemble::Assembled;
 use crate::oni::{Context, Frame, OniResult};
-use crate::parser::{ParseResult, RhythmParser};
+use crate::parser::RhythmParser;
 use crate::registers::Rhd2000Registers;
 use crate::types::*;
 use anyhow::{Context as _, Result, bail};
@@ -1062,39 +1063,22 @@ impl Board for OniBoard {
         blk.num_channels = self.parser.num_channels();
         let target = self.settings.block_samples.max(1);
         let has_rhythm = !self.enabled_streams.is_empty();
+        let health = self.health.clone().unwrap();
         loop {
-            let f = match self.pending.take() {
-                Some(f) => f,
-                None => match self.ctx.read_frame() {
-                    Ok(f) => f,
-                    Err(e) => {
-                        self.health.as_ref().unwrap().read_errors.fetch_add(1, Ordering::Relaxed);
-                        return Err(e.into());
-                    }
-                },
+            let ctx = &self.ctx;
+            let next = || {
+                ctx.read_frame().inspect_err(|_| {
+                    health.read_errors.fetch_add(1, Ordering::Relaxed);
+                })
             };
-            self.health.as_ref().unwrap().frames.fetch_add(1, Ordering::Relaxed);
-            if f.dev_idx() == DEVICE_RHYTHM {
-                if !has_rhythm {
-                    continue;
-                }
-                let ts = f.time() as f64 / self.acq_clock_hz.max(1) as f64;
-                let health = self.health.as_deref().unwrap();
-                match self.parser.parse(&f.data()[8.min(f.data().len())..], ts, blk, health) {
-                    ParseResult::Discontinuous => {
-                        self.pending = Some(f);
+            match crate::assemble::assemble(&mut self.parser, &mut self.pending, blk, target, has_rhythm, self.acq_clock_hz, &health, next)? {
+                Assembled::Block => return Ok(()),
+                Assembled::Side(f) => {
+                    self.handle_side(&f, blk);
+                    // BNO-only configurations still need to deliver blocks.
+                    if !has_rhythm && blk.side.len() >= 4 {
                         return Ok(());
                     }
-                    ParseResult::Appended | ParseResult::Bad => {}
-                }
-                if blk.len() >= target {
-                    return Ok(());
-                }
-            } else {
-                self.handle_side(&f, blk);
-                // BNO-only configurations still need to deliver blocks.
-                if !has_rhythm && blk.side.len() >= 4 {
-                    return Ok(());
                 }
             }
         }

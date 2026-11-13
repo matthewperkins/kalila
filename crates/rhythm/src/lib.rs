@@ -1,6 +1,7 @@
 //! Driver for the Open Ephys acquisition board (ECP5 gateware, FT600 USB 3, ONI protocol),
 //! plus a real-time simulator implementing the same [`Board`] trait.
 
+pub mod assemble;
 pub mod oni;
 pub mod oni_board;
 pub mod parser;
