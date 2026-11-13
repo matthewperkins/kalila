@@ -52,6 +52,23 @@ fn create_new(path: &Path) -> Result<File> {
     fs::OpenOptions::new().write(true).create_new(true).open(path).with_context(|| format!("creating {}", path.display()))
 }
 
+/// Writes `path` whole or not at all (a temporary file, then a rename): a disk filling up
+/// mid-write leaves the previous version, never a cut-off file that readers can't parse.
+fn write_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    let r = (|| -> Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r.with_context(|| format!("writing {}", path.display()))
+}
+
 /// Keeps the first error and carries on, so every file that can be finished is.
 fn keep_first(first: &mut Option<anyhow::Error>, r: Result<()>) {
     if let Err(e) = r {
@@ -69,9 +86,12 @@ impl NpyFile {
         Ok(n)
     }
     fn header(&self) -> Vec<u8> {
+        self.header_for(self.count)
+    }
+    fn header_for(&self, count: u64) -> Vec<u8> {
         // Shape field is padded so the header length never changes as the count grows.
-        let dict = format!("{{'descr': '{}', 'fortran_order': False, 'shape': ({},), }}", self.descr, self.count);
-        let mut dict = format!("{dict:<width$}", width = dict.len() + (24 - self.count.to_string().len()));
+        let dict = format!("{{'descr': '{}', 'fortran_order': False, 'shape': ({},), }}", self.descr, count);
+        let mut dict = format!("{dict:<width$}", width = dict.len() + (24 - count.to_string().len()));
         let base = 10; // magic(6) + version(2) + len(2)
         let total = (base + dict.len() + 1).div_ceil(64) * 64;
         while base + dict.len() + 1 < total {
@@ -90,9 +110,23 @@ impl NpyFile {
         self.count += v.len() as u64;
         Ok(())
     }
+    /// Bytes per record, from the dtype ("<i8" → 8, "|S513" → 513).
+    fn itemsize(&self) -> u64 {
+        self.descr[2..].parse().unwrap_or(1)
+    }
     fn update_header(&mut self) -> Result<()> {
-        self.w.flush()?;
-        let h = self.header();
+        // If the flush fails (disk full, I/O error), the header still gets the records that
+        // are wholly on disk, so a reader sees everything that made it rather than the count
+        // from the last checkpoint.
+        let flushed = self.w.flush();
+        let n = match &flushed {
+            Ok(()) => self.count,
+            Err(_) => {
+                let len = self.w.get_ref().metadata()?.len();
+                self.count.min(len.saturating_sub(self.header_len) / self.itemsize())
+            }
+        };
+        let h = self.header_for(n);
         if h.len() as u64 != self.header_len {
             bail!("npy header size changed for {}", self.path.display());
         }
@@ -101,6 +135,7 @@ impl NpyFile {
         f.seek(SeekFrom::Start(0))?;
         f.write_all(&h)?;
         f.seek(SeekFrom::Start(pos))?;
+        flushed?;
         Ok(())
     }
     fn finish(mut self) -> Result<()> {
@@ -220,7 +255,7 @@ impl Recording {
         };
         let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, messages, clock: None, first_sample: None, written: 0, next: None, gaps: Vec::new(), last_header_update: Instant::now(), oebin: json!({}), dat_path, ttl_dir: ed };
         r.oebin = r.build_oebin();
-        fs::write(dir.join("structure.oebin"), serde_json::to_string_pretty(&r.oebin)?)?;
+        write_replace(&dir.join("structure.oebin"), serde_json::to_string_pretty(&r.oebin)?.as_bytes())?;
         Ok(r)
     }
 
@@ -427,7 +462,7 @@ impl Recording {
         if let Some(mut k) = m.keys {
             keep_first(&mut first, k.flush().map_err(Into::into));
         }
-        keep_first(&mut first, serde_json::to_string_pretty(&oebin).map_err(Into::into).and_then(|j| fs::write(oebin_path, j).map_err(Into::into)));
+        keep_first(&mut first, serde_json::to_string_pretty(&oebin).map_err(Into::into).and_then(|j| write_replace(&oebin_path, j.as_bytes())));
         first.map_or(Ok(()), Err)
     }
 }
@@ -450,6 +485,8 @@ pub struct RecStatus {
     pub bytes: AtomicU64,
     pub samples: AtomicU64,
     pub error: Mutex<Option<String>>,
+    /// Recorder errors so far, never reset (`error` is cleared when a recording starts).
+    pub errors: AtomicU64,
     pub current_dir: Mutex<Option<PathBuf>>,
     pub root: Mutex<PathBuf>,
     /// Force a new date-time session directory on the next recording.
@@ -555,6 +592,7 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
     let fail = |status: &RecStatus, e: anyhow::Error| {
         error!("recording error: {e:#}");
         *status.error.lock() = Some(format!("{e:#}"));
+        status.errors.fetch_add(1, Ordering::SeqCst);
         status.recording.store(false, Ordering::SeqCst);
     };
     loop {

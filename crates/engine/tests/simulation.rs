@@ -11,6 +11,10 @@
 //! counters equal to the injected faults, and `RecSource::read` putting each sample at its
 //! number across the gaps.
 //!
+//! Seeds from 1000 also cap every file's size (`RLIMIT_FSIZE`), as a disk filling up
+//! mid-recording would: the recorder must say so, and every file must read back correctly as
+//! far as it goes.
+//!
 //! Everything is a function of the seed; a failure prints the seed, and
 //! `OERS_SIM_SEED=<n> cargo test -p engine --test simulation` reruns just that one.
 
@@ -176,12 +180,27 @@ fn read_npy(path: &Path) -> (String, Vec<u8>) {
     (String::from_utf8(b[10..10 + hl].to_vec()).unwrap(), b[10 + hl..].to_vec())
 }
 
-/// Reads a 1-D `.npy`, checking its header's shape against its body.
-fn npy_vec<T: Copy + Default, const N: usize>(path: &Path, from: fn([u8; N]) -> T) -> Vec<T> {
+/// Reads a 1-D `.npy` as a reader would: the records its header claims. The body must
+/// hold them; with `exact`, nothing more (after a disk error, a partial tail may follow).
+fn npy_vec<T: Copy + Default, const N: usize>(path: &Path, from: fn([u8; N]) -> T, exact: bool) -> Result<Vec<T>, String> {
     let (h, body) = read_npy(path);
-    let n: usize = h.split("'shape': (").nth(1).and_then(|s| s.split(',').next()).and_then(|s| s.trim().parse().ok()).unwrap_or_else(|| panic!("shape in {h}"));
-    assert_eq!(body.len(), n * N, "{}: header says {n} records, body holds {}", path.display(), body.len() / N);
-    body.chunks_exact(N).map(|c| from(c.try_into().unwrap())).collect()
+    let n: usize = h.split("'shape': (").nth(1).and_then(|s| s.split(',').next()).and_then(|s| s.trim().parse().ok()).ok_or_else(|| format!("no shape in {h}"))?;
+    if body.len() < n * N || (exact && body.len() != n * N) {
+        return Err(format!("{}: header says {n} records, body holds {} bytes", path.display(), body.len()));
+    }
+    Ok(body[..n * N].chunks_exact(N).map(|c| from(c.try_into().unwrap())).collect())
+}
+
+/// Caps the size of any file this process writes (`RLIMIT_FSIZE`), so writes past it fail
+/// with EFBIG as a full disk would fail them; None restores the limit.
+fn file_size_limit(bytes: Option<u64>) {
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let mut r: libc::rlimit = std::mem::zeroed();
+        libc::getrlimit(libc::RLIMIT_FSIZE, &mut r);
+        r.rlim_cur = bytes.map_or(r.rlim_max, |b| b as libc::rlim_t);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &r), 0);
+    }
 }
 
 fn find(dir: &Path, name: &str, under: &str) -> PathBuf {
@@ -201,8 +220,11 @@ fn find(dir: &Path, name: &str, under: &str) -> PathBuf {
     v.pop().unwrap()
 }
 
-/// Runs one seed; returns a description of the first broken invariant.
-fn run(seed: u64) -> Result<(), String> {
+/// Runs one seed; returns a description of the first broken invariant. With `disk_limit`,
+/// no file may grow past that many bytes: the recorder must report the error, and every
+/// file must still read back correctly as far as its header (or length) says.
+fn run(seed: u64, disk_limit: Option<u64>) -> Result<(), String> {
+    let faulty = disk_limit.is_some();
     let mut rng = Rng(seed);
     let frames = 2_000 + rng.below(12_000) as usize;
     let (stream, accepted, exp) = frame_stream(&mut rng, frames);
@@ -225,6 +247,8 @@ fn run(seed: u64) -> Result<(), String> {
     let status = Arc::new(RecStatus::default());
     *status.root.lock() = root.clone();
     let st = status.clone();
+    fs::create_dir_all(&root).unwrap();
+    file_size_limit(disk_limit);
     let recorder = std::thread::spawn(move || run_recorder(rx, st));
     tx.send(RecMsg::AcquisitionStarted(layout())).unwrap();
 
@@ -271,9 +295,15 @@ fn run(seed: u64) -> Result<(), String> {
     }
     tx.send(RecMsg::AcquisitionStopped).unwrap();
     tx.send(RecMsg::Shutdown).unwrap();
-    recorder.join().map_err(|_| "recorder panicked".to_string())?;
-    if let Some(e) = status.error.lock().clone() {
-        return Err(format!("recorder error: {e}"));
+    let joined = recorder.join();
+    file_size_limit(None);
+    joined.map_err(|_| "recorder panicked".to_string())?;
+    let rec_error = status.error.lock().clone();
+    match (&rec_error, disk_limit) {
+        (Some(e), None) => return Err(format!("recorder error: {e}")),
+        // Loud: a recording too big for the limit must have been reported.
+        (_, Some(lim)) if status.errors.load(Ordering::SeqCst) == 0 && recordings.iter().any(|r| (r.len() * NCH * 2) as u64 > lim) => return Err(format!("no recorder error with files capped at {lim} bytes")),
+        _ => {}
     }
 
     // The parser accepted exactly the valid, advancing frames, and counted every fault.
@@ -282,83 +312,99 @@ fn run(seed: u64) -> Result<(), String> {
         return Err(format!("health {got:?}, injected {exp:?}"));
     }
 
-    // Each recording's files, from the files alone.
-    recordings.retain(|r| !r.is_empty());
+    // Each recording's files, from the files alone: one folder per Start, in order.
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if root.exists() {
-        let mut stack = vec![root.clone()];
-        while let Some(d) = stack.pop() {
-            for e in fs::read_dir(&d).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("recording")) {
-                        dirs.push(p);
-                    } else {
-                        stack.push(p);
-                    }
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("recording")) {
+                    dirs.push(p);
+                } else {
+                    stack.push(p);
                 }
             }
         }
     }
     dirs.sort_by_key(|d| d.file_name().unwrap().to_string_lossy().trim_start_matches("recording").parse::<u32>().unwrap());
-    // Recordings that got no samples leave empty folders: skip those.
-    dirs.retain(|d| fs::metadata(find(d, "continuous.dat", "continuous")).map(|m| m.len() > 0).unwrap_or(false));
     if dirs.len() != recordings.len() {
-        return Err(format!("{} recordings with data on disk, {} sent", dirs.len(), recordings.len()));
+        return Err(format!("{} recording folders, {} recordings started", dirs.len(), recordings.len()));
     }
     for (k, (dir, want)) in dirs.iter().zip(&recordings).enumerate() {
-        let samples = npy_vec(&find(dir, "sample_numbers.npy", "continuous"), i64::from_le_bytes);
-        if &samples != want {
-            let i = samples.iter().zip(want).position(|(a, b)| a != b).unwrap_or(samples.len().min(want.len()));
-            return Err(format!("recording {k}: sample_numbers differ at {i} (file {:?}, sent {:?}; {} vs {} samples)", samples.get(i), want.get(i), samples.len(), want.len()));
-        }
-        if samples.windows(2).any(|w| w[1] <= w[0]) {
-            return Err(format!("recording {k}: sample numbers not strictly increasing"));
-        }
-        let ts = npy_vec(&find(dir, "timestamps.npy", "continuous"), f64::from_le_bytes);
-        if ts.len() != samples.len() {
-            return Err(format!("recording {k}: {} timestamps for {} samples", ts.len(), samples.len()));
-        }
+        let samples = npy_vec(&find(dir, "sample_numbers.npy", "continuous"), i64::from_le_bytes, !faulty)?;
+        let ts = npy_vec(&find(dir, "timestamps.npy", "continuous"), f64::from_le_bytes, !faulty)?;
         let dat = fs::read(find(dir, "continuous.dat", "continuous")).unwrap();
-        if dat.len() != samples.len() * NCH * 2 {
-            return Err(format!("recording {k}: continuous.dat holds {} bytes for {} samples", dat.len(), samples.len()));
+        let rows = dat.len() / (NCH * 2);
+        if !faulty && (&samples != want || ts.len() != samples.len() || dat.len() != samples.len() * NCH * 2) {
+            let i = samples.iter().zip(want).position(|(a, b)| a != b).unwrap_or(samples.len().min(want.len()));
+            return Err(format!("recording {k}: {} sample numbers ({} sent, first difference at {i}), {} timestamps, {} bytes of data", samples.len(), want.len(), ts.len(), dat.len()));
         }
-        for (i, &s) in samples.iter().enumerate() {
+        // Each header counts every whole record that reached the disk (up to those sent),
+        // not just those at the last checkpoint.
+        for (name, under, size, sent) in [("sample_numbers.npy", "continuous", 8, want.len()), ("timestamps.npy", "continuous", 8, want.len())] {
+            let path = find(dir, name, under);
+            let (h, body) = read_npy(&path);
+            let n: usize = h.split("'shape': (").nth(1).and_then(|s| s.split(',').next()).and_then(|s| s.trim().parse().ok()).unwrap();
+            if n != sent.min(body.len() / size) {
+                return Err(format!("recording {k}: {name} header says {n}, {} whole records on disk, {sent} sent", body.len() / size));
+            }
+        }
+        // What's there is right, as far as it goes: the sample numbers are a prefix of
+        // those sent, and every whole row of data belongs to its sample number.
+        if !want.starts_with(&samples) {
+            return Err(format!("recording {k}: sample_numbers isn't a prefix of the samples sent"));
+        }
+        for (i, &s) in samples.iter().take(rows).enumerate() {
             let row: Vec<i16> = dat[i * NCH * 2..(i + 1) * NCH * 2].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
             if row != row_of(counter_at[&s]) {
                 return Err(format!("recording {k}: the row at file index {i} isn't sample {s}'s"));
             }
         }
-        // TTL edges: replaying the per-sample words gives exactly the recorded events.
-        let words = npy_vec(&find(dir, "full_words.npy", "TTL"), u64::from_le_bytes);
-        let ev_samples = npy_vec(&find(dir, "sample_numbers.npy", "TTL"), i64::from_le_bytes);
-        let states = npy_vec(&find(dir, "states.npy", "TTL"), i16::from_le_bytes);
+        // TTL edges: replaying the per-sample words of the samples sent gives the recorded
+        // events (all of them; after a disk error, a prefix).
+        let words = npy_vec(&find(dir, "full_words.npy", "TTL"), u64::from_le_bytes, !faulty)?;
+        let ev_samples = npy_vec(&find(dir, "sample_numbers.npy", "TTL"), i64::from_le_bytes, !faulty)?;
+        let states = npy_vec(&find(dir, "states.npy", "TTL"), i16::from_le_bytes, !faulty)?;
         let mut want_ev: Vec<(i64, i16, u64)> = Vec::new();
-        let mut prev = ttl_of(counter_at[&samples[0]]);
-        for &s in &samples[1..] {
-            let w = ttl_of(counter_at[&s]);
-            for line in 0..16 {
-                if (prev ^ w) & (1 << line) != 0 {
-                    want_ev.push((s, (line + 1) * if w & (1 << line) != 0 { 1 } else { -1 }, w as u64));
+        if let Some(&s0) = want.first() {
+            let mut prev = ttl_of(counter_at[&s0]);
+            for &s in &want[1..] {
+                let w = ttl_of(counter_at[&s]);
+                for line in 0..16 {
+                    if (prev ^ w) & (1 << line) != 0 {
+                        want_ev.push((s, (line + 1) * if w & (1 << line) != 0 { 1 } else { -1 }, w as u64));
+                    }
                 }
+                prev = w;
             }
-            prev = w;
         }
-        let got_ev: Vec<(i64, i16, u64)> = ev_samples.iter().zip(&states).zip(&words).map(|((&s, &st), &w)| (s, st, w)).collect();
-        if got_ev != want_ev {
+        let n_ev = ev_samples.len().min(states.len()).min(words.len());
+        let got_ev: Vec<(i64, i16, u64)> = (0..n_ev).map(|i| (ev_samples[i], states[i], words[i])).collect();
+        let ttl_ok = if faulty { want_ev.starts_with(&got_ev) } else { got_ev == want_ev && n_ev == ev_samples.len() };
+        if !ttl_ok {
             let i = got_ev.iter().zip(&want_ev).position(|(a, b)| a != b).unwrap_or(got_ev.len().min(want_ev.len()));
             return Err(format!("recording {k}: TTL events differ at {i}: on disk {:?}, expected {:?} ({} vs {} events)", got_ev.get(i), want_ev.get(i), got_ev.len(), want_ev.len()));
         }
-        let oebin: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("structure.oebin")).unwrap()).map_err(|e| format!("recording {k}: structure.oebin: {e}"))?;
-        let initial = oebin["events"].as_array().and_then(|a| a.iter().find_map(|e| e.get("initial_state"))).and_then(|v| v.as_u64());
-        if initial != Some(ttl_of(counter_at[&samples[0]]) as u64) {
-            return Err(format!("recording {k}: initial TTL state {initial:?}"));
+        // structure.oebin: always after a clean run; after a disk error, if it was written.
+        match fs::read_to_string(dir.join("structure.oebin")) {
+            Ok(j) => {
+                let oebin: serde_json::Value = serde_json::from_str(&j).map_err(|e| format!("recording {k}: structure.oebin: {e}"))?;
+                let initial = oebin["events"].as_array().and_then(|a| a.iter().find_map(|e| e.get("initial_state"))).and_then(|v| v.as_u64());
+                let want_initial = want.first().map_or(0, |&s| ttl_of(counter_at[&s]) as u64);
+                if !faulty && initial != Some(want_initial) {
+                    return Err(format!("recording {k}: initial TTL state {initial:?}, expected {want_initial}"));
+                }
+            }
+            Err(e) if !faulty => return Err(format!("recording {k}: structure.oebin: {e}")),
+            Err(_) => {}
         }
     }
 
     // The review reader's mapping on the last recording: every sample at its own number,
     // zeros where samples were dropped.
-    if let (Some(src), Some(want)) = (status.source.lock().clone(), recordings.last()) {
+    let last_with_data = recordings.iter().rev().find(|r| !r.is_empty());
+    if let (false, Some(src), Some(want)) = (faulty, status.source.lock().clone(), last_with_data) {
         let (s0, s1) = (want[0], *want.last().unwrap() + 1);
         if src.available() != (s1 - src.first_sample) as u64 {
             return Err(format!("RecSource::available {} for a span of {}", src.available(), s1 - src.first_sample));
@@ -382,10 +428,20 @@ fn run(seed: u64) -> Result<(), String> {
 
 #[test]
 fn acquisition_to_recorder_under_seeded_faults() {
-    let seeds: Vec<u64> = match std::env::var("OERS_SIM_SEED") {
-        Ok(s) => vec![s.parse().expect("OERS_SIM_SEED")],
-        Err(_) => (0..200).collect(),
+    // Seeds 0..200 run clean; 1000..1060 with every file capped at a seeded size (a disk
+    // that fills up mid-recording). One test function, as the file-size cap is per process.
+    let seeds: Vec<(u64, Option<u64>)> = match std::env::var("OERS_SIM_SEED") {
+        Ok(s) => vec![{
+            let seed = s.parse().expect("OERS_SIM_SEED");
+            (seed, disk_limit_for(seed))
+        }],
+        Err(_) => (0..200).chain(1000..1060).map(|s| (s, disk_limit_for(s))).collect(),
     };
-    let failures: Vec<String> = seeds.iter().filter_map(|&s| run(s).err().map(|e| format!("seed {s}: {e}"))).collect();
+    let failures: Vec<String> = seeds.iter().filter_map(|&(s, lim)| run(s, lim).err().map(|e| format!("seed {s}{}: {e}", lim.map_or(String::new(), |l| format!(" (files capped at {l} B)"))))).collect();
     assert!(failures.is_empty(), "{} of {} seeds failed (rerun one with OERS_SIM_SEED=<n>):\n{}", failures.len(), seeds.len(), failures.join("\n"));
+}
+
+/// Seeds from 1000 run with files capped at 2 KB .. 1 MB (a recording here is up to ~1 MB).
+fn disk_limit_for(seed: u64) -> Option<u64> {
+    (seed >= 1000).then(|| 2048 + Rng(seed ^ 0xD15C).below(1 << 20))
 }

@@ -834,6 +834,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "env_logger",
+ "libc",
  "log",
  "parking_lot",
  "rhythm",

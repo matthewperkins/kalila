@@ -369,6 +369,12 @@ impl App {
         }
         if let Some(e) = self.engine.rec_status.error.lock().clone() {
             chip(ui, false, "REC ERROR".into(), &e);
+        } else {
+            // The message clears when the next recording starts; the count stays.
+            let n = self.engine.rec_status.errors.load(Ordering::Relaxed);
+            if n > 0 {
+                chip(ui, false, format!("rec errors {n}"), "Earlier recordings in this session reported errors (disk full, write failures). Their files hold the data up to the error; the details are in the log.");
+            }
         }
         let fps = if self.frame_times.is_empty() { 0.0 } else { self.frame_times.len() as f32 / self.frame_times.iter().sum::<f32>() };
         ui.label(RichText::new(format!("{fps:.0} fps")).weak().monospace()).on_hover_text(&self.gpu_name);

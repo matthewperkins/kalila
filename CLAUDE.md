@@ -195,8 +195,15 @@ Committed per feature where the code separates; the GUI features share one commi
   row at its own sample number), TTL edges and `initial_state` replay from the samples,
   the health counters equal the injected faults, and `RecSource::read` maps across gaps.
   Mutation-checked: disabling the counter check, the recorder's gap list or TTL edges at
-  block starts each fails most seeds. Runs in ~5 s (release). Not covered yet: disk-write
-  faults, crash truncation, the GUI.
+  block starts each fails most seeds. Runs in ~6 s (release).
+  - **Disk full:** seeds 1000–1059 cap every file's size (`RLIMIT_FSIZE`, so writes fail
+    with EFBIG mid-recording). The recorder must count an error (`RecStatus::errors`, never
+    reset; the GUI shows "rec errors n" once the message has cleared), every header must
+    count each whole record on disk, and what's on disk must be a correct prefix. This found
+    and fixed: a cut-off `structure.oebin` (now written to a temporary file and renamed),
+    headers left at the last checkpoint when the final flush failed (0 records claimed,
+    3479 on disk), and an error forgotten when the next recording started.
+  - Not covered: crash truncation, the GUI.
 - **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
   under it (every GUI frame takes that lock, and the builder runs at idle priority).
 
