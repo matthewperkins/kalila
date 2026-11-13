@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Measure CPU (and GPU) load of running programs, for comparing oers with the stock GUI.
+"""Measure CPU (and GPU) load of running programs, for comparing kalila with the stock GUI.
 
-    scripts/cpuload.py --name oers [--name basler_record --name manta_record ...]
-                       [--seconds 120] [--interval 1] [--csv out.csv] [--label "oers recording"]
+    scripts/cpuload.py --name kalila [--name basler_record --name manta_record ...]
+                       [--seconds 120] [--interval 1] [--csv out.csv] [--label "kalila recording"]
 
 Each --name matches processes whose command name (comm) or executable basename equals it,
 or starts with it (e.g. `preview` matches the camera previews); all matches form one group.

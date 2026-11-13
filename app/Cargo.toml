@@ -1,5 +1,5 @@
 [package]
-name = "oers"
+name = "kalila"
 version.workspace = true
 edition.workspace = true
 description = "Open Ephys acquisition GUI (egui + wgpu/Vulkan)"

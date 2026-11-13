@@ -7,7 +7,7 @@
 //!     continuous/Acquisition_Board-100.<stream>/{continuous.dat, sample_numbers.npy, timestamps.npy}
 //!     events/Acquisition_Board-100.<stream>/TTL/{states,sample_numbers,timestamps,full_words}.npy
 //!     events/MessageCenter/{text,sample_numbers,timestamps}.npy
-//!     note_keystrokes.tsv   (oers only: every keypress of each typed note)
+//!     note_keystrokes.tsv   (kalila only: every keypress of each typed note)
 //! ```
 //!
 //! Messages follow the stock GUI 1.x (`RecordNode::handleBroadcastMessage`): sample numbers in
@@ -569,7 +569,7 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
     impl Drop for Exit<'_> {
         fn drop(&mut self) {
             if std::thread::panicking() {
-                *self.0.error.lock() = Some("the recorder thread crashed: this recording ends at that point (files are readable up to the last second). Restart oers to record again.".into());
+                *self.0.error.lock() = Some("the recorder thread crashed: this recording ends at that point (files are readable up to the last second). Restart kalila to record again.".into());
             }
             self.0.recording.store(false, Ordering::SeqCst);
         }
@@ -741,7 +741,7 @@ mod tests {
     /// put every sample at its own number (review and the overview depend on it).
     #[test]
     fn reads_back_by_sample_number_across_gaps() {
-        let root = std::env::temp_dir().join(format!("oers-rec-gap-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kalila-rec-gap-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let layout = StreamLayout {
             name: "acquisition_board".into(),
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn a_malformed_block_stops_the_recording_loudly() {
-        let root = std::env::temp_dir().join(format!("oers-rec-bad-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kalila-rec-bad-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let layout = StreamLayout {
             name: "acquisition_board".into(),
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn a_second_session_in_the_same_second_never_reuses_a_folder() {
-        let root = std::env::temp_dir().join(format!("oers-rec-collide-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kalila-rec-collide-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let layout = StreamLayout { name: "acquisition_board".into(), sample_rate: 30000.0, channels: vec![ChannelInfo { name: "CH1".into(), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }], headstages: vec![], ttl_lines: 8, side_streams: vec![], hw_clock_hz: 0.0 };
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn writes_valid_open_ephys_binary() {
-        let root = std::env::temp_dir().join(format!("oers-rec-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kalila-rec-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let layout = StreamLayout {
             name: "acquisition_board".into(),

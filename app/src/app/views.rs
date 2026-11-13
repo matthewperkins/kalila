@@ -1151,7 +1151,7 @@ impl App {
     pub(super) fn trace_windows(&mut self, ctx: &egui::Context) {
         let open: Vec<(u32, String)> = self.shared.lock().settings.iter().filter(|v| v.open).map(|v| (v.id, v.name.clone())).collect();
         for (id, name) in open {
-            let mut b = egui::ViewportBuilder::default().with_title(format!("oers — {name}")).with_app_id("oers").with_inner_size([1400.0, 900.0]);
+            let mut b = egui::ViewportBuilder::default().with_title(format!("kalila — {name}")).with_app_id("kalila").with_inner_size([1400.0, 900.0]);
             if let Some(icon) = &self.icon {
                 b = b.with_icon(icon.clone());
             }

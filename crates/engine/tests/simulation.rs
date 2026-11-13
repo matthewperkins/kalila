@@ -16,7 +16,7 @@
 //! far as it goes.
 //!
 //! Everything is a function of the seed; a failure prints the seed, and
-//! `OERS_SIM_SEED=<n> cargo test -p engine --test simulation` reruns just that one.
+//! `KALILA_SIM_SEED=<n> cargo test -p engine --test simulation` reruns just that one.
 
 use engine::record::{RecMsg, RecStatus, run_recorder};
 use rhythm::assemble::{Assembled, DeviceFrame, assemble};
@@ -241,7 +241,7 @@ fn run(seed: u64, disk_limit: Option<u64>) -> Result<(), String> {
     }
     let counter_at: BTreeMap<i64, u32> = number.iter().copied().zip(accepted.iter().copied()).collect();
 
-    let root = std::env::temp_dir().join(format!("oers-sim-{}-{seed}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("kalila-sim-{}-{seed}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let (tx, rx) = crossbeam_channel::unbounded();
     let status = Arc::new(RecStatus::default());
@@ -430,15 +430,15 @@ fn run(seed: u64, disk_limit: Option<u64>) -> Result<(), String> {
 fn acquisition_to_recorder_under_seeded_faults() {
     // Seeds 0..200 run clean; 1000..1060 with every file capped at a seeded size (a disk
     // that fills up mid-recording). One test function, as the file-size cap is per process.
-    let seeds: Vec<(u64, Option<u64>)> = match std::env::var("OERS_SIM_SEED") {
+    let seeds: Vec<(u64, Option<u64>)> = match std::env::var("KALILA_SIM_SEED") {
         Ok(s) => vec![{
-            let seed = s.parse().expect("OERS_SIM_SEED");
+            let seed = s.parse().expect("KALILA_SIM_SEED");
             (seed, disk_limit_for(seed))
         }],
         Err(_) => (0..200).chain(1000..1060).map(|s| (s, disk_limit_for(s))).collect(),
     };
     let failures: Vec<String> = seeds.iter().filter_map(|&(s, lim)| run(s, lim).err().map(|e| format!("seed {s}{}: {e}", lim.map_or(String::new(), |l| format!(" (files capped at {l} B)"))))).collect();
-    assert!(failures.is_empty(), "{} of {} seeds failed (rerun one with OERS_SIM_SEED=<n>):\n{}", failures.len(), seeds.len(), failures.join("\n"));
+    assert!(failures.is_empty(), "{} of {} seeds failed (rerun one with KALILA_SIM_SEED=<n>):\n{}", failures.len(), seeds.len(), failures.join("\n"));
 }
 
 /// Seeds from 1000 run with files capped at 2 KB .. 1 MB (a recording here is up to ~1 MB).

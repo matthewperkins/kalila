@@ -1,4 +1,4 @@
-//! Scripted GUI input for testing without a real pointer: `OERS_UI_SCRIPT=<file>`.
+//! Scripted GUI input for testing without a real pointer: `KALILA_UI_SCRIPT=<file>`.
 //!
 //! The steps are injected through `App::raw_input_hook` into one window's own egui input. The
 //! system pointer and keyboard and other programs are never touched. Off unless the variable is
@@ -17,7 +17,7 @@
 //! scroll 600 400 0 -120 [alt]    # dx dy in points (negative dy = wheel down)
 //! key ArrowLeft [shift]          # egui key names: Enter, Escape, Home, End, A, Minus, …
 //! text hello
-//! shot palette-open      # PNG of the target window into OERS_UI_SHOTS (default: script dir)
+//! shot palette-open      # PNG of the target window into KALILA_UI_SHOTS (default: script dir)
 //! log any message
 //! quit                   # ask the main window to close
 //! ```
@@ -143,9 +143,9 @@ fn save_png(path: &Path, img: &egui::ColorImage) -> Result<(), String> {
 }
 
 impl UiScript {
-    /// The script named by `OERS_UI_SCRIPT`, if set (errors are logged and disable it).
+    /// The script named by `KALILA_UI_SCRIPT`, if set (errors are logged and disable it).
     pub fn from_env() -> Option<Self> {
-        let path = PathBuf::from(std::env::var_os("OERS_UI_SCRIPT")?);
+        let path = PathBuf::from(std::env::var_os("KALILA_UI_SCRIPT")?);
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -160,8 +160,8 @@ impl UiScript {
                 return None;
             }
         };
-        let shots = std::env::var_os("OERS_UI_SHOTS").map(PathBuf::from).unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
-        log::warn!("ui-script: running {} ({} steps); scripted input goes to oers windows only", path.display(), steps.len());
+        let shots = std::env::var_os("KALILA_UI_SHOTS").map(PathBuf::from).unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
+        log::warn!("ui-script: running {} ({} steps); scripted input goes to kalila windows only", path.display(), steps.len());
         Some(Self { steps, target: "Open Ephys acquisition".into(), batches: VecDeque::new(), wait_until: None, shots, done: false })
     }
 

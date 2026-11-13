@@ -54,7 +54,7 @@ static inline void* get_driver_function(lib_handle_t handle, const char* functio
     if (!driver-> fname) rc = -1; \
 }
 
-// oers patch: optional directory searched before the default dlopen() path.
+// kalila patch: optional directory searched before the default dlopen() path.
 static char oni_driver_search_dir[4096] = {0};
 
 void oni_set_driver_search_dir(const char* dir)

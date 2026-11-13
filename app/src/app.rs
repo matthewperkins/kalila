@@ -73,7 +73,7 @@ pub struct App {
     shared: SharedViews,
     render_state: egui_wgpu::RenderState,
     icon: Option<Arc<egui::IconData>>,
-    /// Scripted test input (`OERS_UI_SCRIPT`), off by default.
+    /// Scripted test input (`KALILA_UI_SCRIPT`), off by default.
     ui_script: Option<crate::uiscript::UiScript>,
     /// Which CAR the CAR window is editing, if open.
     car_window: Option<CarTarget>,
@@ -140,7 +140,7 @@ impl App {
             engine,
             shared,
             render_state: rs.clone(),
-            icon: eframe::icon_data::from_png_bytes(include_bytes!("../../packaging/icon/oers-128.png")).ok().map(Arc::new),
+            icon: eframe::icon_data::from_png_bytes(include_bytes!("../../packaging/icon/kalila-128.png")).ok().map(Arc::new),
             ui_script: crate::uiscript::UiScript::from_env(),
             car_window: None,
             colors_dirty: true,
@@ -403,7 +403,7 @@ impl App {
     fn notes_section(&mut self, ui: &mut egui::Ui) {
         let mut sh = self.shared.lock();
         egui::CollapsingHeader::new(RichText::new("Notes").strong()).id_salt("notes_section").default_open(true).show(ui, |ui| {
-            ui.small("In any oers window: / starts a note at that moment; Enter or \\ saves it, Esc cancels. ` stamps the next draft, 1–9 a preset. Saved in the recording as Open Ephys messages.");
+            ui.small("In any kalila window: / starts a note at that moment; Enter or \\ saves it, Esc cancels. ` stamps the next draft, 1–9 a preset. Saved in the recording as Open Ephys messages.");
             ui.label("Drafts (` stamps the top one)");
             let id = egui::Id::unique("note-draft-input");
             let mut draft = ui.data_mut(|d| d.get_temp::<String>(id).unwrap_or_default());
@@ -973,13 +973,13 @@ impl App {
     }
 }
 
-/// Every note also goes to `$XDG_STATE_HOME/oers/notes.log` (default `~/.local/state`) (tab-separated: local time, sample,
+/// Every note also goes to `$XDG_STATE_HOME/kalila/notes.log` (default `~/.local/state`) (tab-separated: local time, sample,
 /// time, recording folder or "-", text), so notes typed while not recording are kept too.
 fn append_notes_log(sample: i64, when: &str, dir: Option<&std::path::Path>, text: &str) {
     use std::io::Write;
     let state = std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")));
     let Some(state) = state else { return };
-    let d = state.join("oers");
+    let d = state.join("kalila");
     let _ = std::fs::create_dir_all(&d);
     let line = format!("{}\t{sample}\t{when}\t{}\t{}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), dir.map_or("-".into(), |p| p.display().to_string()), text.replace(['\t', '\n'], " "));
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(d.join("notes.log")) {

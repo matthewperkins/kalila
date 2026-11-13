@@ -1,5 +1,11 @@
 # Context for Claude sessions on this project
 
+The program is **kalila** (lower case everywhere; environment variables `KALILA_*`). It was
+called **oers** until 2026-11-13: commit messages, `docs/reviews/` and older notes use that
+name. Its twin, the Zig program in `~/oEZ/oez` (oEZ, being renamed dimna), shares the board.
+Before any board run, check nothing else holds it:
+`pgrep -x oers || pgrep -x kalila || pgrep -x oez || pgrep -x oez-headless || pgrep -x dimna || pgrep -x dimna-headless || pgrep -x headless || pgrep -f '[o]pen-ephys'`
+
 Carried over from the development session on the dev box, so a session on the rig starts
 with the same background. See `README.md` for build and setup; this file holds the *why*
 and the current state.
@@ -128,9 +134,9 @@ Committed per feature where the code separates; the GUI features share one commi
   headings show a "CAR" badge when it applies there.
 - Spike tiles: click monitors that channel, Ctrl+click adds/removes it from the audio mix.
   Monitored channels are coloured by stereo position (amber left → yellow → lime right).
-- Desktop launcher: `packaging/install-desktop.sh` (log in `~/.local/state/oers/oers.log`).
+- Desktop launcher: `packaging/install-desktop.sh` (log in `~/.local/state/kalila/kalila.log`).
 - Simulator: a common-mode artefact burst (30 ms every 1.7 s) for testing CAR; on by
-  default, `OERS_SIM_ARTEFACT=0` turns it off.
+  default, `KALILA_SIM_ARTEFACT=0` turns it off.
 
 ## Thread liveness and electrode identity (2026-11-13, from `docs/reviews/`)
 
@@ -186,7 +192,7 @@ Committed per feature where the code separates; the GUI features share one commi
   - Port scan gives up after 2 s without enough headstage frames (upstream waits forever)
     and skips short frames instead of panicking. Not yet run on the board.
 - **Deterministic simulation test (group 3).** `crates/engine/tests/simulation.rs`: per
-  seed (200 by default; `OERS_SIM_SEED=<n>` reruns one), a frame stream like the board's
+  seed (200 by default; `KALILA_SIM_SEED=<n>` reruns one), a frame stream like the board's
   with seeded faults (dropped frames, duplicates, stale and corrupted and truncated frames,
   other devices' frames, a counter wrapping at 2^32) runs through the board's own block
   assembly (`rhythm::assemble`, now shared with `OniBoard::read_block`) and the real
@@ -257,7 +263,7 @@ Spike2-style scrubbing through the ongoing recording, per trace window (`app/src
   the same in `TtlGeom`), so a drag moves at once. A fill is never cancelled; when it completes,
   the newest stretch is requested. A pan forward by less than a window *appends* just the new
   samples to the shown state (filter state continues, no lead-in). The reader reads straight
-  into the `i16` buffer. `RUST_LOG=oers=debug` logs each fill with its read time.
+  into the `i16` buffer. `RUST_LOG=kalila=debug` logs each fill with its read time.
   - Measured on the sim (62 ch, Raw): 3 s fills in 11–27 ms; 33 s in 0.85–0.98 s. The file
     read is 20–80 ms of that; the rest is the GPU `filt` pass, which runs one serial thread
     per channel (an IIR is sequential), about 57 ms per 8 MB chunk. Raw is no faster because
@@ -313,7 +319,7 @@ clamped to the recording's length; spans over 60 s never fall back to direct rea
   ingest. While a pyramid is incomplete the badge says "building the overview" and the
   image is redrawn every 300 ms. `RUST_LOG=engine=debug` logs backfill progress and RAM.
 - Scripted runs that enter or leave review unprompted: most likely real pointer input reaching
-  the simulator's windows, which sit over the user's own oers (on 2026-11-11 the user was
+  the simulator's windows, which sit over the user's own kalila (on 2026-11-11 the user was
   moving a window at the time). `leave_review` and `reset_all` log at debug level.
 
 ## Per-row display filters (simulator, 2026-11-08; Raw/Band since 2026-11-10)
@@ -348,7 +354,7 @@ clamped to the recording's length; spans over 60 s never fall back to direct rea
 
 ## Typed notes (simulator, 2026-11-09)
 
-`app/src/notes.rs`. Keys work in any oers window while no text box has focus:
+`app/src/notes.rs`. Keys work in any kalila window while no text box has focus:
 - **Typed notes:** `/` opens a note stamped at that sample; Enter or `\` saves it, Esc cancels.
   While a note is open, every key goes into it, so no shortcuts fire.
 - **One-key stamps:** `` ` `` stamps the next draft (queued in the Notes panel); 1–9 stamp the
@@ -367,7 +373,7 @@ clamped to the recording's length; spans over 60 s never fall back to direct rea
 - **Keystroke log:** every keypress, sample-stamped, goes to `note_keystrokes.tsv` in the
   recording folder.
 - **Notes log:** every note, recorded or not, is also appended to
-  `$XDG_STATE_HOME/oers/notes.log` (default `~/.local/state`). Point `XDG_STATE_HOME` elsewhere
+  `$XDG_STATE_HOME/kalila/notes.log` (default `~/.local/state`). Point `XDG_STATE_HOME` elsewhere
   for simulator tests.
 - **Markers:** notes are drawn on the live traces and in review.
 
@@ -395,18 +401,18 @@ window's sweeps can start at a level crossing on one of its electrodes instead o
   every other trigger setting does.
 - Not yet: triggering in review; a combined spike/laser latency view.
 
-## Scripted GUI tests (`OERS_UI_SCRIPT`)
+## Scripted GUI tests (`KALILA_UI_SCRIPT`)
 
 No input-injection tools are installed on the rig. To click through the GUI, run the simulator
-with `OERS_UI_SCRIPT=<file>`.
+with `KALILA_UI_SCRIPT=<file>`.
 - **Steps:** window, wait, move, click, drag, scroll, key, text, shot, log, quit. The format
   is at the top of `app/src/uiscript.rs`.
-- **Input path:** `App::raw_input_hook` feeds the steps into one oers window's own egui input,
+- **Input path:** `App::raw_input_hook` feeds the steps into one kalila window's own egui input,
   never the system pointer.
-- **Screenshots:** `shot` saves that window as a PNG, to `OERS_UI_SHOTS` or the script's folder.
+- **Screenshots:** `shot` saves that window as a PNG, to `KALILA_UI_SHOTS` or the script's folder.
 - **Coordinates** are window points (= pixels on the rig).
-- **Example run:** `OERS_UI_SCRIPT=s.txt XDG_CONFIG_HOME=<scratch cfg> ./target/release/oers --sim --acquire`
-- Ask before launching it while the user's own oers is open: the window rules place the
+- **Example run:** `KALILA_UI_SCRIPT=s.txt XDG_CONFIG_HOME=<scratch cfg> ./target/release/kalila --sim --acquire`
+- Ask before launching it while the user's own kalila is open: the window rules place the
   simulator's windows over theirs, and it plays audio.
 
 ## CPU comparison with the stock GUI (rig, 2026-11-05)
@@ -414,7 +420,7 @@ with `OERS_UI_SCRIPT=<file>`.
 `scripts/cpuload.py` (per process and thread, % of one core; the rig has 4 cores, no SMT).
 Same board, 32 channels, full screen, 60 s per condition; CSVs in `~/oers-test/cpu/`:
 
-| | stock 1.1 | oers |
+| | stock 1.1 | kalila |
 |---|---|---|
 | acquiring | 82 % (GUI thread 50) | 59 % (GUI thread 11) |
 | recording | 178 %, one core pinned at 100 % | 53 % |
@@ -424,7 +430,7 @@ Same board, 32 channels, full screen, 60 s per condition; CSVs in `~/oers-test/c
   `AbstractFifo::getNumReady`), holding one core for as long as it records.
 - Both cameras together (`~/gst-record-scripts/cam_record`) take about 16 % of a core plus
   NVENC (12 %). No camera frames were dropped with either program.
-- oers's acquisition + FTDI driver threads (30–40 %) cost more than stock's (~30 %).
+- kalila's acquisition + FTDI driver threads (30–40 %) cost more than stock's (~30 %).
   Unconfirmed guess: smaller USB reads. A possible trim if headroom ever matters.
 - The FTDI driver's threads show up as "board-open" (they inherit that thread's name).
 
@@ -443,7 +449,7 @@ Same board, 32 channels, full screen, 60 s per condition; CSVs in `~/oers-test/c
 5. Compare against a short stock-GUI recording with the same headstages: channel count,
    µV scale (0.195 µV/bit), ADC scale (v3 boards invert), TTL timing. Add `--aux --adc` to
    headless to include those channels.
-6. `./target/release/oers` for the GUI.
+6. `./target/release/kalila` for the GUI.
 
 When debugging hardware, compare against the original sources: the acquisition-board
 plugin (`Source/devices/oni/`) and liboni 4.6 (vendored in `crates/oni-sys/liboni`). On the

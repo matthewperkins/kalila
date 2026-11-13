@@ -1,5 +1,7 @@
 # Code reviews
 
+Written when the program was called oers; it is now kalila.
+
 Two independent read-only reviews of commit `31aa188` (2026-11-13). Each was written by a
 separate Claude agent that couldn't see the other's output. Nothing was built or run for either.
 

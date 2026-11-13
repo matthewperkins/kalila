@@ -1,4 +1,6 @@
-# oers — Open Ephys acquisition in Rust
+# kalila — Open Ephys acquisition in Rust
+
+(Called oers until November 2026.)
 
 A rewrite of the Open Ephys GUI's acquisition path for the **ONI/FT600 acquisition board**
 (ECP5 gateware, not Opal Kelly), with a GPU-drawn egui interface and a spike-oriented audio
@@ -17,7 +19,7 @@ wraps FTDI's closed-source D3XX library.
 ![Main window](docs/screenshots/main-window.png)
 
 **Main window:** board, recording and trace-window controls, spike tiles with persistence.
-All screenshots are from the built-in simulator (`oers --sim`), so the signals are synthetic.
+All screenshots are from the built-in simulator (`kalila --sim`), so the signals are synthetic.
 
 ```
 crates/oni-sys   liboni 4.6 (C, vendored, statically linked) + FFI
@@ -31,8 +33,8 @@ scripts/         FT600 driver build, udev rule, realtime limits
 
 ```sh
 cargo build --release            # needs Rust ≥ 1.85, a C compiler, libpipewire/alsa headers
-./target/release/oers --sim      # simulator (no hardware needed)
-./target/release/oers            # hardware
+./target/release/kalila --sim      # simulator (no hardware needed)
+./target/release/kalila            # hardware
 ```
 
 ## Rig setup (one time)
@@ -50,22 +52,22 @@ cargo build --release            # needs Rust ≥ 1.85, a C compiler, libpipewir
    Open Ephys install is also picked up automatically from `~/.local/share/open-ephys/shared*`,
    or set `ONI_DRIVER_PATH=<dir>`.
 2. **USB permissions:** `sudo install -m644 scripts/60-open-ephys-ft600.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
-3. **Real-time priority (recommended):** copy `scripts/99-oers-realtime.conf` to
+3. **Real-time priority (recommended):** copy `scripts/99-kalila-realtime.conf` to
    `/etc/security/limits.d/`, add yourself to the `realtime` group, then re-login. The top
    bar shows `RT` (green) once the acquisition thread runs under SCHED_FIFO. Without it,
    acquisition still works; the board's DRAM buffer absorbs scheduling stalls.
 4. **Hyprland / NVIDIA:** use NVIDIA driver ≥ 555 (explicit sync). For the absolute lowest
    display latency, allow tearing for this window:
-   `windowrulev2 = immediate, class:^(oers)$` and `general:allow_tearing = true`.
+   `windowrulev2 = immediate, class:^(kalila)$` and `general:allow_tearing = true`.
 
 ## First check on the rig (before an experiment)
 
 ```sh
-cargo run --release -p engine --example headless -- --hw --seconds 600 --record /tmp/oers-test
+cargo run --release -p engine --example headless -- --hw --seconds 600 --record /tmp/kalila-test
 ```
 
 It prints once per second. Expect `dropped=0 gaps=0 bad=0`, `hwbuf` near 0 %, and
-recorder back-pressure `bp=0ms`. Then open `/tmp/oers-test` with
+recorder back-pressure `bp=0ms`. Then open `/tmp/kalila-test` with
 `open_ephys.analysis.Session` and compare against a short recording from the stock GUI with
 the same headstages: channel count, µV scale, and TTL timing. The register command lists
 are verified byte-identical to Intan's C++, and the frame layout and init/scan sequence are
@@ -112,18 +114,19 @@ channel label to listen; Ctrl+click or Shift+click to add up to 8 channels.
 
 ## Config
 
-`~/.config/oers/config.json` (board, display, audio, spike, record root). Command line:
+`~/.config/kalila/config.json` (board, display, audio, spike, record root; on the first run it
+starts from a copy of `~/.config/oers/config.json` if there is one). Command line:
 `--sim`, `--acquire`.
 
 ## Desktop launcher
 
-`packaging/install-desktop.sh` adds oers to your application launcher (with a "simulated
+`packaging/install-desktop.sh` adds kalila to your application launcher (with a "simulated
 board" action). Run it again if you move the checkout. A desktop launch has no terminal, so
-the log goes to `~/.local/state/oers/oers.log`.
+the log goes to `~/.local/state/kalila/kalila.log`.
 
 ## What has been tested
 
-oers has run on **one rig** so far. Until it has run on others, make your first
+kalila has run on **one rig** so far. Until it has run on others, make your first
 recordings alongside the stock GUI (or compare a short recording from each with the same
 headstages), as below.
 

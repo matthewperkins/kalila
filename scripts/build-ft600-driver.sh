@@ -6,7 +6,7 @@
 #
 #   scripts/build-ft600-driver.sh /path/to/extracted/libftd3xx-linux-x86_64-*
 #
-# Installs to ~/.local/lib (found automatically by oers). Override with PREFIX=/usr/local.
+# Installs to ~/.local/lib (found automatically by kalila). Override with PREFIX=/usr/local.
 set -euo pipefail
 FTDI_DIR="${1:?usage: $0 <extracted FTDI D3XX directory>}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"

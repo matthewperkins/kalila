@@ -1,6 +1,6 @@
-# oers icon credits
+# kalila icon credits
 
-The oers icon (`oers-icon.svg` and the `oers-*.png` renders) is adapted from two drawings on
+The kalila icon (`kalila-icon.svg` and the `kalila-*.png` renders) is adapted from two drawings on
 Wikimedia Commons:
 
 - **Bastet** by Gunawan Kartapranata (Gunkarta),
@@ -20,4 +20,4 @@ red-orange); each iris and pupil redrawn over its trace. `make_icon.py` builds t
 the originals.
 
 **Licence of the icon:** [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
-This applies to the icon files only, not to the oers source code.
+This applies to the icon files only, not to the kalila source code.

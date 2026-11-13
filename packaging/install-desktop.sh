@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs an oers launcher into ~/.local/share/applications pointing at this checkout.
+# Installs an kalila launcher into ~/.local/share/applications pointing at this checkout.
 # Build first: cargo build --release
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -10,29 +10,29 @@ mkdir -p "$apps"
 icons=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor
 for sz in 32 48 64 128 256; do
     mkdir -p "$icons/${sz}x${sz}/apps"
-    cp "$root/packaging/icon/oers-$sz.png" "$icons/${sz}x${sz}/apps/oers.png"
+    cp "$root/packaging/icon/kalila-$sz.png" "$icons/${sz}x${sz}/apps/kalila.png"
 done
 # hyprtoolkit ignores theme dirs without an index.theme
 [ -f "$icons/index.theme" ] || cp /usr/share/icons/hicolor/index.theme "$icons/" 2>/dev/null || true
-# No scalable SVG: oers-icon.svg links src/*.svg by relative path, which breaks once copied.
+# No scalable SVG: kalila-icon.svg links src/*.svg by relative path, which breaks once copied.
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -qtf "$icons" || true
-cat >"$apps/oers.desktop" <<DESK
+cat >"$apps/kalila.desktop" <<DESK
 [Desktop Entry]
 Type=Application
-Name=oers
+Name=kalila
 GenericName=Open Ephys acquisition (Rust)
 Comment=Acquire and record from the Open Ephys ONI acquisition board
-Exec=$root/packaging/oers-launch.sh
-Icon=oers
+Exec=$root/packaging/kalila-launch.sh
+Icon=kalila
 Terminal=false
 Categories=Science;
-StartupWMClass=oers
+StartupWMClass=kalila
 StartupNotify=false
 Actions=Simulator;
 
 [Desktop Action Simulator]
-Name=oers (simulated board)
-Exec=$root/packaging/oers-launch.sh --sim
+Name=kalila (simulated board)
+Exec=$root/packaging/kalila-launch.sh --sim
 DESK
 command -v update-desktop-database >/dev/null && update-desktop-database -q "$apps" || true
-echo "installed $apps/oers.desktop"
+echo "installed $apps/kalila.desktop"

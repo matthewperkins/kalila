@@ -82,7 +82,7 @@ unsafe extern "C" {
     pub fn oni_version(major: *mut c_int, minor: *mut c_int, patch: *mut c_int);
     pub fn oni_get_driver_info(ctx: oni_ctx) -> *const oni_driver_info_t;
     pub fn oni_error_str(err: c_int) -> *const c_char;
-    /// oers patch to the vendored loader: directory tried before the default dlopen path.
+    /// kalila patch to the vendored loader: directory tried before the default dlopen path.
     pub fn oni_set_driver_search_dir(dir: *const c_char);
 }
 

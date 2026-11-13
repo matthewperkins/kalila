@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build the oers icon: Bastet and Sekhmet face to face, with two traces.
+"""Build the kalila icon: Bastet and Sekhmet face to face, with two traces.
 
-    python3 packaging/icon/make_icon.py        # writes oers-icon.svg and PNGs next to this file
+    python3 packaging/icon/make_icon.py        # writes kalila-icon.svg and PNGs next to this file
 
 Bastet (left, mirrored to face right) gives off a slow, gastric-like wave from her pupil, in
 her iris blue, running out to the right over Sekhmet's collar. Sekhmet (right) receives a
@@ -93,7 +93,7 @@ def build():
     burst = path(spike_trace(4, sx, sy))
     under = f'fill="none" stroke="{BG}" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"'
     return f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{TILE}" height="{TILE}" viewBox="0 0 {TILE} {TILE}">
-  <title>oers</title>
+  <title>kalila</title>
   <!-- Adapted from Bastet by Gunawan Kartapranata (CC BY-SA 3.0) and Sekhmet by Jeff Dahl
        (CC BY-SA 4.0), Wikimedia Commons; see ICON-CREDITS.md. This icon: CC BY-SA 4.0. -->
   <defs>
@@ -130,13 +130,13 @@ def build():
 
 
 def main():
-    svg = os.path.join(HERE, "oers-icon.svg")
+    svg = os.path.join(HERE, "kalila-icon.svg")
     with open(svg, "w") as f:
         f.write(build())
     for size in (256, 128, 64, 48, 32):
-        out = os.path.join(HERE, f"oers-{size}.png")
+        out = os.path.join(HERE, f"kalila-{size}.png")
         subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(size), svg, "-o", out], check=True, cwd=HERE)
-    print(f"wrote {svg} and oers-{{256,128,64,48,32}}.png")
+    print(f"wrote {svg} and kalila-{{256,128,64,48,32}}.png")
 
 
 if __name__ == "__main__":

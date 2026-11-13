@@ -1473,6 +1473,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kalila"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "chrono",
+ "crossbeam-channel",
+ "eframe",
+ "engine",
+ "env_logger",
+ "log",
+ "parking_lot",
+ "png",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,23 +2172,6 @@ dependencies = [
  "objc2 0.5.3",
  "objc2-core-location",
  "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "oers"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "chrono",
- "crossbeam-channel",
- "eframe",
- "engine",
- "env_logger",
- "log",
- "parking_lot",
- "png",
- "serde",
- "serde_json",
 ]
 
 [[package]]

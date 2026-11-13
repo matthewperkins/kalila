@@ -258,7 +258,7 @@ impl Engine {
         if self.rec_thread.as_ref().is_some_and(|h| h.is_finished()) {
             let _ = self.rec_thread.take().map(|h| h.join());
             error!("recorder thread ended");
-            self.last_error = Some("the recorder thread crashed: nothing more can be recorded in this session. Restart oers to record again.".into());
+            self.last_error = Some("the recorder thread crashed: nothing more can be recorded in this session. Restart kalila to record again.".into());
         }
     }
 
@@ -499,7 +499,7 @@ impl Engine {
 
     pub fn start_recording(&self) {
         if self.rec_thread.as_ref().is_none_or(|h| h.is_finished()) || self.rec_tx.send(RecMsg::Start).is_err() {
-            *self.rec_status.error.lock() = Some("cannot record: the recorder thread has crashed. Restart oers.".into());
+            *self.rec_status.error.lock() = Some("cannot record: the recorder thread has crashed. Restart kalila.".into());
         }
     }
     pub fn stop_recording(&self) {
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn stop_does_not_hang_on_a_silent_board() {
-        let root = std::env::temp_dir().join(format!("oers-hang-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kalila-hang-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut e = Engine::new(root.clone());
         e.audio_settings.lock().enabled = false;
@@ -802,7 +802,7 @@ mod tests {
     /// acquired after Stop, nor a later acquisition run's (whose sample numbers restart at 0).
     #[test]
     fn the_overview_stops_at_the_end_of_the_recording() {
-        let root = std::env::temp_dir().join(format!("oers-pyr-end-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kalila-pyr-end-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut e = Engine::new(root.clone());
         e.audio_settings.lock().enabled = false;
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn a_panic_in_acquisition_finalises_the_recording() {
-        let root = std::env::temp_dir().join(format!("oers-acq-panic-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kalila-acq-panic-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut e = Engine::new(root.clone());
         e.audio_settings.lock().enabled = false;

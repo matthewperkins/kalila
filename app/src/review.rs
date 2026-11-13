@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn reads_a_growing_recording_back() {
-        let dir = std::env::temp_dir().join(format!("oers-review-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kalila-review-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dat = dir.join("continuous.dat");
         // 3 channels, 10 samples: value = 100 * sample + channel.

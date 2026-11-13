@@ -449,11 +449,26 @@ impl Default for Config {
 }
 
 impl Config {
+    fn config_dir() -> PathBuf {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))).unwrap_or_else(|| PathBuf::from("."))
+    }
     pub fn path() -> PathBuf {
-        let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))).unwrap_or_else(|| PathBuf::from("."));
-        base.join("oers").join("config.json")
+        Self::config_dir().join("kalila").join("config.json")
+    }
+    /// The program was called oers until 2026-11-13: with no kalila config yet, start from a
+    /// copy of the oers one (left in place).
+    fn adopt_old_config() {
+        let (new, old) = (Self::path(), Self::config_dir().join("oers").join("config.json"));
+        if new.exists() || !old.exists() {
+            return;
+        }
+        match new.parent().map(std::fs::create_dir_all).transpose().and_then(|_| std::fs::copy(&old, &new)) {
+            Ok(_) => log::info!("copied the settings from {} (the program's former name) to {}", old.display(), new.display()),
+            Err(e) => log::warn!("could not copy the settings from {}: {e}", old.display()),
+        }
     }
     pub fn load() -> Self {
+        Self::adopt_old_config();
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => Self::parse(&s).unwrap_or_else(|e| {
                 // Keep the file: saving the defaults over it would lose every setting (16-ch

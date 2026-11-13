@@ -1,4 +1,4 @@
-//! oers — Open Ephys acquisition GUI in Rust (egui + wgpu/Vulkan).
+//! kalila — Open Ephys acquisition GUI in Rust (egui + wgpu/Vulkan).
 
 mod app;
 mod config;
@@ -18,7 +18,7 @@ fn main() -> eframe::Result {
     let mut cfg = config::Config::load();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("oers [--sim] [--acquire]\n  --sim      open the simulated board instead of hardware\n  --acquire  start acquiring as soon as the board is open\nConfig: {}", config::Config::path().display());
+        println!("kalila [--sim] [--acquire]\n  --sim      open the simulated board instead of hardware\n  --acquire  start acquiring as soon as the board is open\nConfig: {}", config::Config::path().display());
         return Ok(());
     }
     if args.iter().any(|a| a == "--sim") {
@@ -41,14 +41,14 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         viewport: {
-            let v = eframe::egui::ViewportBuilder::default().with_title("oers — Open Ephys acquisition").with_app_id("oers").with_inner_size([1600.0, 1000.0]);
+            let v = eframe::egui::ViewportBuilder::default().with_title("kalila — Open Ephys acquisition").with_app_id("kalila").with_inner_size([1600.0, 1000.0]);
             // Window icon: Bastet and Sekhmet (packaging/icon; credits in ICON-CREDITS.md).
-            match eframe::icon_data::from_png_bytes(include_bytes!("../../packaging/icon/oers-128.png")) {
+            match eframe::icon_data::from_png_bytes(include_bytes!("../../packaging/icon/kalila-128.png")) {
                 Ok(icon) => v.with_icon(std::sync::Arc::new(icon)),
                 Err(_) => v,
             }
         },
         ..Default::default()
     };
-    eframe::run_native("oers", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg, autostart)))))
+    eframe::run_native("kalila", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg, autostart)))))
 }

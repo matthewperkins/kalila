@@ -1,6 +1,6 @@
 //! Typed, sample-stamped notes (Open Ephys MessageCenter text events in the recording).
 //!
-//! Works in any oers window while no text box has focus; never needs the mouse.
+//! Works in any kalila window while no text box has focus; never needs the mouse.
 //! - `/` opens a note stamped at that sample. Every key then goes into the note, so no
 //!   shortcut fires. Enter or `\` saves it, Esc cancels it.
 //! - `` ` `` stamps the next prepared draft (drafts are written ahead in the Notes panel).
