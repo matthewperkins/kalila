@@ -29,7 +29,6 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use rhythm::{Block, ChannelKind, StreamLayout};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -617,12 +616,15 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
             },
         };
         let n = (c1 - c0 + lead) as usize;
-        let mut data = vec![0i16; n * nch];
-        if let Err(e) = f.read_exact_at(bytemuck::cast_slice_mut(&mut data), (c0 - lead) * nch as u64 * 2) {
-            log::warn!("pyramid backfill: reading {}: {e}", src.dat.display());
-            std::thread::sleep(Duration::from_secs(5));
-            continue;
-        }
+        // Pyramid positions are sample numbers from the start (not file offsets: see gaps).
+        let data = match src.read(f, src.first_sample + (c0 - lead) as i64, n) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("pyramid backfill: reading {}: {e}", src.dat.display());
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
         // Filter before taking the lock, as the live path does: every GUI frame takes it, and
         // this thread runs at idle priority (a chunk with a long lead-in filters for 0.1 s+).
         let band_nchp = view.and_then(|v| bands.iter().find(|(bv, _)| *bv == v)).map(|(_, bl)| {
@@ -662,7 +664,7 @@ pub fn available_samples(src: &RecSource) -> u64 {
 }
 
 fn available(src: &RecSource) -> u64 {
-    std::fs::metadata(&src.dat).map(|m| m.len() / (2 * src.nch.max(1) as u64)).unwrap_or(0)
+    src.available()
 }
 
 /// The channels of a band pyramid for a window: the electrodes of its headstages.

@@ -149,6 +149,11 @@ struct Recording {
     /// (first sample, its timestamp) of the latest block: messages are timestamped from it.
     clock: Option<(i64, f64)>,
     first_sample: Option<i64>,
+    /// Samples written to the main stream, and the sample number the next block should have.
+    written: u64,
+    next: Option<i64>,
+    /// See `RecSource::gaps`.
+    gaps: Vec<(i64, u64)>,
     last_header_update: Instant,
     oebin: serde_json::Value,
     dat_path: PathBuf,
@@ -158,7 +163,7 @@ struct Recording {
 impl Recording {
     /// Read-back description, once the first sample is known.
     fn source(&self) -> Option<RecSource> {
-        Some(RecSource { dat: self.dat_path.clone(), ttl_dir: self.ttl_dir.clone(), nch: self.main.channels, first_sample: self.first_sample?, sample_rate: self.layout.sample_rate })
+        Some(RecSource { dat: self.dat_path.clone(), ttl_dir: self.ttl_dir.clone(), nch: self.main.channels, first_sample: self.first_sample?, sample_rate: self.layout.sample_rate, gaps: Arc::new(self.gaps.clone()) })
     }
 }
 
@@ -201,7 +206,7 @@ impl Recording {
             timestamps: NpyFile::create(&md.join("timestamps.npy"), "<f8")?,
             keys: None,
         };
-        let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, messages, clock: None, first_sample: None, last_header_update: Instant::now(), oebin: json!({}), dat_path, ttl_dir: ed };
+        let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, messages, clock: None, first_sample: None, written: 0, next: None, gaps: Vec::new(), last_header_update: Instant::now(), oebin: json!({}), dat_path, ttl_dir: ed };
         r.oebin = r.build_oebin();
         fs::write(dir.join("structure.oebin"), serde_json::to_string_pretty(&r.oebin)?)?;
         Ok(r)
@@ -275,6 +280,12 @@ impl Recording {
             if let Some(&t0) = b.timestamps.first() {
                 self.clock = Some((b.first_sample, t0));
             }
+            // continuous.dat has no holes: after a gap, record where the file picks up again.
+            if self.next.is_some_and(|n| n != b.first_sample) {
+                self.gaps.push((b.first_sample, self.written));
+            }
+            self.written += b.len() as u64;
+            self.next = Some(b.first_sample + b.len() as i64);
             let bytes = unsafe { std::slice::from_raw_parts(b.data.as_ptr() as *const u8, b.data.len() * 2) };
             self.main.dat.write_all(bytes)?;
             let m = &mut self.main;
@@ -429,6 +440,53 @@ pub struct RecSource {
     pub nch: usize,
     pub first_sample: i64,
     pub sample_rate: f64,
+    /// The file has no holes, so after a gap in the sample numbers (dropped samples) file
+    /// index ≠ sample − `first_sample`. Each entry is (sample number, file index) of a block
+    /// that didn't follow on from the one before, oldest first; empty without gaps.
+    pub gaps: Arc<Vec<(i64, u64)>>,
+}
+
+impl RecSource {
+    /// Contiguous stretches: (first sample number, file index, length in samples), for a
+    /// file holding `file_len` samples.
+    fn runs(&self, file_len: u64) -> impl Iterator<Item = (i64, u64, u64)> + '_ {
+        let starts: Vec<(i64, u64)> = std::iter::once((self.first_sample, 0)).chain(self.gaps.iter().copied().filter(|&(_, f)| f < file_len)).collect();
+        (0..starts.len()).map(move |k| {
+            let (s, f) = starts[k];
+            let to = starts.get(k + 1).map_or(file_len, |&(_, f1)| f1);
+            (s, f, to.saturating_sub(f))
+        })
+    }
+
+    /// One past the last sample number in a file holding `file_len` samples.
+    pub fn end_sample(&self, file_len: u64) -> i64 {
+        self.runs(file_len).last().map_or(self.first_sample, |(s, _, n)| s + n as i64)
+    }
+
+    /// Samples in the file now, as a span of sample numbers from `first_sample` (dropped
+    /// samples included, so it lines up with sample numbers).
+    pub fn available(&self) -> u64 {
+        let len = fs::metadata(&self.dat).map(|m| m.len() / (2 * self.nch.max(1) as u64)).unwrap_or(0);
+        (self.end_sample(len) - self.first_sample) as u64
+    }
+
+    /// Samples `s0 .. s0 + n` (sample numbers) of `f`, the recording's continuous.dat, as
+    /// `n × nch` int16. Dropped samples, and anything past the end of the file, read as 0.
+    pub fn read(&self, f: &File, s0: i64, n: usize) -> std::io::Result<Vec<i16>> {
+        use std::os::unix::fs::FileExt;
+        let nch = self.nch.max(1);
+        let len = f.metadata()?.len() / (2 * nch as u64);
+        let mut data = vec![0i16; n * nch];
+        let s1 = s0 + n as i64;
+        for (s, fi, m) in self.runs(len) {
+            let (a, b) = (s.max(s0), (s + m as i64).min(s1));
+            if a < b {
+                let out = &mut data[(a - s0) as usize * nch..(b - s0) as usize * nch];
+                f.read_exact_at(bytemuck::cast_slice_mut(out), (fi + (a - s) as u64) * nch as u64 * 2)?;
+            }
+        }
+        Ok(data)
+    }
 }
 
 /// Whether the next recording starts a new date-time session directory: the first recording,
@@ -476,7 +534,7 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                         fail(&status, e);
                         rec = None;
                     } else {
-                        if status.source.lock().as_ref().is_none_or(|s| s.dat != r.dat_path) {
+                        if status.source.lock().as_ref().is_none_or(|s| s.dat != r.dat_path || s.gaps.len() != r.gaps.len()) {
                             *status.source.lock() = r.source();
                         }
                         status.bytes.fetch_add(b.data.len() as u64 * 2, Ordering::Relaxed);
@@ -593,6 +651,55 @@ mod tests {
         assert_eq!(r.len(), 513);
         assert_eq!(std::str::from_utf8(&r[..512]).unwrap(), "é".repeat(256));
         assert_eq!(r[512], 0);
+    }
+
+    /// After dropped samples the file skips ahead; reading back by sample number must
+    /// put every sample at its own number (review and the overview depend on it).
+    #[test]
+    fn reads_back_by_sample_number_across_gaps() {
+        let root = std::env::temp_dir().join(format!("oers-rec-gap-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let layout = StreamLayout {
+            name: "acquisition_board".into(),
+            sample_rate: 30000.0,
+            channels: (0..2).map(|i| ChannelInfo { name: format!("CH{}", i + 1), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }).collect(),
+            headstages: vec![],
+            ttl_lines: 8,
+            side_streams: vec![],
+            hw_clock_hz: 0.0,
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let st = Arc::new(RecStatus::default());
+        *st.root.lock() = root.clone();
+        let st2 = st.clone();
+        let h = std::thread::spawn(move || run_recorder(rx, st2));
+        tx.send(RecMsg::AcquisitionStarted(layout)).unwrap();
+        tx.send(RecMsg::Start).unwrap();
+        // Blocks at 1000, 1032, then a gap to 1200, 1232, then a gap to 1300.
+        for first in [1000i64, 1032, 1200, 1232, 1300] {
+            let mut b = Block::with_capacity(2, 32);
+            b.first_sample = first;
+            for s in first..first + 32 {
+                b.data.extend([s as i16, -(s as i16)]);
+                b.timestamps.push(s as f64 / 30000.0);
+                b.ttl.push(0);
+            }
+            tx.send(RecMsg::Data(Arc::new(b))).unwrap();
+        }
+        tx.send(RecMsg::Stop).unwrap();
+        tx.send(RecMsg::Shutdown).unwrap();
+        h.join().unwrap();
+        let src = st.source.lock().clone().unwrap();
+        assert_eq!(*src.gaps, vec![(1200, 64), (1300, 128)]);
+        assert_eq!(src.available(), 332, "the span runs to sample 1332");
+        let f = File::open(&src.dat).unwrap();
+        let data = src.read(&f, 1050, 300).unwrap();
+        for (i, s) in (1050i64..1350).enumerate() {
+            let present = (1000..1064).contains(&s) || (1200..1264).contains(&s) || (1300..1332).contains(&s);
+            let want = if present { [s as i16, -(s as i16)] } else { [0, 0] };
+            assert_eq!([data[2 * i], data[2 * i + 1]], want, "sample {s}");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -153,6 +153,12 @@ Committed per feature where the code separates; the GUI features share one commi
   the live edge is the file's end (`live_end = available`), so blocks taken between Stop
   and the recorder acting on it fall outside it. Test
   `the_overview_stops_at_the_end_of_the_recording` (after Stop, and after a restart).
+- **Review reads by sample number, across gaps.** `continuous.dat` has no holes, so after
+  dropped samples file index ≠ sample − first. The recorder publishes each restart point in
+  `RecSource::gaps` (sample number, file index); `RecSource::read` (review reader and pyramid
+  backfill) and `RecSource::available` (the span in sample numbers) map through it, and
+  dropped samples read as 0 (a flat stretch). Test `reads_back_by_sample_number_across_gaps`.
+  The simulator can't drop samples, so on the GUI this was only checked without gaps.
 - **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
   under it (every GUI frame takes that lock, and the builder runs at idle priority).
 

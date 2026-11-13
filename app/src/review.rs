@@ -70,9 +70,11 @@ impl Reader {
     }
 }
 
-/// Samples of the main stream readable so far (the recorder flushes about once a second).
+/// Samples of the main stream readable so far (the recorder flushes about once a second), as
+/// a span of sample numbers from `first_sample`: dropped samples count, so it lines up with
+/// sample numbers, TTL edges and notes.
 pub fn available(src: &RecSource) -> i64 {
-    std::fs::metadata(&src.dat).map(|m| (m.len() / (2 * src.nch.max(1) as u64)) as i64).unwrap_or(0)
+    src.available() as i64
 }
 
 fn serve(r: &Req, files: &mut HashMap<PathBuf, File>, ttl: &mut TtlEdges) -> Resp {
@@ -87,13 +89,11 @@ fn serve(r: &Req, files: &mut HashMap<PathBuf, File>, ttl: &mut TtlEdges) -> Res
                 &files[&r.src.dat]
             }
         };
-        let avail = (f.metadata()?.len() / (2 * nch as u64)) as i64;
+        let avail = r.src.end_sample(f.metadata()?.len() / (2 * nch as u64)) - r.src.first_sample;
         let start = (r.from - r.src.first_sample).clamp(0, avail);
         let end = (r.from - r.src.first_sample + r.n as i64).clamp(start, avail);
-        let n = (end - start) as usize;
-        // Read straight into the sample buffer (the file is little-endian, as the host).
-        let mut data = vec![0i16; n * nch];
-        f.read_exact_at(bytemuck::cast_slice_mut(&mut data), start as u64 * nch as u64 * 2)?;
+        // By sample number: across a gap the file skips ahead, and dropped samples read as 0.
+        let data = r.src.read(f, r.src.first_sample + start, (end - start) as usize)?;
         Ok((r.src.first_sample + start, data))
     };
     match read() {
@@ -366,7 +366,7 @@ mod tests {
         // 3 channels, 10 samples: value = 100 * sample + channel.
         let v: Vec<u8> = (0..10i16).flat_map(|s| (0..3i16).flat_map(move |c| (100 * s + c).to_le_bytes())).collect();
         std::fs::write(&dat, &v).unwrap();
-        let src = RecSource { dat, ttl_dir: dir.clone(), nch: 3, first_sample: 1000, sample_rate: 30000.0 };
+        let src = RecSource { dat, ttl_dir: dir.clone(), nch: 3, first_sample: 1000, sample_rate: 30000.0, gaps: Default::default() };
         assert_eq!(available(&src), 10);
         let (mut files, mut ttl) = (HashMap::new(), TtlEdges::default());
         // Asks for 1005..1020: only 1005..1010 exist.
