@@ -159,6 +159,20 @@ Committed per feature where the code separates; the GUI features share one commi
   backfill) and `RecSource::available` (the span in sample numbers) map through it, and
   dropped samples read as 0 (a flat stretch). Test `reads_back_by_sample_number_across_gaps`.
   The simulator can't drop samples, so on the GUI this was only checked without gaps.
+- **Recorder hardening (group 1 of the reviews).**
+  - Files are created with `create_new`, so an existing recording is never truncated;
+    session folders get `_2`, `_3` within one second, and a taken `recordingN` is skipped.
+  - Changing the root directory starts a new session there (it used to take effect only
+    at the next session).
+  - `write_block` refuses a malformed block (values ≠ samples × channels, TTL count) or one
+    behind the last written: the recording stops with a REC ERROR. After any write error the
+    recording is finished file by file (`finish` keeps going past errors, syncs data first,
+    writes `structure.oebin` last).
+  - The parser skips a frame whose counter repeats or goes backwards (a bad frame; it used
+    to count ~4.3e9 lost samples and shift later sample numbers by 2^32). After 3000 such
+    frames in a row the counter is taken to have restarted (`RESYNC_AFTER`).
+  - A config that fails to parse is renamed `config.json.bad-<time>`, and the error bar
+    says so (the defaults used to be saved over it).
 - **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
   under it (every GUI frame takes that lock, and the builder runs at idle priority).
 

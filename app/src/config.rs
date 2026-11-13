@@ -364,6 +364,9 @@ pub struct Config {
     /// ("A1:5"). When the layout changes, those settings are moved to follow their
     /// electrodes (`ElectrodeMap`). Empty in configs from before 2026-11-13.
     pub electrode_keys: Vec<String>,
+    /// Set by `load` when the file couldn't be read as a config (shown in the GUI).
+    #[serde(skip)]
+    pub load_error: Option<String>,
 }
 
 /// Keys ("A1:5": headstage name and index within it) of a layout's electrodes, by global
@@ -440,6 +443,7 @@ impl Default for Config {
             sim_headstages: vec![32, 32],
             review_ram_gb: engine::pyramid::DEFAULT_BUDGET as f32 / 1e9,
             electrode_keys: Vec::new(),
+            load_error: None,
         }
     }
 }
@@ -452,8 +456,17 @@ impl Config {
     pub fn load() -> Self {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => Self::parse(&s).unwrap_or_else(|e| {
-                log::warn!("config parse error ({e}); using defaults");
-                Self::default()
+                // Keep the file: saving the defaults over it would lose every setting (16-ch
+                // mode, DAC routes, …) for good.
+                let path = Self::path();
+                let bad = path.with_extension(format!("json.bad-{}", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")));
+                let kept = match std::fs::rename(&path, &bad) {
+                    Ok(()) => format!("it was kept as {}", bad.display()),
+                    Err(re) => format!("it could not be set aside ({re})"),
+                };
+                let msg = format!("The config file {} could not be read ({e}); using defaults, and {kept}. Check the board settings before recording.", path.display());
+                log::error!("{msg}");
+                Self { load_error: Some(msg), ..Self::default() }
             }),
             Err(_) => Self::default(),
         }

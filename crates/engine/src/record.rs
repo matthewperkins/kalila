@@ -47,9 +47,21 @@ struct NpyFile {
     path: PathBuf,
 }
 
+/// A new file; never truncates one that exists (an earlier recording's).
+fn create_new(path: &Path) -> Result<File> {
+    fs::OpenOptions::new().write(true).create_new(true).open(path).with_context(|| format!("creating {}", path.display()))
+}
+
+/// Keeps the first error and carries on, so every file that can be finished is.
+fn keep_first(first: &mut Option<anyhow::Error>, r: Result<()>) {
+    if let Err(e) = r {
+        first.get_or_insert(e);
+    }
+}
+
 impl NpyFile {
     fn create(path: &Path, descr: &'static str) -> Result<Self> {
-        let f = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let f = create_new(path)?;
         let mut n = Self { w: BufWriter::with_capacity(1 << 16, f), descr, count: 0, header_len: 0, path: path.to_owned() };
         let h = n.header();
         n.header_len = h.len() as u64;
@@ -178,7 +190,7 @@ impl Recording {
             let d = cont.join(stream_folder(name));
             fs::create_dir_all(&d)?;
             Ok(StreamFiles {
-                dat: BufWriter::with_capacity(8 << 20, File::create(d.join("continuous.dat"))?),
+                dat: BufWriter::with_capacity(8 << 20, create_new(&d.join("continuous.dat"))?),
                 samples: NpyFile::create(&d.join("sample_numbers.npy"), "<i8")?,
                 timestamps: NpyFile::create(&d.join("timestamps.npy"), "<f8")?,
                 tmp_i64: Vec::new(),
@@ -267,6 +279,17 @@ impl Recording {
         if b.num_channels != self.main.channels {
             bail!("channel count changed during recording ({} -> {})", self.main.channels, b.num_channels);
         }
+        // A malformed block would shift every channel of continuous.dat from here on, and a
+        // block behind the last would make sample_numbers.npy go backwards: stop recording
+        // (loudly, with every file finished) rather than write either.
+        if b.data.len() != b.len() * b.num_channels || b.ttl.len() != b.len() {
+            bail!("malformed block at sample {}: {} samples, {} values for {} channels, {} TTL words", b.first_sample, b.len(), b.data.len(), b.num_channels, b.ttl.len());
+        }
+        if let Some(n) = self.next
+            && b.first_sample < n
+        {
+            bail!("block at sample {} is behind the last one written (next was {n})", b.first_sample);
+        }
         if !b.is_empty() {
             if self.first_sample.is_none() {
                 self.first_sample = Some(b.first_sample);
@@ -348,7 +371,7 @@ impl Recording {
         self.messages.timestamps.write(&[ts])?;
         if !keys.is_empty() {
             if self.messages.keys.is_none() {
-                let mut w = BufWriter::new(File::create(self.dir.join("note_keystrokes.tsv"))?);
+                let mut w = BufWriter::new(create_new(&self.dir.join("note_keystrokes.tsv"))?);
                 writeln!(w, "note_sample\tkey_sample\tkey")?;
                 self.messages.keys = Some(w);
             }
@@ -378,28 +401,34 @@ impl Recording {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
-        self.oebin = self.build_oebin(); // initial TTL state is known now
-        fs::write(self.dir.join("structure.oebin"), serde_json::to_string_pretty(&self.oebin)?)?;
+    /// Flush, sync and close every file, then write the final metadata. Also used after a
+    /// write error: each file is finished on its own, so one failing file doesn't leave the
+    /// others with stale headers. Returns the first error.
+    fn finish(self) -> Result<()> {
+        // The initial TTL state is known now; written last, once the data is on disk.
+        let oebin = self.build_oebin();
+        let oebin_path = self.dir.join("structure.oebin");
+        let mut first = None;
         for f in std::iter::once(self.main).chain(self.side) {
             let mut dat = f.dat;
-            dat.flush()?;
-            dat.get_ref().sync_all()?;
-            f.samples.finish()?;
-            f.timestamps.finish()?;
+            keep_first(&mut first, dat.flush().map_err(Into::into));
+            keep_first(&mut first, dat.get_ref().sync_all().map_err(Into::into));
+            keep_first(&mut first, f.samples.finish());
+            keep_first(&mut first, f.timestamps.finish());
         }
         let t = self.ttl;
         for n in [t.states, t.samples, t.timestamps, t.words] {
-            n.finish()?;
+            keep_first(&mut first, n.finish());
         }
         let m = self.messages;
         for n in [m.text, m.samples, m.timestamps] {
-            n.finish()?;
+            keep_first(&mut first, n.finish());
         }
         if let Some(mut k) = m.keys {
-            k.flush()?;
+            keep_first(&mut first, k.flush().map_err(Into::into));
         }
-        Ok(())
+        keep_first(&mut first, serde_json::to_string_pretty(&oebin).map_err(Into::into).and_then(|j| fs::write(oebin_path, j).map_err(Into::into)));
+        first.map_or(Ok(()), Err)
     }
 }
 
@@ -512,10 +541,17 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
     let mut layout: Option<StreamLayout> = None;
     let mut session: Option<PathBuf> = None;
     let mut session_date: Option<chrono::NaiveDate> = None;
+    let mut session_root: Option<PathBuf> = None;
     let mut experiment = 0u32;
     let mut recording_idx = 0u32;
     let mut acq_run_seen = false;
     let mut rec: Option<Recording> = None;
+    // After a write error: finish what can be finished (the error is already reported).
+    let abandon = |r: Option<Recording>| {
+        if let Some(Err(e)) = r.map(Recording::finish) {
+            error!("finishing the recording after the error: {e:#}");
+        }
+    };
     let fail = |status: &RecStatus, e: anyhow::Error| {
         error!("recording error: {e:#}");
         *status.error.lock() = Some(format!("{e:#}"));
@@ -532,7 +568,7 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                 if let Some(r) = rec.as_mut() {
                     if let Err(e) = r.write_block(&b) {
                         fail(&status, e);
-                        rec = None;
+                        abandon(rec.take());
                     } else {
                         if status.source.lock().as_ref().is_none_or(|s| s.dat != r.dat_path || s.gaps.len() != r.gaps.len()) {
                             *status.source.lock() = r.source();
@@ -565,10 +601,15 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                 };
                 let now = chrono::Local::now();
                 let forced = status.new_session.swap(false, Ordering::SeqCst);
-                if needs_new_session(session_date, now.date_naive(), forced) {
-                    let name = now.format("%Y-%m-%d_%H-%M-%S").to_string();
+                let root = status.root.lock().clone();
+                // A changed root directory (say, the next animal) also starts a new session.
+                if needs_new_session(session_date, now.date_naive(), forced) || session_root.as_ref() != Some(&root) {
+                    // Never reuse a session folder (two sessions within one second).
+                    let stem = now.format("%Y-%m-%d_%H-%M-%S").to_string();
+                    let name = (1..).map(|k| if k == 1 { stem.clone() } else { format!("{stem}_{k}") }).find(|n| !root.join(n).exists()).unwrap();
                     session_date = Some(now.date_naive());
-                    session = Some(status.root.lock().join(name).join(format!("Record Node {RECORD_NODE_ID}")));
+                    session = Some(root.join(name).join(format!("Record Node {RECORD_NODE_ID}")));
+                    session_root = Some(root);
                     experiment = 0;
                     acq_run_seen = true;
                 }
@@ -578,7 +619,12 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                     acq_run_seen = false;
                 }
                 recording_idx += 1;
-                let dir = session.as_ref().unwrap().join(format!("experiment{experiment}")).join(format!("recording{recording_idx}"));
+                let rec_dir = |i: u32| session.as_ref().unwrap().join(format!("experiment{experiment}")).join(format!("recording{i}"));
+                // Never into an existing recording folder (its files would be refused anyway).
+                while rec_dir(recording_idx).exists() {
+                    recording_idx += 1;
+                }
+                let dir = rec_dir(recording_idx);
                 match fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| Recording::open(&dir, &l)) {
                     Ok(r) => {
                         info!("recording to {}", dir.display());
@@ -606,7 +652,7 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                     && let Err(e) = r.write_message(sample, &text, &keys)
                 {
                     fail(&status, e);
-                    rec = None;
+                    abandon(rec.take());
                 }
             }
             RecMsg::Shutdown => {
@@ -699,6 +745,103 @@ mod tests {
             let want = if present { [s as i16, -(s as i16)] } else { [0, 0] };
             assert_eq!([data[2 * i], data[2 * i + 1]], want, "sample {s}");
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_malformed_block_stops_the_recording_loudly() {
+        let root = std::env::temp_dir().join(format!("oers-rec-bad-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let layout = StreamLayout {
+            name: "acquisition_board".into(),
+            sample_rate: 30000.0,
+            channels: (0..2).map(|i| ChannelInfo { name: format!("CH{}", i + 1), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }).collect(),
+            headstages: vec![],
+            ttl_lines: 8,
+            side_streams: vec![],
+            hw_clock_hz: 0.0,
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let st = Arc::new(RecStatus::default());
+        *st.root.lock() = root.clone();
+        let st2 = st.clone();
+        let h = std::thread::spawn(move || run_recorder(rx, st2));
+        tx.send(RecMsg::AcquisitionStarted(layout)).unwrap();
+        tx.send(RecMsg::Start).unwrap();
+        let block = |first: i64, short: bool| {
+            let mut b = Block::with_capacity(2, 32);
+            b.first_sample = first;
+            for s in first..first + 32 {
+                b.data.extend([s as i16, 0]);
+                b.timestamps.push(0.0);
+                b.ttl.push(0);
+            }
+            if short {
+                b.data.pop();
+            }
+            Arc::new(b)
+        };
+        tx.send(RecMsg::Data(block(0, false))).unwrap();
+        tx.send(RecMsg::Data(block(32, true))).unwrap();
+        tx.send(RecMsg::Data(block(64, false))).unwrap();
+        tx.send(RecMsg::Shutdown).unwrap();
+        h.join().unwrap();
+        assert!(st.error.lock().as_deref().is_some_and(|e| e.contains("malformed block at sample 32")), "{:?}", st.error.lock());
+        assert!(!st.recording.load(Ordering::SeqCst));
+        // Finished up to the good block: the npy header says 32 samples, the file holds them.
+        let dir = st.current_dir.lock().clone().unwrap();
+        let cont = fs::read_dir(dir.join("continuous")).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(fs::metadata(cont.join("continuous.dat")).unwrap().len(), 32 * 2 * 2);
+        let (hdr, body) = read_npy(&cont.join("sample_numbers.npy"));
+        assert!(hdr.contains("(32,)"), "{hdr}");
+        assert_eq!(body.len(), 32 * 8);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_session_in_the_same_second_never_reuses_a_folder() {
+        let root = std::env::temp_dir().join(format!("oers-rec-collide-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let layout = StreamLayout { name: "acquisition_board".into(), sample_rate: 30000.0, channels: vec![ChannelInfo { name: "CH1".into(), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }], headstages: vec![], ttl_lines: 8, side_streams: vec![], hw_clock_hz: 0.0 };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let st = Arc::new(RecStatus::default());
+        *st.root.lock() = root.clone();
+        let st2 = st.clone();
+        let h = std::thread::spawn(move || run_recorder(rx, st2));
+        tx.send(RecMsg::AcquisitionStarted(layout)).unwrap();
+        let mut dirs = Vec::new();
+        for _ in 0..3 {
+            // "New session directory" each time, well within one second.
+            st.new_session.store(true, Ordering::SeqCst);
+            tx.send(RecMsg::Start).unwrap();
+            let mut b = Block::with_capacity(1, 1);
+            b.data.push(7);
+            b.timestamps.push(0.0);
+            b.ttl.push(0);
+            tx.send(RecMsg::Data(Arc::new(b))).unwrap();
+            tx.send(RecMsg::Stop).unwrap();
+            let t = Instant::now();
+            while st.current_dir.lock().as_ref() == dirs.last() || st.recording.load(Ordering::SeqCst) {
+                assert!(t.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            dirs.push(st.current_dir.lock().clone().unwrap());
+        }
+        // A changed root starts a new session there.
+        let root2 = root.join("animal2");
+        *st.root.lock() = root2.clone();
+        tx.send(RecMsg::Start).unwrap();
+        tx.send(RecMsg::Stop).unwrap();
+        tx.send(RecMsg::Shutdown).unwrap();
+        h.join().unwrap();
+        assert!(st.error.lock().is_none(), "{:?}", st.error.lock());
+        dirs.sort();
+        dirs.dedup();
+        assert_eq!(dirs.len(), 3, "{dirs:?}");
+        for d in &dirs {
+            assert!(d.join("structure.oebin").exists());
+        }
+        assert!(st.current_dir.lock().as_ref().unwrap().starts_with(&root2));
         let _ = fs::remove_dir_all(&root);
     }
 

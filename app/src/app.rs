@@ -128,6 +128,9 @@ impl App {
         engine.pyramids.lock().budget = (cfg.review_ram_gb.max(0.1) as f64 * 1e9) as usize;
         let choice = if cfg.open_hardware_on_start { BoardChoice::Hardware } else { BoardChoice::Simulated(cfg.sim_headstages.clone()) };
         engine.open_board(choice, cfg.board.clone());
+        if cfg.load_error.is_some() {
+            engine.last_error = cfg.load_error.clone();
+        }
         let audio_text = channels_to_text(&cfg.audio.channels);
         let shared = Arc::new(parking_lot::Mutex::new(ViewsShared::new(cfg.views.clone(), engine.audio_settings.clone(), engine.audio_stats.clone(), engine.dsp_settings.clone(), engine.channel_stats.clone(), engine.pyramids.clone())));
         shared.lock().notes = crate::notes::Notes::new(&cfg.notes);

@@ -33,7 +33,13 @@ pub struct RhythmParser {
     aux_hold: Vec<i16>,
     last_counter: Option<u32>,
     counter_hi: i64,
+    /// Consecutive frames rejected for a repeated or backwards counter.
+    behind: u32,
 }
+
+/// After this many consecutive frames with a counter behind the last one, the counter is taken
+/// to have restarted (0.1 s at 30 kHz): sample numbers carry on from the last one.
+const RESYNC_AFTER: u32 = 3000;
 
 pub enum ParseResult {
     /// Sample appended to the block.
@@ -81,7 +87,23 @@ impl RhythmParser {
             return ParseResult::Bad;
         }
         let counter = u32::from_le_bytes(d[8..12].try_into().unwrap());
-        let delta = self.last_counter.map(|last| counter.wrapping_sub(last));
+        let mut delta = self.last_counter.map(|last| counter.wrapping_sub(last));
+        // A repeated or backwards counter (a forward jump of over 2^31 samples, 20 h at 30 kHz,
+        // can't be a real gap): a duplicated or stale frame. Skip it as a bad frame; taken as
+        // a gap it would add ~4.3e9 to "lost" and shift every later sample number by 2^32.
+        if let Some(dl) = delta
+            && (dl == 0 || dl > 1 << 31)
+        {
+            if self.behind < RESYNC_AFTER {
+                self.behind += 1;
+                health.bad_frames.fetch_add(1, Ordering::Relaxed);
+                return ParseResult::Bad;
+            }
+            // Still behind after RESYNC_AFTER frames: the counter restarted. Carry on from
+            // the next sample number (a counted discontinuity, nothing dropped).
+            delta = Some(1);
+            health.discontinuities.fetch_add(1, Ordering::Relaxed);
+        }
         let sample_number = match delta {
             None => 0,
             Some(dl) => self.counter_hi + dl as i64,
@@ -95,6 +117,7 @@ impl RhythmParser {
             health.discontinuities.fetch_add(1, Ordering::Relaxed);
             health.dropped_samples.fetch_add(dl.wrapping_sub(1) as u64, Ordering::Relaxed);
         }
+        self.behind = 0;
         self.last_counter = Some(counter);
         self.counter_hi = sample_number;
         if blk.is_empty() {
@@ -260,6 +283,33 @@ mod tests {
         assert!(matches!(p.parse(&f(u32::MAX), 0.0, &mut b, &h), ParseResult::Appended));
         assert!(matches!(p.parse(&f(0), 0.0, &mut b, &h), ParseResult::Appended));
         assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn skips_repeated_or_backwards_counters_and_resyncs_after_a_restart() {
+        let mut p = RhythmParser::new(vec![32], vec![1], false, false, false);
+        let h = Health::default();
+        let mut b = Block::default();
+        let f = |c| encode_payload(1, c, |_, _| 0, |_, _| 32768, [0; 8], 0);
+        for c in [1_000_000, 1_000_001] {
+            assert!(matches!(p.parse(&f(c), 0.0, &mut b, &h), ParseResult::Appended));
+        }
+        // A duplicate and a stale frame: skipped, nothing counted as lost.
+        assert!(matches!(p.parse(&f(1_000_001), 0.0, &mut b, &h), ParseResult::Bad));
+        assert!(matches!(p.parse(&f(999_990), 0.0, &mut b, &h), ParseResult::Bad));
+        assert!(matches!(p.parse(&f(1_000_002), 0.0, &mut b, &h), ParseResult::Appended));
+        assert_eq!((h.dropped_samples.load(Ordering::Relaxed), h.bad_frames.load(Ordering::Relaxed)), (0, 2));
+        assert_eq!((b.first_sample, b.len()), (0, 3));
+        // The counter restarts at 0 for good: after RESYNC_AFTER skipped frames, sample
+        // numbers carry on from the last one.
+        let mut c = 0;
+        while matches!(p.parse(&f(c), 0.0, &mut b, &h), ParseResult::Bad) {
+            c += 1;
+        }
+        assert_eq!(c, RESYNC_AFTER);
+        assert_eq!((b.first_sample, b.len()), (0, 4), "the restarted frame is sample 3");
+        assert!(matches!(p.parse(&f(c + 1), 0.0, &mut b, &h), ParseResult::Appended));
+        assert_eq!(h.dropped_samples.load(Ordering::Relaxed), 0);
     }
 
     #[test]
