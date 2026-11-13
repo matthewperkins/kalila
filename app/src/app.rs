@@ -1,4 +1,4 @@
-use crate::config::{Config, OutputSettings, ViewFilter};
+use crate::config::{Config, ElectrodeMap, OutputSettings, ViewFilter, electrode_keys};
 use crate::spikes::{SLOTS, SpikeCallback, SpikeFrame, SpikeGpu};
 use crate::sweep::Sweeps;
 use crate::traces::{FilterBank, MAX_CUTS, RING, SweepFrame, TraceCallback, TraceConfig, TraceFrame, TraceGpus, review_key};
@@ -282,7 +282,9 @@ impl App {
                 }
             }
             let rec_btn = if recording { egui::Button::new(RichText::new("Recording").color(Color32::WHITE).strong()).fill(Color32::from_rgb(190, 30, 30)) } else { egui::Button::new(RichText::new("Record").color(Color32::from_rgb(230, 80, 80))) };
-            if ui.add_enabled(acquiring, rec_btn).on_hover_text("Ctrl+R").clicked() || (acquiring && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::R))) {
+            // A recording can always be stopped, even if acquisition ended under it.
+            let rec_ok = acquiring || recording;
+            if ui.add_enabled(rec_ok, rec_btn).on_hover_text("Ctrl+R").clicked() || (rec_ok && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::R))) {
                 if recording {
                     self.engine.stop_recording();
                 } else {
@@ -625,6 +627,50 @@ impl App {
         });
     }
 
+    /// When the electrode layout changes (16-ch toggle, rescan, another board), move every
+    /// setting stored as a global electrode index so it keeps pointing at the same electrode:
+    /// DAC routes (and so threshold → TTL out), the spike/audio CAR sets, each trace
+    /// window's CAR sets and the audio channels. Electrodes whose headstage is gone are
+    /// dropped from them, with a message.
+    fn remap_electrodes(&mut self) {
+        let Some(keys) = self.engine.layout().map(electrode_keys) else { return };
+        if keys.is_empty() || keys == self.cfg.electrode_keys {
+            return;
+        }
+        self.dirty_cfg = Instant::now();
+        if self.cfg.electrode_keys.is_empty() {
+            // A config from before the keys were saved: its indices mean this layout.
+            self.cfg.electrode_keys = keys;
+            return;
+        }
+        let mut m = ElectrodeMap::new(&self.cfg.electrode_keys, &keys);
+        for d in &mut self.cfg.outputs.dacs {
+            m.opt(&mut d.electrode);
+        }
+        m.set(&mut self.cfg.display.car.reference);
+        m.set(&mut self.cfg.display.car.subtract);
+        for v in &mut self.shared.lock().settings {
+            m.set(&mut v.car.reference);
+            m.set(&mut v.car.subtract);
+        }
+        {
+            let mut a = self.engine.audio_settings.lock();
+            m.set(&mut a.channels);
+            self.audio_text = channels_to_text(&a.channels);
+        }
+        self.cfg.electrode_keys = keys;
+        if m.changed() {
+            self.colors_dirty = true;
+            let mut msg = format!("Channel layout changed: DAC routes, CAR sets and audio channels moved to follow their electrodes ({} moved", m.moved);
+            if m.dropped > 0 {
+                msg += &format!(", {} dropped: their headstage is gone", m.dropped);
+            }
+            msg += ")";
+            log::info!("{msg}");
+            self.toast(msg);
+        }
+    }
+
     /// Send DAC routes and board-level output settings that differ from what the board last
     /// got; `force` re-sends everything (acquisition start).
     fn sync_outputs(&mut self, force: bool) {
@@ -956,6 +1002,8 @@ impl eframe::App for App {
                 self.cfg.board = s;
             }
         }
+        // Before anything sends electrode indices to the board or the engine.
+        self.remap_electrodes();
         // Outputs: everything on each acquisition start (the board resets TTL out to 0),
         // then only changes (e.g. DAC 1 following a new audio channel).
         let acquiring = self.engine.is_acquiring();

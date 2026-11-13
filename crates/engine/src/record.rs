@@ -439,6 +439,18 @@ fn needs_new_session(session_date: Option<chrono::NaiveDate>, today: chrono::Nai
 }
 
 pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
+    // However this thread ends (a panic included), clear `recording` so the acquisition
+    // thread stops sending and the GUI stops saying "Recording", and say why.
+    struct Exit<'a>(&'a RecStatus);
+    impl Drop for Exit<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                *self.0.error.lock() = Some("the recorder thread crashed: this recording ends at that point (files are readable up to the last second). Restart oers to record again.".into());
+            }
+            self.0.recording.store(false, Ordering::SeqCst);
+        }
+    }
+    let _exit = Exit(&status);
     let mut layout: Option<StreamLayout> = None;
     let mut session: Option<PathBuf> = None;
     let mut session_date: Option<chrono::NaiveDate> = None;

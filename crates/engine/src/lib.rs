@@ -223,6 +223,25 @@ impl Engine {
         if self.running.as_ref().is_some_and(|r| r.acq.is_finished()) {
             self.stop_acquisition();
         }
+        // A worker that panicked while acquisition runs: report it once; recording carries
+        // on. (A worker that returned normally saw the acquisition thread drop its sender,
+        // which can be seen here just before `acq.is_finished()`.)
+        if let Some(r) = &mut self.running
+            && let Some(i) = r.workers.iter().position(|w| w.is_finished())
+        {
+            let w = r.workers.swap_remove(i);
+            let name = w.thread().name().unwrap_or("worker").to_string();
+            if w.join().is_err() {
+                error!("{name} thread crashed");
+                self.last_error = Some(format!("the {name} thread crashed: {}. Recording is not affected; stop and restart acquisition to recover.", worker_role(&name)));
+            }
+        }
+        // The recorder thread ends only at shutdown; earlier means it crashed.
+        if self.rec_thread.as_ref().is_some_and(|h| h.is_finished()) {
+            let _ = self.rec_thread.take().map(|h| h.join());
+            error!("recorder thread ended");
+            self.last_error = Some("the recorder thread crashed: nothing more can be recorded in this session. Restart oers to record again.".into());
+        }
     }
 
     fn set_board(&mut self, b: Box<dyn Board>) {
@@ -383,6 +402,10 @@ impl Engine {
         let acq = std::thread::Builder::new()
             .name("acquisition".into())
             .spawn(move || {
+                // Sent however the thread ends (a panic included), so the recorder finalises
+                // an open recording and clears `recording`; otherwise the GUI could neither
+                // stop that recording nor close.
+                let _stopped = AcqStopped(rec_tx.clone());
                 rt2.store(set_realtime(), Ordering::Relaxed);
                 let r = acquisition_loop(board.as_mut(), &stop2, &live_rx, &disp_tx, &dsp_tx, &aud_tx, &pyr_tx, &rec_tx, &rec_status, rec_limit, &health, &pipe);
                 if let Err(e) = &r {
@@ -391,7 +414,6 @@ impl Engine {
                 if let Err(e) = board.stop() {
                     error!("board stop failed: {e:#}");
                 }
-                let _ = rec_tx.send(RecMsg::AcquisitionStopped);
                 (board, r)
             })
             .unwrap();
@@ -437,7 +459,9 @@ impl Engine {
     }
 
     pub fn start_recording(&self) {
-        let _ = self.rec_tx.send(RecMsg::Start);
+        if self.rec_thread.as_ref().is_none_or(|h| h.is_finished()) || self.rec_tx.send(RecMsg::Start).is_err() {
+            *self.rec_status.error.lock() = Some("cannot record: the recorder thread has crashed. Restart oers.".into());
+        }
     }
     pub fn stop_recording(&self) {
         let _ = self.rec_tx.send(RecMsg::Stop);
@@ -454,6 +478,24 @@ impl Drop for Engine {
         if let Some(h) = self.rec_thread.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Tells the recorder that acquisition has ended, when dropped.
+struct AcqStopped(Sender<RecMsg>);
+impl Drop for AcqStopped {
+    fn drop(&mut self) {
+        let _ = self.0.send(RecMsg::AcquisitionStopped);
+    }
+}
+
+/// What stops working when a worker thread dies (recording is never affected).
+fn worker_role(name: &str) -> &'static str {
+    match name {
+        "dsp" => "spike detection and the spike tiles have stopped",
+        "pyramid" => "the scroll-back overview no longer updates",
+        "audio-feed" => "the audio monitor has stopped",
+        _ => "part of the display has stopped",
     }
 }
 
@@ -510,14 +552,18 @@ fn acquisition_loop(
         // board's DRAM absorbs the stall (and any overflow shows up as counted gaps).
         if rec_status.recording.load(Ordering::Relaxed) {
             let t = Instant::now();
-            while rec.len() as u64 >= rec_limit && !stop.load(Ordering::Relaxed) {
+            // `recording` also clears if the recorder thread dies, so this can't spin forever.
+            while rec.len() as u64 >= rec_limit && !stop.load(Ordering::Relaxed) && rec_status.recording.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_micros(200));
             }
             let w = t.elapsed().as_micros() as u64;
             if w > 0 {
                 pipe.rec_backpressure_us.fetch_add(w, Ordering::Relaxed);
             }
-            let _ = rec.send(RecMsg::Data(blk.clone()));
+            if rec.send(RecMsg::Data(blk.clone())).is_err() {
+                // The recorder thread is gone (its exit guard reports it); never silently.
+                rec_status.recording.store(false, Ordering::SeqCst);
+            }
             pipe.rec_queue.store(rec.len() as u64, Ordering::Relaxed);
         }
         for (tx, ctr) in [(disp, &pipe.display_dropped), (dsp, &pipe.dsp_dropped), (aud, &pipe.audio_dropped), (pyr, &pipe.pyramid_dropped)] {
@@ -573,5 +619,83 @@ fn dsp_thread(rx: Receiver<Arc<Block>>, spikes: Sender<Spike>, settings: Arc<Mut
             c.threshold_uv = (0..nel).map(|i| det.threshold(i)).collect();
             c.spike_counts = counts.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The simulator, panicking in `read_block` after `left` blocks.
+    struct PanicAfter {
+        inner: SimBoard,
+        left: usize,
+    }
+    impl Board for PanicAfter {
+        fn info(&self) -> BoardInfo {
+            self.inner.info()
+        }
+        fn layout(&self) -> StreamLayout {
+            self.inner.layout()
+        }
+        fn settings(&self) -> &BoardSettings {
+            self.inner.settings()
+        }
+        fn apply_settings(&mut self, s: &BoardSettings) -> Result<()> {
+            self.inner.apply_settings(s)
+        }
+        fn available_sample_rates(&self) -> Vec<u32> {
+            self.inner.available_sample_rates()
+        }
+        fn scan_ports(&mut self) -> Result<()> {
+            self.inner.scan_ports()
+        }
+        fn start(&mut self, h: SharedHealth) -> Result<()> {
+            self.inner.start(h)
+        }
+        fn read_block(&mut self, blk: &mut Block) -> Result<()> {
+            if self.left == 0 {
+                panic!("test: board panics mid-recording");
+            }
+            self.left -= 1;
+            self.inner.read_block(blk)
+        }
+        fn live(&mut self, c: &LiveCommand) -> Result<()> {
+            self.inner.live(c)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_panic_in_acquisition_finalises_the_recording() {
+        let root = std::env::temp_dir().join(format!("oers-acq-panic-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut e = Engine::new(root.clone());
+        e.audio_settings.lock().enabled = false;
+        // ~0.3 s of blocks: enough to start recording before the panic.
+        e.set_board(Box::new(PanicAfter { inner: SimBoard::new(vec![32]), left: 300 }));
+        e.start_acquisition().unwrap();
+        e.start_recording();
+        wait_for("recording", || e.is_recording());
+        wait_for("the acquisition thread to end", || {
+            e.poll();
+            !e.is_acquiring()
+        });
+        wait_for("the recorder to finalise", || !e.is_recording());
+        assert!(e.last_error.as_deref().is_some_and(|m| m.contains("panicked")), "{:?}", e.last_error);
+        // The recorder finished the recording normally (no recorder error).
+        assert!(e.rec_status.error.lock().is_none());
+        drop(e);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

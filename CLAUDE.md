@@ -132,6 +132,22 @@ Committed per feature where the code separates; the GUI features share one commi
 - Simulator: a common-mode artefact burst (30 ms every 1.7 s) for testing CAR; on by
   default, `OERS_SIM_ARTEFACT=0` turns it off.
 
+## Thread liveness and electrode identity (2026-11-13, from `docs/reviews/`)
+
+- **Thread deaths are loud.** The acquisition thread sends `AcquisitionStopped` from a drop
+  guard (`AcqStopped`), so a panic there still finalises an open recording and clears
+  `recording` (test `a_panic_in_acquisition_finalises_the_recording`). The recorder clears
+  `recording` and sets a REC ERROR on any exit (`Exit` guard in `run_recorder`); the
+  back-pressure wait also stops on it. `Engine::poll` reports a crashed recorder or worker
+  (dsp, pyramid, audio-feed) in the error bar. The Record button can stop a recording even
+  when acquisition has ended.
+- **Electrode-indexed settings follow their electrodes.** DAC routes (and so threshold → TTL
+  out), the spike/audio CAR sets, each window's CAR sets and the audio channels are global
+  electrode indices. `Config::electrode_keys` records which electrode ("A1:5") each index
+  meant; when the layout changes, `App::remap_electrodes` moves them (`ElectrodeMap`) and
+  drops those whose headstage is gone, with a toast. Checked on the sim (32+16 → 16+16).
+  Old configs without keys are taken to mean the first layout they see.
+
 ## Trace windows (rig, 2026-11-06)
 
 - **Layout.** The main window holds the controls and the spike grid. Traces live in separate

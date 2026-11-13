@@ -308,7 +308,8 @@ pub struct NotesSettings {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct DacOut {
-    /// Global electrode index, or None for off.
+    /// Global electrode index, or None for off. Follows its electrode across layout
+    /// changes (`Config::electrode_keys`).
     pub electrode: Option<usize>,
     /// Comparator threshold in µV. ≥ 0: TTL high at or above it; < 0: at or below it. Drives
     /// TTL out n only in threshold mode (`BoardSettings::ttl_output_mode`).
@@ -358,6 +359,68 @@ pub struct Config {
     /// together, in GB. Over it, the oldest fine detail is released (short old spans are then
     /// read from the file).
     pub review_ram_gb: f32,
+    /// The electrodes that the settings stored as global electrode indices (DAC routes,
+    /// CAR sets, audio channels) refer to: `electrode_keys[i]` is electrode `i`'s key
+    /// ("A1:5"). When the layout changes, those settings are moved to follow their
+    /// electrodes (`ElectrodeMap`). Empty in configs from before 2026-11-13.
+    pub electrode_keys: Vec<String>,
+}
+
+/// Keys ("A1:5": headstage name and index within it) of a layout's electrodes, by global
+/// electrode index. Electrodes come first in the channel list, so the electrode index is
+/// also the channel index.
+pub fn electrode_keys(l: &engine::rhythm::StreamLayout) -> Vec<String> {
+    let mut per_hs = vec![0usize; l.headstages.len()];
+    l.channels
+        .iter()
+        .filter(|c| c.kind == engine::rhythm::ChannelKind::Electrode)
+        .map(|c| {
+            let hs = c.headstage.unwrap_or(0);
+            let k = per_hs.get(hs).copied().unwrap_or(0);
+            if let Some(n) = per_hs.get_mut(hs) {
+                *n += 1;
+            }
+            format!("{}:{k}", l.headstages.get(hs).map_or("?", |h| h.name.as_str()))
+        })
+        .collect()
+}
+
+/// Moves global electrode indices from one layout to another by electrode key, so a DAC
+/// route or CAR set keeps its electrode when, say, a 16-ch RHD2132 toggle or a rescan
+/// renumbers the electrodes after it.
+pub struct ElectrodeMap {
+    to: Vec<Option<usize>>,
+    /// Indices that pointed at another electrode, and that were dropped (headstage gone).
+    pub moved: usize,
+    pub dropped: usize,
+}
+
+impl ElectrodeMap {
+    pub fn new(old: &[String], new: &[String]) -> Self {
+        let to = old.iter().map(|k| new.iter().position(|n| n == k)).collect();
+        Self { to, moved: 0, dropped: 0 }
+    }
+    /// Old index → new index; None if that electrode is gone (or `i` was out of range).
+    pub fn one(&mut self, i: usize) -> Option<usize> {
+        let r = self.to.get(i).copied().flatten();
+        match r {
+            None => self.dropped += 1,
+            Some(n) if n != i => self.moved += 1,
+            _ => {}
+        }
+        r
+    }
+    pub fn opt(&mut self, i: &mut Option<usize>) {
+        if let Some(v) = *i {
+            *i = self.one(v);
+        }
+    }
+    pub fn set(&mut self, v: &mut Vec<usize>) {
+        *v = v.iter().filter_map(|&i| self.one(i)).collect();
+    }
+    pub fn changed(&self) -> bool {
+        self.moved + self.dropped > 0
+    }
 }
 
 impl Default for Config {
@@ -376,6 +439,7 @@ impl Default for Config {
             open_hardware_on_start: true,
             sim_headstages: vec![32, 32],
             review_ram_gb: engine::pyramid::DEFAULT_BUDGET as f32 / 1e9,
+            electrode_keys: Vec::new(),
         }
     }
 }
@@ -434,6 +498,32 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn electrode_settings_follow_their_electrodes_across_a_layout_change() {
+        use engine::rhythm::{Board, SimBoard};
+        // A1 a 32-channel headstage, then switched to 16 channels; A2 16 channels after it.
+        let old = electrode_keys(&SimBoard::new(vec![32, 16]).layout());
+        let new = electrode_keys(&SimBoard::new(vec![16, 16]).layout());
+        assert_eq!((old[40].as_str(), new[24].as_str()), ("A2:8", "A2:8"));
+        let mut m = ElectrodeMap::new(&old, &new);
+        let mut dac = Some(40);
+        m.opt(&mut dac);
+        assert_eq!(dac, Some(24), "the DAC keeps A2:8");
+        let mut car: Vec<usize> = (32..48).collect();
+        m.set(&mut car);
+        assert_eq!(car, (16..32).collect::<Vec<_>>(), "A2's CAR set stays A2's");
+        let mut audio = vec![3, 20, 47];
+        m.set(&mut audio);
+        assert_eq!(audio, vec![3, 31], "A1:20 no longer exists; A1:3 is unchanged");
+        assert_eq!((m.moved, m.dropped), (18, 1));
+        // Same layout: nothing changes.
+        let mut same = ElectrodeMap::new(&old, &old);
+        let mut v = vec![0, 40];
+        same.set(&mut v);
+        assert_eq!(v, vec![0, 40]);
+        assert!(!same.changed());
+    }
 
     #[test]
     fn per_filter_scale_and_channel_filter() {
