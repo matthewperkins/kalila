@@ -463,5 +463,5 @@ rig's headstages have no IMU), processor graph and plugins (deferred), spike fil
 
 ## Working conventions
 
-- Commit/push to `matthewperkins/oers` (private) on `main` when asked.
+- Commit/push to `matthewperkins/kalila` (private; renamed from `oers`) on `main` when asked.
 - Hardware-touching changes: say what registers or devices they write.
