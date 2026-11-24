@@ -6,6 +6,7 @@ description = "Open Ephys acquisition board (ONI/FT600) driver and simulator"
 
 [dependencies]
 oni-sys = { path = "../oni-sys" }
+ft600 = { path = "../ft600" }
 anyhow.workspace = true
 log.workspace = true
 serde.workspace = true

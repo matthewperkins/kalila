@@ -116,6 +116,25 @@ struct ScanBlock {
     aux: Vec<[[u16; INIT_STEP]; 3]>,
 }
 
+/// How the FT600 is reached (`KALILA_DRIVER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Driver {
+    /// kalila's own USB code (`ft600` crate, ported from dimna): `KALILA_DRIVER=usb`. To
+    /// become the default once it has been verified on the board from kalila.
+    Usb,
+    /// liboni's `libonidriver_ft600.so` on FTDI's D3XX 1.0.x: the default.
+    D3xx,
+}
+
+impl Driver {
+    pub fn from_env() -> Self {
+        match std::env::var("KALILA_DRIVER") {
+            Ok(v) if v.eq_ignore_ascii_case("usb") => Driver::Usb,
+            _ => Driver::D3xx,
+        }
+    }
+}
+
 pub struct OniBoard {
     ctx: Context,
     settings: BoardSettings,
@@ -152,13 +171,23 @@ pub struct OniBoard {
 
 impl OniBoard {
     /// Open the first ONI acquisition board on the FT600 bus.
+    ///
+    /// The FT600 is reached through liboni's `libonidriver_ft600.so` on FTDI's D3XX, or with
+    /// `KALILA_DRIVER=usb` through kalila's own USB code (the `ft600` crate), without D3XX.
     pub fn open() -> Result<Self> {
-        info!("Searching for ONI acquisition board (driver ft600)...");
-        match crate::oni::configure_driver_search() {
-            Some(d) => info!("using libonidriver_ft600.so from {}", d.display()),
-            None => info!("libonidriver_ft600.so not found in known locations; trying the default library path"),
-        }
-        let ctx = Context::open("ft600", -1)?;
+        let d3xx = Driver::from_env() == Driver::D3xx;
+        let ctx = if d3xx {
+            info!("Searching for ONI acquisition board (driver ft600 on D3XX)...");
+            match crate::oni::configure_driver_search() {
+                Some(d) => info!("using libonidriver_ft600.so from {}", d.display()),
+                None => info!("libonidriver_ft600.so not found in known locations; trying the default library path"),
+            }
+            Context::open("ft600", -1)?
+        } else {
+            info!("Searching for ONI acquisition board (kalila's own FT600 driver, KALILA_DRIVER=usb)...");
+            ft600::register();
+            Context::open(ft600::DRIVER_NAME, -1)?
+        };
         let mut b = Self {
             ctx,
             settings: BoardSettings::default(),
@@ -202,11 +231,15 @@ impl OniBoard {
         if let Some(d) = self.ctx.driver_info() {
             info!("ONI driver {} {}.{}.{}{}", d.name, d.version.0, d.version.1, d.version.2, d.pre_release.map(|p| format!("-{p}")).unwrap_or_default());
         }
-        if let Ok(v) = self.ctx.get_driver_opt_u32(0) {
-            info!("FTDI driver {}.{}.{}", (v >> 24) & 0xff, (v >> 16) & 0xff, v & 0xffff);
-        }
-        if let Ok(v) = self.ctx.get_driver_opt_u32(1) {
-            info!("FTDI library {}.{}.{}", (v >> 24) & 0xff, (v >> 16) & 0xff, v & 0xff);
+        // Driver option 0 is the D3XX driver version on liboni's ft600 driver; kalila's own
+        // driver logs the FT60x firmware itself when it opens the chip.
+        if Driver::from_env() == Driver::D3xx {
+            if let Ok(v) = self.ctx.get_driver_opt_u32(0) {
+                info!("FTDI driver {}.{}.{}", (v >> 24) & 0xff, (v >> 16) & 0xff, v & 0xffff);
+            }
+            if let Ok(v) = self.ctx.get_driver_opt_u32(1) {
+                info!("FTDI library {}.{}.{}", (v >> 24) & 0xff, (v >> 16) & 0xff, v & 0xff);
+            }
         }
         let v = self.ctx.read_reg(DEVICE_INFO, 2).context("reading gateware version")?;
         self.fw = ((v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff, (v >> 24) & 0xff);

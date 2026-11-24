@@ -1,7 +1,8 @@
 //! Raw bindings to liboni 4.x (vendored in `liboni/`, MIT licensed).
 //!
-//! liboni loads the hardware driver (`libonidriver_ft600.so`) at runtime with
-//! `dlopen`, so this crate builds and links without FTDI's proprietary library.
+//! liboni loads a hardware driver (`libonidriver_ft600.so`) at runtime with `dlopen`, so this
+//! crate builds and links without FTDI's proprietary library. A driver compiled into the
+//! program (the `ft600` crate) is registered with `oni_register_builtin_driver` instead.
 #![allow(non_camel_case_types)]
 
 use std::os::raw::{c_char, c_int, c_void};
@@ -63,7 +64,61 @@ pub const ONI_OPT_BLOCKWRITESIZE: c_int = 11;
 
 // Errors
 pub const ONI_ESUCCESS: c_int = 0;
+pub const ONI_EPATHINVALID: c_int = -1;
+pub const ONI_EDEVID: c_int = -2;
+pub const ONI_EDEVIDX: c_int = -3;
+pub const ONI_EREADFAILURE: c_int = -5;
+pub const ONI_EWRITEFAILURE: c_int = -6;
+pub const ONI_ESEEKFAILURE: c_int = -8;
+pub const ONI_EINVALSTATE: c_int = -9;
+pub const ONI_EINVALOPT: c_int = -10;
+pub const ONI_EINVALARG: c_int = -11;
+pub const ONI_EBUFFERSIZE: c_int = -14;
+pub const ONI_EINVALREADSIZE: c_int = -20;
+pub const ONI_EINIT: c_int = -22;
 pub const ONI_EBADCONTROLLER: c_int = -29;
+
+// ---------------------------------------------------------------- driver side (onidriver.h)
+
+/// `oni_config_t`: the controller's configuration registers.
+pub type oni_config_t = c_int;
+pub const ONI_CONFIG_DEV_IDX: oni_config_t = 0;
+pub const ONI_CONFIG_REG_ADDR: oni_config_t = 1;
+pub const ONI_CONFIG_REG_VALUE: oni_config_t = 2;
+pub const ONI_CONFIG_RW: oni_config_t = 3;
+pub const ONI_CONFIG_TRIG: oni_config_t = 4;
+pub const ONI_CONFIG_RUNNING: oni_config_t = 5;
+pub const ONI_CONFIG_RESET: oni_config_t = 6;
+pub const ONI_CONFIG_SYSCLKHZ: oni_config_t = 7;
+pub const ONI_CONFIG_ACQCLKHZ: oni_config_t = 8;
+pub const ONI_CONFIG_RESETACQCOUNTER: oni_config_t = 9;
+pub const ONI_CONFIG_HWADDRESS: oni_config_t = 10;
+
+pub type oni_read_stream_t = c_int;
+pub const ONI_READ_STREAM_DATA: oni_read_stream_t = 0;
+pub const ONI_READ_STREAM_SIGNAL: oni_read_stream_t = 1;
+pub type oni_write_stream_t = c_int;
+pub const ONI_WRITE_STREAM_DATA: oni_write_stream_t = 0;
+
+pub type oni_driver_ctx = *mut c_void;
+
+/// `struct oni_driver` (onidriverloader.h): a driver's function table.
+#[repr(C)]
+pub struct oni_driver_t {
+    pub handle: *mut c_void,
+    pub ctx: oni_driver_ctx,
+    pub create_ctx: Option<extern "C" fn() -> oni_driver_ctx>,
+    pub destroy_ctx: Option<extern "C" fn(oni_driver_ctx) -> c_int>,
+    pub init: Option<extern "C" fn(oni_driver_ctx, c_int) -> c_int>,
+    pub read_stream: Option<extern "C" fn(oni_driver_ctx, oni_read_stream_t, *mut c_void, usize) -> c_int>,
+    pub write_stream: Option<extern "C" fn(oni_driver_ctx, oni_write_stream_t, *const c_char, usize) -> c_int>,
+    pub read_config: Option<extern "C" fn(oni_driver_ctx, oni_config_t, *mut oni_reg_val_t) -> c_int>,
+    pub write_config: Option<extern "C" fn(oni_driver_ctx, oni_config_t, oni_reg_val_t) -> c_int>,
+    pub set_opt_callback: Option<extern "C" fn(oni_driver_ctx, c_int, *const c_void, usize) -> c_int>,
+    pub set_opt: Option<extern "C" fn(oni_driver_ctx, c_int, *const c_void, usize) -> c_int>,
+    pub get_opt: Option<extern "C" fn(oni_driver_ctx, c_int, *mut c_void, *mut usize) -> c_int>,
+    pub info: Option<extern "C" fn() -> *const oni_driver_info_t>,
+}
 
 unsafe extern "C" {
     pub fn oni_create_ctx(drv_name: *const c_char) -> oni_ctx;
@@ -84,6 +139,9 @@ unsafe extern "C" {
     pub fn oni_error_str(err: c_int) -> *const c_char;
     /// kalila patch to the vendored loader: directory tried before the default dlopen path.
     pub fn oni_set_driver_search_dir(dir: *const c_char);
+    /// kalila patch (as dimna's): when `name` is asked for, `functions` is used instead of
+    /// loading `libonidriver_<name>.so`. `name` must stay valid for the program's life.
+    pub fn oni_register_builtin_driver(name: *const c_char, functions: *const oni_driver_t);
 }
 
 #[cfg(test)]

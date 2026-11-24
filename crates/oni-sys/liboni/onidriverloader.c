@@ -63,8 +63,26 @@ void oni_set_driver_search_dir(const char* dir)
     snprintf(oni_driver_search_dir, sizeof(oni_driver_search_dir), "%s", dir);
 }
 
+// kalila patch (the same as dimna's): one driver compiled into the program. When its name is
+// asked for, its function table is used instead of loading libonidriver_<name>.so.
+static const char* oni_builtin_name = NULL;
+static oni_driver_t oni_builtin_driver;
+
+void oni_register_builtin_driver(const char* name, const oni_driver_t* functions)
+{
+    oni_builtin_name = name;
+    oni_builtin_driver = *functions;
+}
+
 int oni_create_driver(const char* lib_name, oni_driver_t* driver)
 {
+    if (oni_builtin_name && strcmp(lib_name, oni_builtin_name) == 0) {
+        *driver = oni_builtin_driver;
+        driver->handle = NULL; // nothing to dlclose (close_library ignores NULL)
+        driver->ctx = driver->create_ctx();
+        return driver->ctx ? ONI_ESUCCESS : -1;
+    }
+
 #if defined(_WIN32)
     const char* extension = ".dll";
 #elif defined(__APPLE__)

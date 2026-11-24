@@ -1,0 +1,11 @@
+[package]
+name = "ft600"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FT600 USB bridge of the Open Ephys acquisition board, without FTDI's D3XX (an ONI driver for liboni)"
+
+[dependencies]
+oni-sys = { path = "../oni-sys" }
+libc = "0.2"
+log.workspace = true

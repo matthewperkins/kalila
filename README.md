@@ -8,8 +8,9 @@
 
 A rewrite of the Open Ephys GUI's acquisition path for the **ONI/FT600 acquisition board**
 (ECP5 gateware, not Opal Kelly), with a GPU-drawn egui interface and a spike-oriented audio
-monitor. Rust everywhere except the vendored C `liboni` and the FT600 ONI driver, which
-wraps FTDI's closed-source D3XX library.
+monitor. Rust everywhere except the vendored C `liboni` and, by default, liboni's FT600 ONI
+driver, which wraps FTDI's closed-source D3XX library (an experimental driver of kalila's
+own, without D3XX, is in `crates/ft600`).
 
 | | |
 |---|---|
@@ -27,6 +28,7 @@ All screenshots are from the built-in simulator (`kalila --sim`), so the signals
 
 ```
 crates/oni-sys   liboni 4.6 (C, vendored, statically linked) + FFI
+crates/ft600     FT600 USB driver without D3XX (experimental; KALILA_DRIVER=usb)
 crates/rhythm    board driver (port of AcqBoardONI/Rhd2000ONIBoard), frame parser, simulator
 crates/engine    real-time acquisition thread, recorder (Open Ephys Binary), DSP, audio
 app/             egui + wgpu (Vulkan) GUI: GPU traces, GPU spike persistence view
@@ -55,6 +57,14 @@ cargo build --release            # needs Rust ≥ 1.85, a C compiler, libpipewir
    runtime dependency on it). The script refuses 1.1.x. A driver shipped with an existing
    Open Ephys install is also picked up automatically from `~/.local/share/open-ephys/shared*`,
    or set `ONI_DRIVER_PATH=<dir>`.
+   **Without D3XX (experimental):** `KALILA_DRIVER=usb ./target/release/kalila` (or the
+   headless example) reaches the FT600 through kalila's own USB code instead
+   (`crates/ft600`, ported from [dimna](https://github.com/matthewperkins/dimna)), with
+   nothing from FTDI installed. It sends the chip only what D3XX sends on every open, and
+   never writes the chip's configuration. In dimna it uses about a quarter of D3XX's CPU and
+   opens the board in about 2.5 s instead of 8.6 s. It has not yet been run on the board
+   from kalila, so D3XX stays the default for now. `KALILA_USB_TRACE=1` logs every USB
+   command; `KALILA_USB_PACE=0` turns off read pacing.
 2. **USB permissions:** `sudo install -m644 scripts/60-open-ephys-ft600.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
 3. **Real-time priority (recommended):** copy `scripts/99-kalila-realtime.conf` to
    `/etc/security/limits.d/`, add yourself to the `realtime` group, then re-login. The top

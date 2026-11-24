@@ -213,6 +213,28 @@ Committed per feature where the code separates; the GUI features share one commi
 - **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
   under it (every GUI frame takes that lock, and the builder runs at idle priority).
 
+## FT600 without D3XX (dev box, 2026-11-24; not yet on the board)
+
+`crates/ft600`, a Rust port of dimna's USB driver (`src/usb_linux.zig`, `ft600.zig`,
+`oni_usb.zig`), registered with liboni as a built-in driver (`oni_register_builtin_driver`,
+the same 11-line loader patch as dimna's). **Opt-in, `KALILA_DRIVER=usb`;** D3XX stays the
+default until it has passed on the rig from kalila.
+- Layers: `usbfs` (usbdevfs ioctls, async URBs so a timed-out read keeps its bytes), `chip`
+  (FT600 protocol: 20-byte announcements on EP 0x01, GPIO and config as vendor requests),
+  `driver` (port of liboni's `onidriver_ft600.c`, with dimna's read pacing and no 200 ms
+  abort waits when nothing is announced).
+- **Hardware safety:** sends only what D3XX sends on every open (GPIO 0 = FIFO reset,
+  announcements, aborts; reads of firmware version and chip config). Every control transfer
+  goes through `Ft600::control_transfer`, which refuses anything outside `ALLOWED_REQUESTS`
+  (never 0x40 0xcf, the chip-config write). Tests check the list, the refusal, and scan the
+  workspace for any other control transfer; both were mutation-checked.
+- dimna's measurements (46 ch): CPU 2.2 s vs 8.7 s per 20 s, open + scan 2.5 s vs 8.6 s.
+- `KALILA_USB_TRACE=1` logs USB commands; `KALILA_USB_PACE=0` turns pacing off. With it, the
+  usb block size (kalila's default 24 KiB; dimna's 8 KiB) sets the delivery delay.
+- To do on the rig: 600 s headless soak with `KALILA_DRIVER=usb`, a back-to-back recording
+  against D3XX (noise profile, AUX, ADC, TTL), `cpuload.py`, Stop/Start and Apply cycles.
+  Then make it the default.
+
 ## Trace windows (rig, 2026-11-06)
 
 - **Layout.** The main window holds the controls and the spike grid. Traces live in separate
@@ -463,5 +485,6 @@ rig's headstages have no IMU), processor graph and plugins (deferred), spike fil
 
 ## Working conventions
 
-- Commit/push to `matthewperkins/kalila` (private; renamed from `oers`) on `main` when asked.
+- Commit/push to `matthewperkins/kalila` (public since 2026-11-24; renamed from `oers`) on
+  `main` when asked. Being public, nothing private (recordings, personal details) goes in.
 - Hardware-touching changes: say what registers or devices they write.
