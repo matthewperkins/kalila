@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=kalila
+GenericName=Open Ephys acquisition
+Comment=Acquire, display and record from the Open Ephys acquisition board (ONI/FT600)
+Exec=/usr/libexec/kalila/kalila-desktop-launch
+Icon=kalila
+Terminal=false
+Categories=Science;
+StartupWMClass=kalila
+StartupNotify=false
+Actions=Simulator;
+
+[Desktop Action Simulator]
+Name=kalila (simulated board)
+Exec=/usr/libexec/kalila/kalila-desktop-launch --sim

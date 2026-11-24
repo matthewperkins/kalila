@@ -4,7 +4,7 @@ The program is **kalila** (lower case everywhere; environment variables `KALILA_
 called **oers** until 2026-11-13: commit messages, `docs/reviews/` and older notes use that
 name. Its twin, the Zig program in `~/oEZ/oez` (oEZ, being renamed dimna), shares the board.
 Before any board run, check nothing else holds it:
-`pgrep -x oers || pgrep -x kalila || pgrep -x oez || pgrep -x oez-headless || pgrep -x dimna || pgrep -x dimna-headless || pgrep -x headless || pgrep -f '[o]pen-ephys'`
+`pgrep -x oers || pgrep -x kalila || pgrep -x kalila-headless || pgrep -x oez || pgrep -x oez-headless || pgrep -x dimna || pgrep -x dimna-headless || pgrep -x headless || pgrep -f '[o]pen-ephys'`
 
 Carried over from the development session on the dev box, so a session on the rig starts
 with the same background. See `README.md` for build and setup; this file holds the *why*
@@ -213,12 +213,13 @@ Committed per feature where the code separates; the GUI features share one commi
 - **Backfill filters outside the store lock**, as the live path does; only `ingest` runs
   under it (every GUI frame takes that lock, and the builder runs at idle priority).
 
-## FT600 without D3XX (dev box, 2026-11-24; not yet on the board)
+## FT600 without D3XX (default since 2026-11-24)
 
 `crates/ft600`, a Rust port of dimna's USB driver (`src/usb_linux.zig`, `ft600.zig`,
 `oni_usb.zig`), registered with liboni as a built-in driver (`oni_register_builtin_driver`,
-the same 11-line loader patch as dimna's). **Opt-in, `KALILA_DRIVER=usb`;** D3XX stays the
-default until it has passed on the rig from kalila.
+the same 11-line loader patch as dimna's). **The default; `KALILA_DRIVER=d3xx`** selects
+liboni's D3XX driver. Made the default by the user on 2026-11-24 after the rig checks below,
+before the GUI Stop/Start and Apply check.
 - Layers: `usbfs` (usbdevfs ioctls, async URBs so a timed-out read keeps its bytes), `chip`
   (FT600 protocol: 20-byte announcements on EP 0x01, GPIO and config as vendor requests),
   `driver` (port of liboni's `onidriver_ft600.c`, with dimna's read pacing and no 200 ms
@@ -229,11 +230,45 @@ default until it has passed on the rig from kalila.
   (never 0x40 0xcf, the chip-config write). Tests check the list, the refusal, and scan the
   workspace for any other control transfer; both were mutation-checked.
 - dimna's measurements (46 ch): CPU 2.2 s vs 8.7 s per 20 s, open + scan 2.5 s vs 8.6 s.
-- `KALILA_USB_TRACE=1` logs USB commands; `KALILA_USB_PACE=0` turns pacing off. With it, the
-  usb block size (kalila's default 24 KiB; dimna's 8 KiB) sets the delivery delay.
-- To do on the rig: 600 s headless soak with `KALILA_DRIVER=usb`, a back-to-back recording
-  against D3XX (noise profile, AUX, ADC, TTL), `cpuload.py`, Stop/Start and Apply cycles.
-  Then make it the default.
+- `KALILA_USB_TRACE=1` logs USB commands; `KALILA_USB_PACE=0` turns pacing off.
+- **USB block default 8 KiB** (was 24 KiB, stock's), from the delay table below. Saved configs
+  without `defaults_rev` that hold exactly 24 KiB move to 8 KiB once, with a toast
+  (`Config::parse`); any other value is the user's choice and stays.
+- **On the rig (2026-11-24), 46 ch, 30 kHz:** 600 s soak with recording `dropped=0 gaps=0
+  bad=0`, hwbuf 0.0 %, 17,999,968 contiguous samples; 20 s recordings back to back with D3XX
+  agree (noise profile r = 1.000, AUX within 0.24 mV, ADC within 0.18 mV; TTL not compared,
+  no input connected); CPU for a 20 s recording run 3.3 s vs 9.8 s; open to acquiring ~2 s vs
+  ~7 s. Eleven open/acquire/close runs in a row, all clean.
+- **Delivery delay** (headless `--latency`: each 32-sample block's newest sample vs the
+  quickest block of its second; ms, mean / p99 / max; CPU user+sys per 20 s):
+
+  | | 24 KiB | 8 KiB | 4 KiB |
+  |---|---|---|---|
+  | usb, paced | 2.07 / 4.05 / 4.5, 3.1 s | 0.75 / 1.44 / 2.0, 4.3 s | 0.38 / 0.75 / 1.5, 5.1 s |
+  | usb, unpaced | | | 0.37 / 0.72 / 1.6, 8.2 s |
+  | D3XX | 2.05 / 4.04 / 5.0, 8.3 s | 0.71 / 1.39 / 5.5, 10.3 s | 0.39 / 1.11 / 5.0, 10.1 s |
+
+  The mean is half the block's fill time, so block size sets the delay; pacing adds ~0.01 ms
+  and saves ~40 % CPU at 4 KiB; D3XX has the longer tail (p99.9 2.6–2.8 ms at 8/4 KiB vs 1.5/0.8).
+- Still to do: Stop/Start and Apply-while-acquiring in the GUI with the new driver.
+
+## Releases (2026-11-24)
+
+`.github/workflows/release.yml`, on a `v*` tag or by hand (workflow_dispatch). Scripts in
+`packaging/`: `ci-build.sh gnu|musl` (build, test, release folder, tarball; for gnu also
+.deb/.rpm with nfpm, `nfpm.yaml`), `ci-test-install.sh` (install and run on a distribution),
+`collect-licenses.py` (licence files of every crate compiled in).
+- **glibc** built on Rocky 9 (glibc 2.34; `ci-build.sh` fails if a newer symbol is needed),
+  Rust pinned there (`RUST_VERSION`). Tested as packages on Ubuntu 22.04/24.04, Debian
+  12/13, Rocky 9, Alma 9, Fedora, and as a tarball on Arch.
+- **musl** built on Alpine 3.22, dynamically linked (`-C target-feature=-crt-static`, so
+  Vulkan/Wayland/X11 can be dlopen()ed); liboni gets an empty `<execinfo.h>` there
+  (`oni-sys/build.rs`). Tested on Alpine and Void musl.
+- The test (no board, no display): every symbol resolves, the dlopen()ed libraries are
+  installed, `kalila-headless` runs 3 s on the simulator with nothing lost.
+- A tag only **drafts** the release; the user reads and publishes it. The tag must be
+  `v<workspace version>`.
+- Shipped binaries: `kalila` and `kalila-headless` (the engine's headless example).
 
 ## Trace windows (rig, 2026-11-06)
 

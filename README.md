@@ -8,9 +8,9 @@
 
 A rewrite of the Open Ephys GUI's acquisition path for the **ONI/FT600 acquisition board**
 (ECP5 gateware, not Opal Kelly), with a GPU-drawn egui interface and a spike-oriented audio
-monitor. Rust everywhere except the vendored C `liboni` and, by default, liboni's FT600 ONI
-driver, which wraps FTDI's closed-source D3XX library (an experimental driver of kalila's
-own, without D3XX, is in `crates/ft600`).
+monitor. Rust everywhere except the vendored C `liboni`. The board's FT600 USB chip is driven
+by kalila's own code (`crates/ft600`), so FTDI's closed-source D3XX library is not needed
+(it remains available as a fallback).
 
 | | |
 |---|---|
@@ -28,43 +28,62 @@ All screenshots are from the built-in simulator (`kalila --sim`), so the signals
 
 ```
 crates/oni-sys   liboni 4.6 (C, vendored, statically linked) + FFI
-crates/ft600     FT600 USB driver without D3XX (experimental; KALILA_DRIVER=usb)
+crates/ft600     FT600 USB driver without D3XX (the default; KALILA_DRIVER=d3xx for the old one)
 crates/rhythm    board driver (port of AcqBoardONI/Rhd2000ONIBoard), frame parser, simulator
 crates/engine    real-time acquisition thread, recorder (Open Ephys Binary), DSP, audio
 app/             egui + wgpu (Vulkan) GUI: GPU traces, GPU spike persistence view
-scripts/         FT600 driver build, udev rule, realtime limits
+scripts/         udev rule, realtime limits, D3XX driver build (fallback)
+packaging/       desktop launcher, icon, release build and packages (CI)
 ```
+
+## Install
+
+Releases (<https://github.com/matthewperkins/kalila/releases>) have, for x86_64:
+
+| file | for |
+|---|---|
+| `kalila_<version>_amd64.deb` | Debian 12+, Ubuntu 22.04+ |
+| `kalila-<version>.x86_64.rpm` | RHEL / Alma / Rocky 9+, Fedora |
+| `kalila-<version>-x86_64-linux-gnu.tar.gz` | any distribution with glibc 2.34 or newer |
+| `kalila-<version>-x86_64-linux-musl.tar.gz` | musl distributions (Alpine, Void musl) |
+
+Each is built and then installed and run (on the simulated board) on those distributions by
+the release workflow (`.github/workflows/release.yml`). The packages install `kalila`,
+`kalila-headless` (acquisition and recording without windows), a menu entry, the board's
+udev rule and real-time limits for the `realtime` group; see the package description, or
+`INSTALL.md` in a tarball. `SHA256SUMS` has the checksums.
 
 ## Build
 
 ```sh
-cargo build --release            # needs Rust ≥ 1.85, a C compiler, libpipewire/alsa headers
+cargo build --release            # needs Rust ≥ 1.85, a C compiler, clang, libpipewire/alsa headers
 ./target/release/kalila --sim      # simulator (no hardware needed)
 ./target/release/kalila            # hardware
 ```
 
 ## Rig setup (one time)
 
-1. **FT600 ONI driver.** Needs FTDI's *D3XX Linux x86_64* package from the **1.0.x** line;
-   tested on hardware with **1.0.14**. D3XX 1.1.x (FTDI's libusb-based rewrite) does *not*
-   work: `oni_init_ctx` hangs forever, because a 0 ms pipe timeout became "block forever".
-   FTDI's page (<https://ftdichip.com/drivers/d3xx-drivers/>) now lists only 1.1.x for Linux;
-   FTDI's 1.0.14 upload is archived at
+1. **FT600 driver: nothing to install.** kalila reaches the board's FT600 USB chip with its
+   own driver (`crates/ft600`, ported from [dimna](https://github.com/matthewperkins/dimna)),
+   through the kernel's usbdevfs; nothing from FTDI is needed. It sends the chip only what
+   FTDI's D3XX library sends on every open, and never writes the chip's configuration. On
+   the rig (46 channels) it used a third of D3XX's CPU, opened the board in about 2 s
+   instead of 7 s, and recorded the same data. `KALILA_USB_TRACE=1` logs every USB command;
+   `KALILA_USB_PACE=0` turns off read pacing.
+
+   **D3XX (fallback):** `KALILA_DRIVER=d3xx` uses liboni's own FT600 driver on FTDI's D3XX
+   instead. That needs the *D3XX Linux x86_64* package from the **1.0.x** line (tested with
+   **1.0.14**); D3XX 1.1.x (FTDI's libusb-based rewrite) does *not* work: `oni_init_ctx` hangs
+   forever, because a 0 ms pipe timeout became "block forever". FTDI's page
+   (<https://ftdichip.com/drivers/d3xx-drivers/>) now lists only 1.1.x for Linux; FTDI's
+   1.0.14 upload is archived at
    <https://web.archive.org/web/20240519150808id_/https://ftdichip.com/wp-content/uploads/2023/06/libftd3xx-linux-x86_64-1.0.14.tgz>
    (sha256 `ca71469fc2267ba655c0a9af9aa4cb853e4adad1dfd438df83f72d0b6b7ac265`).
    Extract it, then run `scripts/build-ft600-driver.sh <extracted>/linux-x86_64`. That
-   installs `~/.local/lib/libonidriver_ft600.so` (FTDI's library linked statically, no
-   runtime dependency on it). The script refuses 1.1.x. A driver shipped with an existing
-   Open Ephys install is also picked up automatically from `~/.local/share/open-ephys/shared*`,
-   or set `ONI_DRIVER_PATH=<dir>`.
-   **Without D3XX (experimental):** `KALILA_DRIVER=usb ./target/release/kalila` (or the
-   headless example) reaches the FT600 through kalila's own USB code instead
-   (`crates/ft600`, ported from [dimna](https://github.com/matthewperkins/dimna)), with
-   nothing from FTDI installed. It sends the chip only what D3XX sends on every open, and
-   never writes the chip's configuration. In dimna it uses about a quarter of D3XX's CPU and
-   opens the board in about 2.5 s instead of 8.6 s. It has not yet been run on the board
-   from kalila, so D3XX stays the default for now. `KALILA_USB_TRACE=1` logs every USB
-   command; `KALILA_USB_PACE=0` turns off read pacing.
+   installs `~/.local/lib/libonidriver_ft600.so` (FTDI's library linked statically). The
+   script refuses 1.1.x. A driver shipped with an existing Open Ephys install is also
+   picked up from `~/.local/share/open-ephys/shared*`, or set `ONI_DRIVER_PATH=<dir>`.
+   Not available in the musl build.
 2. **USB permissions:** `sudo install -m644 scripts/60-open-ephys-ft600.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
 3. **Real-time priority (recommended):** copy `scripts/99-kalila-realtime.conf` to
    `/etc/security/limits.d/`, add yourself to the `realtime` group, then re-login. The top
@@ -180,7 +199,8 @@ and other plugins, and a spike recording format.
 
 GPL-3.0-or-later (see [LICENSE](LICENSE)), as for the Open Ephys GUI and acquisition-board
 plugin this is ported from. The vendored `liboni` (`crates/oni-sys/liboni`) keeps its own MIT
-licence. FTDI's D3XX library is closed source and not included; see "Rig setup".
+licence. FTDI's D3XX library is closed source, not included and not needed (see "Rig
+setup"). Release builds carry the licences of every Rust crate compiled in.
 
 ## Icon
 

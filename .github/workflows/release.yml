@@ -1,0 +1,150 @@
+# Builds kalila's release: a glibc tarball, .deb and .rpm (built on Rocky Linux 9, so glibc
+# 2.34 or newer), and a musl tarball (built on Alpine). Installs and runs them on each
+# supported distribution, and for a version tag drafts a GitHub release (never published
+# here: the owner reads the draft and publishes it). The steps are scripts in packaging/
+# (ci-build.sh, ci-test-install.sh), so they can be read and run without this file.
+# No board is ever touched: there is none.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-gnu:
+    runs-on: ubuntu-latest
+    container: rockylinux/rockylinux:9
+    steps:
+      # git first, so that checkout makes a real clone and `git describe` works.
+      - name: Install git
+        run: dnf install -y git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Build, test, package
+        env:
+          KALILA_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: sh packaging/ci-build.sh gnu dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-gnu
+          path: dist/
+          if-no-files-found: error
+
+  # Alpine in `docker run`, not as a job container: JavaScript actions (checkout, artifacts)
+  # need the runner's glibc-built node.
+  build-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build and test on Alpine
+        env:
+          KALILA_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: >
+          docker run --rm -e KALILA_TAG -v "$PWD:/w" -w /w alpine:3.22
+          sh -c 'apk add --no-cache git && git config --global --add safe.directory /w &&
+          sh packaging/ci-build.sh musl dist'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-musl
+          path: dist/
+          if-no-files-found: error
+
+  test-package:
+    needs: build-gnu
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:12
+          - debian:13
+          - rockylinux/rockylinux:9
+          - almalinux:9
+          - fedora:latest
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-gnu
+          path: dist
+      - name: Install, run, remove
+        run: sh packaging/ci-test-install.sh package dist
+
+  # The glibc tarball on a rolling distribution, from the folder (no package).
+  test-gnu-tarball:
+    needs: build-gnu
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-gnu
+          path: dist
+      - name: Unpack and run
+        run: sh packaging/ci-test-install.sh tarball dist/kalila-*-x86_64-linux-gnu.tar.gz
+
+  test-musl:
+    needs: build-musl
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - alpine:3.22
+          - ghcr.io/void-linux/void-musl:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-musl
+          path: dist
+      - name: Unpack and run
+        run: >
+          docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }}
+          sh -c 'sh packaging/ci-test-install.sh tarball dist/kalila-*-x86_64-linux-musl.tar.gz'
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build-gnu, build-musl, test-package, test-gnu-tarball, test-musl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag
+          --title "kalila $TAG"
+          --notes "Draft made by the release workflow from $GITHUB_SHA. Packages, tarballs and SHA256SUMS below; see INSTALL.md in each tarball and the README."
+          dist/*
