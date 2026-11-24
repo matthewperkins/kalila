@@ -166,6 +166,15 @@ impl App {
             dac_sent: [None; 8],
             outputs_sent: None,
         }
+        .with_load_notice()
+    }
+
+    fn with_load_notice(mut self) -> Self {
+        if let Some(n) = self.cfg.load_notice.take() {
+            log::info!("{n}");
+            self.toast(n);
+        }
+        self
     }
 
     fn layout(&self) -> Option<StreamLayout> {
@@ -530,7 +539,7 @@ impl App {
                         });
                     });
                     ui.add(egui::Slider::new(&mut b.block_samples, 8..=256).text("samples / block"));
-                    ui.small("Smaller USB blocks lower latency at the cost of more USB transactions; 24 KiB is the stock default.");
+                    ui.small("Smaller USB blocks lower latency at the cost of more USB transactions and CPU. 8 KiB is the default (stock uses 24 KiB).");
                 });
             });
             // LEDs are a live setting: no restart needed.

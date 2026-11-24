@@ -119,18 +119,18 @@ struct ScanBlock {
 /// How the FT600 is reached (`KALILA_DRIVER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Driver {
-    /// kalila's own USB code (`ft600` crate, ported from dimna): `KALILA_DRIVER=usb`. To
-    /// become the default once it has been verified on the board from kalila.
+    /// kalila's own USB code (`ft600` crate, ported from dimna): the default since
+    /// 2026-11-24, after passing on the rig.
     Usb,
-    /// liboni's `libonidriver_ft600.so` on FTDI's D3XX 1.0.x: the default.
+    /// liboni's `libonidriver_ft600.so` on FTDI's D3XX 1.0.x: `KALILA_DRIVER=d3xx`.
     D3xx,
 }
 
 impl Driver {
     pub fn from_env() -> Self {
         match std::env::var("KALILA_DRIVER") {
-            Ok(v) if v.eq_ignore_ascii_case("usb") => Driver::Usb,
-            _ => Driver::D3xx,
+            Ok(v) if v.eq_ignore_ascii_case("d3xx") => Driver::D3xx,
+            _ => Driver::Usb,
         }
     }
 }
@@ -172,19 +172,19 @@ pub struct OniBoard {
 impl OniBoard {
     /// Open the first ONI acquisition board on the FT600 bus.
     ///
-    /// The FT600 is reached through liboni's `libonidriver_ft600.so` on FTDI's D3XX, or with
-    /// `KALILA_DRIVER=usb` through kalila's own USB code (the `ft600` crate), without D3XX.
+    /// The FT600 is reached through kalila's own USB code (the `ft600` crate), or with
+    /// `KALILA_DRIVER=d3xx` through liboni's `libonidriver_ft600.so` on FTDI's D3XX.
     pub fn open() -> Result<Self> {
         let d3xx = Driver::from_env() == Driver::D3xx;
         let ctx = if d3xx {
-            info!("Searching for ONI acquisition board (driver ft600 on D3XX)...");
+            info!("Searching for ONI acquisition board (driver ft600 on D3XX, KALILA_DRIVER=d3xx)...");
             match crate::oni::configure_driver_search() {
                 Some(d) => info!("using libonidriver_ft600.so from {}", d.display()),
                 None => info!("libonidriver_ft600.so not found in known locations; trying the default library path"),
             }
             Context::open("ft600", -1)?
         } else {
-            info!("Searching for ONI acquisition board (kalila's own FT600 driver, KALILA_DRIVER=usb)...");
+            info!("Searching for ONI acquisition board (kalila's own FT600 driver, no D3XX)...");
             ft600::register();
             Context::open(ft600::DRIVER_NAME, -1)?
         };

@@ -14,7 +14,7 @@
 //! What it sends the board: what D3XX sends on every open (GPIO requests, GPIO 0 being the
 //! board's FIFO reset; transfer announcements; pipe aborts; two read-only requests, firmware
 //! version and chip configuration) and the ONI command and register traffic liboni asks for.
-//! Linux only. Used when `KALILA_DRIVER=usb`; not yet verified on the board from kalila.
+//! Linux only. The default; `KALILA_DRIVER=d3xx` selects liboni's D3XX driver instead.
 
 mod chip;
 mod driver;

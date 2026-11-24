@@ -1,8 +1,14 @@
 //! Headless acquisition + recording with live health stats (a soak-test tool for the rig).
 //!
 //! ```text
-//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ] [--aux] [--adc] [--leds] [--16ch A1[,B1…]] [--car] [--no-audio]
+//! cargo run --release -p engine --example headless -- [--hw] [--seconds N] [--record DIR] [--rate HZ] [--aux] [--adc] [--leds] [--16ch A1[,B1…]] [--car] [--no-audio] [--usb-block BYTES] [--latency]
 //! ```
+//!
+//! `--usb-block` sets how many bytes liboni reads from the board at a time (default 8192).
+//! `--latency` reports, at the end, how late each block's newest sample reached the engine
+//! compared with the quickest block of the same second of samples (as dimna measures it), so
+//! the drift between the board's and the host's clocks cancels. It measures the delay added by
+//! reading in blocks and by the USB path's jitter, not the fixed delay common to all blocks.
 //!
 //! `--aux` / `--adc` acquire (and record) the headstage AUX and the 8 I/O-board ADC channels,
 //! for comparing scales against a stock-GUI recording. `--leds` turns the board LEDs on (off by
@@ -23,6 +29,9 @@ fn main() -> anyhow::Result<()> {
     let mut settings = BoardSettings::default();
     if let Some(r) = opt("--rate") {
         settings.sample_rate = r.parse()?;
+    }
+    if let Some(b) = opt("--usb-block") {
+        settings.usb_block_bytes = b.parse()?;
     }
     settings.acquire_aux = flag("--aux");
     settings.acquire_adc = flag("--adc");
@@ -65,6 +74,11 @@ fn main() -> anyhow::Result<()> {
     let mut spikes = 0usize;
     let mut last = Instant::now();
     let mut lat_max = Duration::ZERO;
+    let latency = flag("--latency");
+    let fs = l.sample_rate;
+    let t_ref = Instant::now();
+    // (second of samples, host time of arrival − sample time) for each block's newest sample.
+    let mut arrivals: Vec<(i64, f64)> = Vec::new();
     while t0.elapsed().as_secs_f64() < secs {
         e.poll();
         if !e.is_acquiring() {
@@ -74,6 +88,10 @@ fn main() -> anyhow::Result<()> {
             while let Ok(b) = rx.try_recv() {
                 if let Some(t) = b.acquired_at {
                     lat_max = lat_max.max(t.elapsed());
+                    if latency && t > t_ref {
+                        let newest = b.first_sample + b.len() as i64 - 1;
+                        arrivals.push((newest / fs as i64, (t - t_ref).as_secs_f64() - newest as f64 / fs));
+                    }
                 }
             }
         }
@@ -101,6 +119,9 @@ fn main() -> anyhow::Result<()> {
     e.stop_recording();
     std::thread::sleep(Duration::from_millis(100));
     e.stop_acquisition();
+    if latency {
+        report_latency(&arrivals, e.pipeline.display_dropped.load(Ordering::Relaxed));
+    }
     if let Some(d) = e.rec_status.current_dir.lock().clone() {
         println!("recorded to {}", d.display());
     }
@@ -108,4 +129,28 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("recording error: {err}");
     }
     Ok(())
+}
+
+/// Delivery delay of each block relative to the quickest of its second (see `--latency`).
+fn report_latency(arrivals: &[(i64, f64)], dropped: u64) {
+    use std::collections::HashMap;
+    let mut min: HashMap<i64, f64> = HashMap::new();
+    for &(sec, x) in arrivals {
+        let m = min.entry(sec).or_insert(x);
+        *m = m.min(x);
+    }
+    // Skip the first and last second (partly filled; the start includes the pipeline warming up).
+    let (lo, hi) = (min.keys().min().copied().unwrap_or(0), min.keys().max().copied().unwrap_or(0));
+    let mut d: Vec<f64> = arrivals.iter().filter(|(s, _)| *s > lo && *s < hi).map(|(s, x)| (x - min[s]) * 1e3).collect();
+    if d.is_empty() {
+        println!("latency: no blocks measured");
+        return;
+    }
+    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = |p: f64| d[((d.len() - 1) as f64 * p).round() as usize];
+    let mean = d.iter().sum::<f64>() / d.len() as f64;
+    println!(
+        "latency (ms, newest sample of each block vs the quickest of its second; {} blocks, {} not seen): mean {:.3} median {:.3} p99 {:.3} p99.9 {:.3} max {:.3}",
+        d.len(), dropped, mean, q(0.5), q(0.99), q(0.999), d[d.len() - 1]
+    );
 }

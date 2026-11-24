@@ -223,7 +223,9 @@ impl Default for BoardSettings {
             leds: false,
             rhd2132_16ch: [false; 8],
             clock_divider: 1,
-            usb_block_bytes: 24 * 1024,
+            // 8 KiB: about 0.75 ms mean delivery delay at 46 ch (24 KiB, stock's, is about 2 ms);
+            // measured on the rig 2026-11-24, see CLAUDE.md.
+            usb_block_bytes: 8 * 1024,
             block_samples: 32,
         }
     }

@@ -364,10 +364,19 @@ pub struct Config {
     /// ("A1:5"). When the layout changes, those settings are moved to follow their
     /// electrodes (`ElectrodeMap`). Empty in configs from before 2026-11-13.
     pub electrode_keys: Vec<String>,
+    /// Which one-time changes of defaults this config has been through (`parse`). 1: the
+    /// USB block default went from 24 KiB to 8 KiB (2026-11-24).
+    pub defaults_rev: u32,
     /// Set by `load` when the file couldn't be read as a config (shown in the GUI).
     #[serde(skip)]
     pub load_error: Option<String>,
+    /// Set by `parse` when it changed a setting of the saved config (shown once as a toast).
+    #[serde(skip)]
+    pub load_notice: Option<String>,
 }
+
+/// The latest `Config::defaults_rev`.
+const DEFAULTS_REV: u32 = 1;
 
 /// Keys ("A1:5": headstage name and index within it) of a layout's electrodes, by global
 /// electrode index. Electrodes come first in the channel list, so the electrode index is
@@ -443,7 +452,9 @@ impl Default for Config {
             sim_headstages: vec![32, 32],
             review_ram_gb: engine::pyramid::DEFAULT_BUDGET as f32 / 1e9,
             electrode_keys: Vec::new(),
+            defaults_rev: DEFAULTS_REV,
             load_error: None,
+            load_notice: None,
         }
     }
 }
@@ -507,6 +518,15 @@ impl Config {
         if cfg.views.is_empty() {
             cfg.views.push(TraceViewSettings::default());
         }
+        // A missing field means a config from before the field existed (serde would fill in
+        // the current default, DEFAULTS_REV).
+        let rev = v.get("defaults_rev").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+        if rev < 1 && cfg.board.usb_block_bytes == 24 * 1024 {
+            // 24 KiB was the untouched default until now; another value was chosen and stays.
+            cfg.board.usb_block_bytes = 8 * 1024;
+            cfg.load_notice = Some("USB block set to the new default, 8 KiB (was 24 KiB): about 0.75 ms delivery delay instead of 2 ms".into());
+        }
+        cfg.defaults_rev = DEFAULTS_REV;
         Ok(cfg)
     }
     pub fn save(&self) {
@@ -526,6 +546,26 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_old_24_kib_usb_block_default_moves_to_8_kib_once() {
+        let old = |b: u32| format!(r#"{{"board": {{"usb_block_bytes": {b}}}}}"#);
+        // Saved before the change with the old default: moved, and the user is told.
+        let c = Config::parse(&old(24576)).unwrap();
+        assert_eq!((c.board.usb_block_bytes, c.defaults_rev), (8192, DEFAULTS_REV));
+        assert!(c.load_notice.is_some());
+        // Another value was the user's choice: kept, silently.
+        let c = Config::parse(&old(16384)).unwrap();
+        assert_eq!(c.board.usb_block_bytes, 16384);
+        assert!(c.load_notice.is_none());
+        // 24 KiB chosen after the change (saved with defaults_rev 1): kept.
+        let c = Config::parse(r#"{"board": {"usb_block_bytes": 24576}, "defaults_rev": 1}"#).unwrap();
+        assert_eq!(c.board.usb_block_bytes, 24576);
+        assert!(c.load_notice.is_none());
+        // A fresh config has the new default and needs no migration.
+        assert_eq!(Config::default().board.usb_block_bytes, 8192);
+        assert_eq!(Config::default().defaults_rev, DEFAULTS_REV);
+    }
 
     #[test]
     fn electrode_settings_follow_their_electrodes_across_a_layout_change() {
