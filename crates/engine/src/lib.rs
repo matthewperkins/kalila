@@ -14,6 +14,7 @@ pub mod dsp;
 pub mod pyramid;
 pub mod record;
 mod sched;
+pub mod signals;
 
 use anyhow::{Result, bail};
 use audio::{AudioMonitor, AudioSettings, AudioStats};

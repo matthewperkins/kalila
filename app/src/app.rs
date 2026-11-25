@@ -121,6 +121,8 @@ pub struct App {
     toast: Option<(String, Instant)>,
     /// When a window close was last refused because a recording is running (shows a message).
     close_refused: Option<Instant>,
+    /// SIGTERM/SIGINT arrived: the app is closing on purpose, so a recording does not refuse it.
+    signal_quit: bool,
     dirty_cfg: Instant,
     /// Wheel movement over the spike grid not yet turned into rows (`wheel_rows`).
     spike_scroll: f32,
@@ -203,6 +205,7 @@ impl App {
             gpu_name: format!("{} ({:?})", info.name, info.backend),
             toast: None,
             close_refused: None,
+            signal_quit: false,
             dirty_cfg: Instant::now(),
             spike_scroll: 0.0,
             underrun_window: std::cell::Cell::new((Instant::now(), 0, 0)),
@@ -1301,6 +1304,17 @@ impl eframe::App for App {
     /// Runs every pass, also while the main window is hidden (Wayland then withholds its
     /// frames and eframe runs only this): board, outputs and the display/spike queues.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if engine::signals::requested() && !self.signal_quit {
+            // Logout, `kill`, systemd stop, Ctrl+C: close through the normal path (`on_exit`
+            // finalises the recording and saves the config), bypassing the refusal while recording.
+            log::warn!(
+                "{} received: closing; this bypasses the 'recording in progress' refusal",
+                engine::signals::name()
+            );
+            self.signal_quit = true;
+            self.engine.stop_recording();
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+        }
         let was_board = self.engine.has_board();
         self.engine.poll();
         if !was_board && self.engine.has_board() {
@@ -1440,7 +1454,11 @@ impl eframe::App for App {
         self.car_palette(ui.ctx(), CarTarget::Global);
         self.trace_windows(ui.ctx());
         // Window close (Hyprland killactive, Meta+C): refused while recording; stop it first.
-        if ui.ctx().input(|i| i.viewport().close_requested()) && self.engine.is_recording() {
+        if refuse_close(
+            ui.ctx().input(|i| i.viewport().close_requested()),
+            self.engine.is_recording(),
+            self.signal_quit,
+        ) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_refused = Some(Instant::now());
         }
@@ -1515,6 +1533,24 @@ impl eframe::App for App {
         }
         self.engine.stop_acquisition();
         self.save_cfg();
+    }
+}
+
+/// A window close is refused while recording, unless it comes from a signal (`signal_quit`).
+fn refuse_close(close_requested: bool, recording: bool, signal_quit: bool) -> bool {
+    close_requested && recording && !signal_quit
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::refuse_close;
+
+    #[test]
+    fn a_signal_bypasses_the_close_refusal() {
+        assert!(refuse_close(true, true, false));
+        assert!(!refuse_close(true, true, true));
+        assert!(!refuse_close(true, false, false));
+        assert!(!refuse_close(false, true, false));
     }
 }
 

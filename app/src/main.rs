@@ -50,6 +50,7 @@ fn main() -> eframe::Result {
         env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"),
     )
     .init();
+    engine::signals::install();
     let mut cfg = config::Config::load();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {

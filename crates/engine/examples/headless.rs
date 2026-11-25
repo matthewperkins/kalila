@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    engine::signals::install();
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let opt = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
@@ -98,6 +99,11 @@ fn main() -> anyhow::Result<()> {
     // (second of samples, host time of arrival − sample time) for each block's newest sample.
     let mut arrivals: Vec<(i64, f64)> = Vec::new();
     while t0.elapsed().as_secs_f64() < secs {
+        if engine::signals::requested() {
+            // Leave through the normal end-of-run path below (stop recording, then acquisition).
+            println!("{} received: stopping", engine::signals::name());
+            break;
+        }
         e.poll();
         if !e.is_acquiring() {
             anyhow::bail!("acquisition stopped: {:?}", e.last_error);
