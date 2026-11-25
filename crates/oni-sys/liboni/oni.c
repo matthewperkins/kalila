@@ -1140,6 +1140,11 @@ static int _oni_pump_signal_type(oni_ctx ctx, int flags, oni_signal_t *type)
     do {
         int pack_size = _oni_read_signal_packet(ctx, buffer);
 
+        // kalila patch: a failed read of the signal stream (the board gone or silent) is
+        // returned; upstream tried again forever. A bad delimiter is still retried.
+        if (pack_size < 0 && pack_size != ONI_ECOBSPACK)
+            return pack_size;
+
         if (pack_size < 1)
             continue; // Something wrong with delimiter, try again
 
@@ -1166,6 +1171,11 @@ static int _oni_pump_signal_data(oni_ctx ctx, int flags, oni_signal_t *type, voi
 
     do {
         pack_size = _oni_read_signal_packet(ctx, buffer);
+
+        // kalila patch: a failed read of the signal stream (the board gone or silent) is
+        // returned; upstream tried again forever. A bad delimiter is still retried.
+        if (pack_size < 0 && pack_size != ONI_ECOBSPACK)
+            return pack_size;
 
         if (pack_size < 1)
             continue; // Something wrong with delimiter, try again
