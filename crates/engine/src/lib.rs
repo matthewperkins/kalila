@@ -401,7 +401,7 @@ impl Engine {
                 std::thread::Builder::new()
                     .name("audio-feed".into())
                     .spawn(move || {
-                        let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max);
+                        sched::set_audio_feed();
                         let mut m = AudioMonitor::new(s, st, fs);
                         while let Ok(b) = rx.recv() {
                             m.process(&b);
@@ -425,6 +425,7 @@ impl Engine {
                 // an open recording and clears `recording`; otherwise the GUI could neither
                 // stop that recording nor close.
                 let _stopped = AcqStopped(rec_tx.clone());
+                let _awake = sched::KeepAwake::new();
                 rt2.store(set_realtime(), Ordering::Relaxed);
                 let r = acquisition_loop(board.as_mut(), &stop2, &live_rx, &disp_tx, &dsp_tx, &aud_tx, &pyr_tx, &rec_tx, &rec_status, rec_limit, &health, &pipe);
                 if let Err(e) = &r {
@@ -440,7 +441,7 @@ impl Engine {
         std::thread::sleep(Duration::from_millis(5));
         self.rt_priority = rt.load(Ordering::Relaxed);
         if !self.rt_priority {
-            warn!("acquisition thread is not real-time; see README (rtprio limits). Board DRAM still buffers stalls.");
+            warn!("acquisition thread is not real-time{}. Board DRAM still buffers stalls.", if cfg!(target_os = "linux") { "; see README (rtprio limits)" } else { "" });
         }
         self.live_tx = Some(live_tx);
         self.display_rx = Some(disp_rx);

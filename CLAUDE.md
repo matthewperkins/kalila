@@ -292,8 +292,16 @@ they are; platform code sits behind small `cfg` seams.
 - `sync_all` is `F_FULLFSYNC` on macOS (slow); the recorder only syncs when a recording
   finishes. The simulation test takes ~135 s there against ~6 s on Linux.
 - Scripted GUI runs on the Mac: window points are half the pixels (Retina).
-- Still to do: keep-awake assertion, time-constraint policy, the IOKit backend and its board
-  sessions, Cmd equivalents for the Ctrl gestures, a macOS CI job, an `.app`.
+- **Scheduling and power** (`engine::sched`, 2026-11-24): the acquisition and audio-feed
+  threads take the user-interactive QoS class and a Mach time-constraint policy (dimna's
+  figures: period 1 ms, computation 0.5 ms, constraint 1 ms, preemptible), so the status
+  chip reads RT; `KeepAwake` holds a `PreventUserIdleSystemSleep` assertion for the
+  acquisition thread's lifetime (seen in `pmset -g assertions`).
+- **Open: audio underruns on the simulator**, about 2 per second (45 in 19 s, buffer 128 at
+  48 kHz, latency 7 ms), the same with `present_mode` "vsync" and with the policy above, so
+  neither the redraw rate (it free-runs at ~3000 fps with "auto") nor the feeder's
+  priority. Not yet tried: the simulator's pacing sleep, the Core Audio callback sizes.
+- Still to do: the IOKit backend and its board sessions, Cmd equivalents for the Ctrl gestures, a macOS CI job, an `.app`.
 
 ## Trace windows (rig, 2026-11-06)
 

@@ -348,7 +348,7 @@ impl App {
             if h.hw_buffer_pct > 0.0 || h.frames > 0 {
                 chip(ui, h.hw_buffer_pct < 50.0, format!("hw buf {:.1}%", h.hw_buffer_pct), "Acquisition board DRAM FIFO usage. Rising = host not keeping up.");
             }
-            chip(ui, self.engine.rt_priority(), if self.engine.rt_priority() { "RT".into() } else { "no RT".into() }, "Acquisition thread real-time scheduling (SCHED_FIFO). See README to enable.");
+            chip(ui, self.engine.rt_priority(), if self.engine.rt_priority() { "RT".into() } else { "no RT".into() }, if cfg!(target_os = "macos") { "Acquisition thread real-time scheduling (Mach time-constraint policy)." } else { "Acquisition thread real-time scheduling (SCHED_FIFO). See README to enable." });
             let a = &self.engine.audio_stats;
             if a.running.load(Ordering::Relaxed) {
                 // Red at 5 or more underruns within about the last minute (this minute so far, or
