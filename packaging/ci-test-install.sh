@@ -60,7 +60,8 @@ run_checks() {
 
 case "$mode" in
 package)
-    dist=$2
+    # Absolute: apt-get reads "dist/x.deb" as package "dist", release "x.deb".
+    dist=$(cd "$2" && pwd -P)
     if command -v apt-get >/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -q
@@ -93,7 +94,8 @@ tarball)
         pacman -Syu --noconfirm alsa-lib libpipewire vulkan-icd-loader wayland libxkbcommon gcc-libs
     elif command -v xbps-install >/dev/null; then
         xbps-install -Syu xbps
-        xbps-install -Sy alsa-lib libpipewire vulkan-loader wayland libxkbcommon libgcc
+        # tar: Void's container image has none.
+        xbps-install -Sy alsa-lib libpipewire vulkan-loader wayland libxkbcommon libgcc tar
     else
         fail "no known package manager for the runtime libraries"
     fi

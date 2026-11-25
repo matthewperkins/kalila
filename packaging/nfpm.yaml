@@ -140,6 +140,11 @@ contents:
     file_info:
       mode: 0644
 
+  # The folder itself, so that an .rpm owns it and removes it with the package.
+  - dst: /usr/share/doc/kalila
+    type: dir
+    file_info:
+      mode: 0755
   - src: README.md
     dst: /usr/share/doc/kalila/README.md
     file_info:
