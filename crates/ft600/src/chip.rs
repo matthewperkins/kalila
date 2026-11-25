@@ -46,7 +46,7 @@ use std::time::Instant;
 
 use log::info;
 
-use crate::usbfs::{self, Device, UsbError};
+use crate::usb::{self, Device, UsbError};
 
 pub const VENDOR_ID: u16 = 0x0403;
 /// FT600 (16-bit FIFO) and FT601 (32-bit FIFO).
@@ -160,7 +160,7 @@ impl Ft600 {
     /// Opens the `index`-th board (bus/device order) whose product string is `product`; a
     /// negative index means the first. Claims both interfaces.
     pub fn open(product: &str, index: i32) -> Result<Ft600, Error> {
-        let locs = usbfs::find(VENDOR_ID, &PRODUCT_IDS, product);
+        let locs = usb::find(VENDOR_ID, &PRODUCT_IDS, product);
         let want = index.max(0) as usize;
         let loc = *locs.get(want).ok_or(UsbError::NotFound)?;
         let dev = Device::open(loc)?;
@@ -411,12 +411,15 @@ mod tests {
 
     #[test]
     fn no_other_file_in_the_workspace_calls_or_defines_a_usb_control_transfer() {
-        // Only usbfs.rs may define the function and only chip.rs may call it. Text
-        // is searched line by line, comments included. Not seen: calls through a function
-        // pointer or alias. The raw ioctl number is looked for too (only usbfs.rs may use it).
+        // Only the two backends (usbfs.rs, usb_iokit.rs) may define the function and only
+        // chip.rs may call it. Text is searched line by line, comments included. Not seen:
+        // calls through a function pointer or alias. The raw calls are looked for too: the
+        // ioctl number (only usbfs.rs may use it) and IOKit's request (only usb_iokit.rs).
         let call = concat!(".", "control(");
         let def = concat!("fn ", "control(");
         let ioctl = concat!("USBDEVFS_", "CONTROL");
+        let iokit = concat!("Device", "Request");
+        let iokit_slot = concat!("DEV_", "REQUEST_TO");
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut files = 0;
         let mut bad = Vec::new();
@@ -439,7 +442,10 @@ mod tests {
                 let text = std::fs::read_to_string(&p).unwrap();
                 for (n, line) in text.lines().enumerate() {
                     let here = || format!("{}:{}: {}", p.display(), n + 1, line.trim());
-                    if line.contains(def) && !(in_ft600 && name == "usbfs.rs") {
+                    if line.contains(def) && !(in_ft600 && (name == "usbfs.rs" || name == "usb_iokit.rs")) {
+                        bad.push(here());
+                    }
+                    if (line.contains(iokit) || line.contains(iokit_slot)) && !(in_ft600 && name == "usb_iokit.rs") {
                         bad.push(here());
                     }
                     if line.contains(call) && !(in_ft600 && name == "chip.rs") {

@@ -17,7 +17,7 @@ use log::{error, info};
 use oni_sys as sys;
 
 use crate::chip::{Channel, Error, Ft600};
-use crate::usbfs::UsbError;
+use crate::usb::UsbError;
 
 /// The name to pass to `oni_create_ctx` once `register` has run.
 pub const DRIVER_NAME: &str = "kalilausb";
@@ -31,9 +31,12 @@ const SIGRES_REG: u8 = 0x02;
 const DEFAULT_PRIO: u32 = 0x0A0A_0000;
 const AUX_SIZE: usize = 8192;
 
-/// Read pacing (see `read_stream`) is on unless `KALILA_USB_PACE=0`.
+/// Read pacing (see `read_stream`): `KALILA_USB_PACE=0` turns it off, any other value on.
+/// Unset, it is on, except on macOS: there the pacing sleep wakes 2 to 5 ms late while the
+/// screen is busy (measured in dimna's port, blocks up to 21 ms late), and waiting in the
+/// USB transfer instead cost no more CPU.
 fn pacing() -> bool {
-    std::env::var("KALILA_USB_PACE").map_or(true, |v| !v.starts_with('0'))
+    std::env::var("KALILA_USB_PACE").map_or(cfg!(not(target_os = "macos")), |v| !v.starts_with('0'))
 }
 
 /// A byte ring of fixed capacity (one slot is kept free, as upstream's circBuffer).
@@ -710,7 +713,7 @@ mod tests {
     fn liboni_finds_the_registered_driver_and_init_fails_cleanly_without_a_board() {
         // No board on the dev box (and none must be touched by tests): only meaningful
         // where no FT600 is attached, which is checked first.
-        if !crate::usbfs::find(crate::chip::VENDOR_ID, &crate::chip::PRODUCT_IDS, USB_DESCRIPTION).is_empty() {
+        if !crate::usb::find(crate::chip::VENDOR_ID, &crate::chip::PRODUCT_IDS, USB_DESCRIPTION).is_empty() {
             return;
         }
         register();

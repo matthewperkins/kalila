@@ -5,7 +5,8 @@
 //! where the FT600 protocol was learned from D3XX 1.0.14 and measured on the rig. Three
 //! layers:
 //!
-//! - `usbfs`: USB through the kernel's usbdevfs, no libusb;
+//! - `usb`: USB with no library in between: the kernel's usbdevfs on Linux (`usbfs.rs`),
+//!   IOKit's USB user client on macOS (`usb_iokit.rs`, not yet run with a board);
 //! - `chip`: the FT600 wire protocol; every control request is checked against an allowlist
 //!   that excludes writing the chip configuration;
 //! - `driver`: an ONI driver (a port of liboni's `onidriver_ft600.c`) registered with the
@@ -14,10 +15,15 @@
 //! What it sends the board: what D3XX sends on every open (GPIO requests, GPIO 0 being the
 //! board's FIFO reset; transfer announcements; pipe aborts; two read-only requests, firmware
 //! version and chip configuration) and the ONI command and register traffic liboni asks for.
-//! Linux only. The default; `KALILA_DRIVER=d3xx` selects liboni's D3XX driver instead.
+//! The default; `KALILA_DRIVER=d3xx` selects liboni's D3XX driver instead.
 
 mod chip;
 mod driver;
-mod usbfs;
+#[cfg(target_os = "macos")]
+#[path = "usb_iokit.rs"]
+mod usb;
+#[cfg(not(target_os = "macos"))]
+#[path = "usbfs.rs"]
+mod usb;
 
 pub use driver::{DRIVER_NAME, register};

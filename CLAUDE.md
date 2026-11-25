@@ -279,10 +279,26 @@ they are; platform code sits behind small `cfg` seams.
   The WGSL shaders run unchanged.
 - **Seams so far:** `engine::sched` (SCHED_FIFO / SCHED_IDLE on Linux, QoS classes on
   macOS), `oni::DRIVER_FILE` (`.so` / `.dylib`), `oni-sys/build.rs` links `libdl` on Linux only.
-- **The board does not work on macOS yet.** `crates/ft600` compiles there but `usbfs.rs` is
-  Linux's usbdevfs. Decided with the user: an IOKit backend in **pure Rust** (no C shim,
-  unlike dimna's `usb_iokit.c`), behind the same surface, under the same control-request
-  allowlist. Never run against a board without the user present.
+- **The board on macOS: written, never run with a board** (2026-11-24).
+  `crates/ft600/src/usb_iokit.rs`, the macOS backend behind the same surface as `usbfs.rs`
+  (`crate::usb` picks one per OS). Decided with the user: **pure Rust**, no C shim, so it
+  is a port of dimna's `usb_iokit.c` that calls IOKit's COM-style tables by slot number.
+  The slots, UUIDs, struct layouts and result codes were printed by a throwaway C program
+  against the macOS 27 SDK (`offsetof(IOUSBDeviceInterface942, …) / 8`).
+  - Sends the board nothing the Linux backend does not: the same `chip.rs` and `driver.rs`
+    run above it, and every control transfer still goes through `Ft600::control_transfer`
+    and its allowlist. The workspace scan now also allows `fn control(` in `usb_iokit.rs`
+    and looks for IOKit's request call outside it (mutation-checked).
+  - Bulk transfers are async reads waited for on the caller's thread and aborted at the
+    timeout, so a timed-out read keeps its bytes. `KALILA_USB_TEST_ABORT_EVERY=N` gives up
+    every Nth read at once, to prove that with the board streaming.
+  - Read pacing is **off by default on macOS** (`KALILA_USB_PACE=1` turns it on), from
+    dimna's finding below.
+  - Without a board `headless --hw` ends with "no ONI acquisition board found".
+  - **First board sessions need the user present**, in dimna's order
+    (`~/dimna/docs/plans/macos-step8-usb.md`): registry and claim; 10 s traced; the same
+    with `KALILA_USB_TEST_ABORT_EVERY=3`; open and close twenty times; 10 min recorded;
+    unplug; then a recording compared with the rig's.
 - **From dimna's port** (`~/dimna/docs/plans/macos-port.md`, `macos-step8-usb.md`): timers
   wake 2–5 ms late while the screen is busy, so no timed pacing sleep on the acquisition
   path (the simulator's pacing sleep is the likely cause of audio underruns on the sim);
@@ -301,7 +317,7 @@ they are; platform code sits behind small `cfg` seams.
   48 kHz, latency 7 ms), the same with `present_mode` "vsync" and with the policy above, so
   neither the redraw rate (it free-runs at ~3000 fps with "auto") nor the feeder's
   priority. Not yet tried: the simulator's pacing sleep, the Core Audio callback sizes.
-- Still to do: the IOKit backend and its board sessions, Cmd equivalents for the Ctrl gestures, a macOS CI job, an `.app`.
+- Still to do: the board sessions on the Mac, Cmd equivalents for the Ctrl gestures, a macOS CI job, an `.app`.
 
 ## Trace windows (rig, 2026-11-06)
 
