@@ -229,8 +229,13 @@ impl MonitorDsp {
     /// Process a block into interleaved stereo at the acquisition rate.
     pub fn process(&mut self, s: &AudioSettings, blk: &Block, out: &mut Vec<f32>) {
         // A CAR change also rebuilds the chains, so the held noise σ is recalibrated.
-        let key = (s.channels.clone(), s.band, s.presence_db.to_bits(), s.car.clone());
-        if key != self.key {
+        // Compared in place, so a block allocates only when the key changes (it used to
+        // clone `channels` and the CAR into a new key for every block).
+        let (channels, band, presence_bits, car) = &self.key;
+        let changed =
+            *channels != s.channels || *band != s.band || *presence_bits != s.presence_db.to_bits() || *car != s.car;
+        if changed {
+            let key = (s.channels.clone(), s.band, s.presence_db.to_bits(), s.car.clone());
             let n = s.channels.len();
             self.chains = (0..n)
                 .map(|i| {
@@ -306,6 +311,9 @@ pub struct AudioMonitor {
     producer: Option<rtrb::Producer<f32>>,
     fs_in: f64,
     fs_out: f64,
+    /// The settings this thread works with: a copy of `settings`, refreshed only when they
+    /// differ, so a block clones (allocates) only after an edit.
+    cur: AudioSettings,
     dsp: MonitorDsp,
     resamp: SincResampler,
     tmp: Vec<f32>,
@@ -327,6 +335,7 @@ impl AudioMonitor {
             producer: None,
             fs_in,
             fs_out: 48000.0,
+            cur: s.clone(),
             dsp: MonitorDsp::new(fs_in),
             resamp: SincResampler::new(),
             tmp: Vec::new(),
@@ -348,13 +357,16 @@ impl AudioMonitor {
         let def = dev.default_output_config().context("default output config")?;
         let fs_out = def.sample_rate();
         let channels = def.channels().max(1);
-        let (prod, cons) = rtrb::RingBuffer::<f32>::new((fs_out as usize / 5) * 2);
-        let cons = Arc::new(Mutex::new(cons));
         let ch = channels as usize;
+        // Each attempt gets its own ring, and its consumer moves into that stream's callback,
+        // which then owns it outright (no lock on the real-time thread). An attempt that
+        // fails drops its callback and with it the consumer, so its producer is dropped too;
+        // only the stream that is started keeps a ring. Streams are never rebuilt later
+        // (the error callback only clears `running`).
         let build = |buffer_size: cpal::BufferSize| {
+            let (prod, mut cons) = rtrb::RingBuffer::<f32>::new((fs_out as usize / 5) * 2);
             let st = self.stats.clone();
             let est = self.stats.clone();
-            let cons = cons.clone();
             dev.build_output_stream::<f32, _, _>(
                 cpal::StreamConfig {
                     channels,
@@ -362,10 +374,6 @@ impl AudioMonitor {
                     buffer_size,
                 },
                 move |out: &mut [f32], _| {
-                    let Some(mut cons) = cons.try_lock() else {
-                        out.fill(0.0);
-                        return;
-                    };
                     let frames = out.len() / ch;
                     st.cb_frames.store(frames as u32, Ordering::Relaxed);
                     st.cb_frames_max.fetch_max(frames as u32, Ordering::Relaxed);
@@ -403,8 +411,9 @@ impl AudioMonitor {
                 },
                 None,
             )
+            .map(|stream| (stream, prod))
         };
-        let stream = match build(cpal::BufferSize::Fixed(s.device_buffer)) {
+        let (stream, prod) = match build(cpal::BufferSize::Fixed(s.device_buffer)) {
             Ok(st) => st,
             Err(e) => {
                 warn!(
@@ -427,7 +436,13 @@ impl AudioMonitor {
 
     /// Process one acquisition block (audio feeder thread).
     pub fn process(&mut self, blk: &Block) {
-        let s = self.settings.lock().clone();
+        {
+            let shared = self.settings.lock();
+            if *shared != self.cur {
+                self.cur = shared.clone();
+            }
+        }
+        let s = &self.cur;
         self.stats
             .active
             .store(s.enabled && self.producer.is_some(), Ordering::Relaxed);
@@ -438,7 +453,7 @@ impl AudioMonitor {
             self.dsp.recalibrate();
         }
         self.tmp.clear();
-        self.dsp.process(&s, blk, &mut self.tmp);
+        self.dsp.process(s, blk, &mut self.tmp);
         self.stats.held_sigma_cuv.store(
             self.dsp.held_sigma(0).map(|v| (v * 100.0) as u32).unwrap_or(0),
             Ordering::Relaxed,
@@ -900,5 +915,242 @@ mod tests {
             subtract: vec![0],
         }));
         assert_eq!(peak_after(&run(&s, &b), 3000), plain);
+    }
+
+    /// `MonitorDsp::process` as it was before the real-time changes (2026-11-25): settings
+    /// cloned per block, key rebuilt per block. Kept verbatim as the reference for
+    /// `output_is_bit_identical_to_the_reference_path`.
+    fn reference_dsp_process(d: &mut MonitorDsp, s: &AudioSettings, blk: &Block, out: &mut Vec<f32>) {
+        let key = (s.channels.clone(), s.band, s.presence_db.to_bits(), s.car.clone());
+        if key != d.key {
+            let n = s.channels.len();
+            d.chains = (0..n)
+                .map(|i| {
+                    let mut c = Chain::new(d.fs, s, pan_position(i, n));
+                    c.car = s.car.as_ref().is_some_and(|car| car.subtract.contains(&s.channels[i]));
+                    c
+                })
+                .collect();
+            d.key = key;
+            d.samples_since_cal = 0;
+        }
+        let dd = d.dynamics;
+        let vol = if s.mute { 0.0 } else { 10f32.powf(s.volume_db / 20.0) };
+        let floor = 10f32.powf(-24.0 * s.expansion.clamp(0.0, 1.0) / 20.0);
+        let expand = !s.reference && s.expansion > 0.0;
+        let presence = !s.reference && s.presence_db != 0.0;
+        let nch = blk.num_channels;
+        let norm_ch = 1.0 / (s.channels.len().max(1) as f32).sqrt();
+        for t in 0..blk.len() {
+            let row = &blk.data[t * nch..(t + 1) * nch];
+            let car = s.car.as_ref().map_or(0.0, |c| c.mean(row));
+            d.samples_since_cal += 1;
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            for (c, &chi) in d.chains.iter_mut().zip(s.channels.iter()) {
+                let raw = row.get(chi).copied().unwrap_or(0) as f32;
+                let x = (raw - if c.car { car } else { 0.0 }) * ELECTRODE_UV_PER_BIT;
+                let mut y = x;
+                for (b, z) in c.bp.iter().zip(c.bpz.iter_mut()) {
+                    y = b.tick(y, z);
+                }
+                if c.held_sigma.is_none() && c.noise.update(y) && c.noise.windows() >= 1 {
+                    c.held_sigma = Some(c.noise.sigma().max(0.5));
+                }
+                let sigma = c.held_sigma.unwrap_or_else(|| c.noise.sigma().max(0.5));
+                let a = y.abs();
+                c.env += if a > c.env { dd.attack } else { dd.release } * (a - c.env);
+                let target = if expand {
+                    let rr = c.env / (s.gate_sigma * sigma);
+                    let r4 = rr * rr * rr * rr;
+                    floor + (1.0 - floor) * (r4 / (1.0 + r4))
+                } else {
+                    1.0
+                };
+                c.gain += if target > c.gain { dd.gain_up } else { dd.gain_down } * (target - c.gain);
+                let dl = c.delay[c.dpos];
+                c.delay[c.dpos] = y;
+                c.dpos = (c.dpos + 1) % c.delay.len();
+                let mut v = dl * c.gain;
+                if presence {
+                    v = c.presence.tick(v, &mut c.pz);
+                }
+                v *= match s.gain_mode {
+                    GainMode::NoiseReferenced => 0.02 / sigma,
+                    GainMode::Absolute => 1.0 / s.absolute_fs_uv.max(1.0),
+                };
+                l += v * c.pan.0;
+                r += v * c.pan.1;
+            }
+            out.push(soft_limit(l * vol * norm_ch));
+            out.push(soft_limit(r * vol * norm_ch));
+        }
+    }
+
+    const BIT_FS: f64 = 30000.0;
+    const BIT_NCH: usize = 8;
+    const BIT_BLOCK: usize = 32;
+    const BIT_BLOCKS: usize = 3750; // 4 s
+    const BIT_HASH: u64 = 0xca0b73a1d5828a66;
+
+    /// 8 electrodes of noise and spikes (different per channel), as 32-sample blocks.
+    fn bit_blocks() -> Vec<Block> {
+        let chans: Vec<Block> = (0..BIT_NCH)
+            .map(|k| {
+                let rate = 5.0 + 11.0 * k as f64;
+                let amp = 40.0 + 15.0 * k as f64;
+                // A shared artefact on every channel, for the CAR.
+                synth(
+                    BIT_FS,
+                    4.0,
+                    4.0 + k as f64,
+                    &[(rate, amp), (3.0, 300.0)],
+                    100 + k as u64,
+                )
+            })
+            .collect();
+        (0..BIT_BLOCKS)
+            .map(|bi| {
+                let mut b = Block::with_capacity(BIT_NCH, BIT_BLOCK);
+                for t in bi * BIT_BLOCK..(bi + 1) * BIT_BLOCK {
+                    for c in &chans {
+                        b.data.push(c.data[t]);
+                    }
+                    b.timestamps.push(t as f64 / BIT_FS);
+                    b.ttl.push(0);
+                }
+                b
+            })
+            .collect()
+    }
+
+    /// The GUI's edits to the shared settings before block `bi` (some are edits back to
+    /// an equal value, which must not rebuild the chains). Returns true to recalibrate.
+    fn bit_edit(bi: usize, s: &mut AudioSettings) -> bool {
+        let car = |sub: Vec<usize>| {
+            Some(Arc::new(crate::dsp::Car {
+                reference: (0..BIT_NCH).collect(),
+                subtract: sub,
+            }))
+        };
+        match bi {
+            200 => s.volume_db = -3.0,
+            400 => s.channels = vec![2, 5],
+            900 => s.car = car(vec![2]),
+            1000 => s.car = car(vec![2]),    // a new Arc of equal value
+            1100 => s.channels = vec![2, 5], // a new Vec of equal value
+            1200 => s.mute = true,
+            1300 => s.mute = false,
+            1500 => s.reference = true,
+            1700 => {
+                s.reference = false;
+                s.gain_mode = GainMode::Absolute;
+            }
+            2000 => {
+                s.presence_db = 6.0;
+                s.expansion = 0.8;
+                s.gate_sigma = 4.0;
+            }
+            2300 => s.gain_mode = GainMode::NoiseReferenced,
+            2500 => {
+                s.band.low_hz = 500.0;
+                s.channels = vec![5, 2, 7];
+                s.car = car(vec![5, 7]);
+            }
+            3000 => return true,
+            3200 => s.enabled = false,
+            3300 => s.enabled = true,
+            3500 => {
+                s.channels = vec![1];
+                s.car = None;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn fnv(h: &mut u64, v: f32) {
+        for b in v.to_bits().to_le_bytes() {
+            *h = (*h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+
+    /// An `AudioMonitor` with a ring but no device, as `open_device` leaves it at 48 kHz.
+    fn monitor_without_device(settings: Arc<Mutex<AudioSettings>>) -> (AudioMonitor, rtrb::Consumer<f32>) {
+        let stats = Arc::new(AudioStats::default());
+        // No callback runs, so the servo never adjusts (as before the device starts).
+        stats.min_fill.store(u32::MAX, Ordering::Relaxed);
+        let mut m = AudioMonitor {
+            settings,
+            stats,
+            _stream: None,
+            producer: None,
+            fs_in: BIT_FS,
+            fs_out: 48000.0,
+            cur: AudioSettings::default(),
+            dsp: MonitorDsp::new(BIT_FS),
+            resamp: SincResampler::new(),
+            tmp: Vec::new(),
+            integ: 0.0,
+            last_ctl: std::time::Instant::now(),
+        };
+        let (prod, cons) = rtrb::RingBuffer::<f32>::new(48000 / 5 * 2);
+        m.producer = Some(prod);
+        (m, cons)
+    }
+
+    /// The feed path (`AudioMonitor::process`, settings edited through the shared mutex
+    /// between blocks as the GUI does) gives exactly the output of the pre-change path,
+    /// sample for sample and bit for bit.
+    #[test]
+    fn output_is_bit_identical_to_the_reference_path() {
+        let blocks = bit_blocks();
+        let shared = Arc::new(Mutex::new(AudioSettings::default()));
+        let (mut m, mut cons) = monitor_without_device(shared.clone());
+        let mut got = Vec::new();
+        // The reference: clone per block, the old key, the same resampler.
+        let mut rs = AudioSettings::default();
+        let mut rd = MonitorDsp::new(BIT_FS);
+        let mut rr = SincResampler::new();
+        let (mut rtmp, mut want) = (Vec::new(), Vec::new());
+        for (bi, b) in blocks.iter().enumerate() {
+            let recal = bit_edit(bi, &mut shared.lock());
+            if recal {
+                m.stats.recalibrate.store(true, Ordering::Relaxed);
+            }
+            m.process(b);
+            while let Ok(v) = cons.pop() {
+                got.push(v);
+            }
+
+            bit_edit(bi, &mut rs);
+            let s = rs.clone();
+            if !s.enabled {
+                continue;
+            }
+            if recal {
+                rd.recalibrate();
+            }
+            rtmp.clear();
+            reference_dsp_process(&mut rd, &s, b, &mut rtmp);
+            want.extend_from_slice(rr.process(&rtmp, 48000.0 / BIT_FS));
+        }
+        assert_eq!(got.len(), want.len());
+        let differ = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differ, 0, "{differ} of {} samples differ", got.len());
+        let mut h = 0xcbf29ce484222325u64;
+        for &v in &got {
+            fnv(&mut h, v);
+        }
+        eprintln!("bit-identity: {} samples, hash {h:#018x}", got.len());
+        // On the machine this was written on (x86_64, glibc) the hash was BIT_HASH both before
+        // and after the change. It is printed, not asserted: another libm (musl, macOS, another
+        // glibc) may round exp/powf differently; the comparison above holds everywhere.
+        if h != BIT_HASH {
+            eprintln!("bit-identity: the hash is not {BIT_HASH:#018x} (a different libm?)");
+        }
     }
 }
