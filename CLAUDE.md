@@ -259,7 +259,8 @@ before the GUI Stop/Start and Apply check.
 .deb/.rpm with nfpm, `nfpm.yaml`), `ci-test-install.sh` (install and run on a distribution),
 `collect-licenses.py` (licence files of every crate compiled in).
 - **glibc** built on Rocky 9 (glibc 2.34; `ci-build.sh` fails if a newer symbol is needed),
-  Rust pinned there (`RUST_VERSION`). Tested as packages on Ubuntu 22.04/24.04, Debian
+  Rust pinned there (`RUST_VERSION`). Tested as packages on Ubuntu 24.04 (**not 22.04**: its PipeWire 0.3.48 lacks
+  `pw_stream_get_time_n`, found by the workflow's first runs on GitHub, 2026-11-25), Debian
   12/13, Rocky 9, Alma 9, Fedora, and as a tarball on Arch.
 - **musl** built on Alpine 3.22, dynamically linked (`-C target-feature=-crt-static`, so
   Vulkan/Wayland/X11 can be dlopen()ed); liboni gets an empty `<execinfo.h>` there

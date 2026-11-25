@@ -42,7 +42,7 @@ Releases (<https://github.com/matthewperkins/kalila/releases>) have, for Linux o
 
 | file | for |
 |---|---|
-| `kalila_<version>_amd64.deb` | Debian 12+, Ubuntu 22.04+ |
+| `kalila_<version>_amd64.deb` | Debian 12+, Ubuntu 24.04+ (PipeWire 0.3.50 or newer) |
 | `kalila-<version>.x86_64.rpm` | RHEL / Alma / Rocky 9+, Fedora |
 | `kalila-<version>-x86_64-linux-gnu.tar.gz` | any distribution with glibc 2.34 or newer |
 | `kalila-<version>-x86_64-linux-musl.tar.gz` | musl distributions (Alpine, Void musl) |

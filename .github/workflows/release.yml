@@ -96,7 +96,8 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - ubuntu:22.04
+          # Not ubuntu:22.04: its PipeWire (0.3.48) lacks pw_stream_get_time_n (0.3.50),
+          # which the build needs; the .deb asks for 0.3.50 and so does not install there.
           - ubuntu:24.04
           - debian:12
           - debian:13

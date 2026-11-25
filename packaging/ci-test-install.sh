@@ -94,8 +94,8 @@ tarball)
         pacman -Syu --noconfirm alsa-lib libpipewire vulkan-icd-loader wayland libxkbcommon gcc-libs
     elif command -v xbps-install >/dev/null; then
         xbps-install -Syu xbps
-        # tar: Void's container image has none.
-        xbps-install -Sy alsa-lib libpipewire vulkan-loader wayland libxkbcommon libgcc tar
+        # tar and gzip: Void's container image has neither.
+        xbps-install -Sy alsa-lib libpipewire vulkan-loader wayland libxkbcommon libgcc tar gzip
     else
         fail "no known package manager for the runtime libraries"
     fi

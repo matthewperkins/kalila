@@ -5,7 +5,8 @@
 #
 #   packaging/ci-build.sh gnu  OUT_DIR    # on Rocky Linux 9: glibc 2.34, so the binaries run
 #                                         # on any glibc >= 2.34 (RHEL/Alma/Rocky 9, Fedora,
-#                                         # Debian 12+, Ubuntu 22.04+)
+#                                         # Debian 12+, Ubuntu 24.04+)
+#                                         # with PipeWire >= 0.3.50 (so not Ubuntu 22.04)
 #   packaging/ci-build.sh musl OUT_DIR    # on Alpine: dynamically linked against musl
 #
 # The version is the workspace's (Cargo.toml). With KALILA_TAG set (the workflow sets it for

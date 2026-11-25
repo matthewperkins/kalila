@@ -12,7 +12,7 @@ Real-time priority for the acquisition thread (recommended):
     sudo install -m 0644 share/99-kalila-realtime.conf /etc/security/limits.d/
     sudo groupadd -r realtime; sudo usermod -aG realtime $USER    # then log out and in
 
-System libraries: libasound (ALSA), libpipewire-0.3, the Vulkan loader with your GPU's
+System libraries: libasound (ALSA), libpipewire-0.3 (0.3.50 or newer), the Vulkan loader with your GPU's
 Vulkan driver, and libwayland-client + libxkbcommon (Wayland) or the X11 libraries (libX11,
 libXcursor, libXrandr, libXi). `BUILD-INFO` lists what the binaries link.
 
