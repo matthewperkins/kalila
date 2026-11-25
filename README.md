@@ -2,11 +2,9 @@
   <img src="packaging/icon/kalila-icon.svg" width="200" alt="kalila icon: the jackals Kalila and Dimna">
 </p>
 
-# kalila — Open Ephys acquisition in Rust
+# kalila — Open Neural Acquisition in Rust
 
-(Called oers until November 2026.)
-
-A rewrite of the Open Ephys GUI's acquisition path for the **ONI/FT600 acquisition board**
+Software for recording from the Open Ephys **ONI/FT600 acquisition board**
 (ECP5 gateware, not Opal Kelly), with a GPU-drawn egui interface and a spike-oriented audio
 monitor. Rust everywhere except the vendored C `liboni`. The board's FT600 USB chip is driven
 by kalila's own code (`crates/ft600`), so FTDI's closed-source D3XX library is not needed
@@ -216,12 +214,37 @@ in 16-channel mode on port A, RHD2216 on port B; NVIDIA RTX 2000 Ada, Hyprland):
   that, only the newest stretch keeps full detail, and short spans further back are read
   from the file. Tested on the simulator only.
 
-Only Linux is supported.
+Linux is where kalila has recorded from the board. The macOS app has only run on the simulated
+board so far: see "macOS (Apple silicon)" under Install.
 
 ## Not yet ported
 
 Impedance measurement, BNO/IMU display (IMU data *is* recorded), the general processor graph
 and other plugins, and a spike recording format.
+
+## Built on Open Ephys's work
+
+kalila exists because the Open Ephys team publishes its hardware, gateware and software
+openly.
+
+The ONI protocol in kalila is spoken entirely by [liboni](https://github.com/open-ephys/liboni)
+(MIT; version 4.6, vendored in `crates/oni-sys/liboni` and compiled in), written by Jonathan
+Newman, Aarón Cuevas López and contributors, and called from Rust through a thin FFI crate
+(`crates/oni-sys`). It is vendored with two small additions to its driver loader, marked
+`kalila patch`. Aarón Cuevas López's work on liboni's FT600 driver was the template for
+kalila's driver, which was created to avoid closed-source FTDI USB code.
+
+The board code (`crates/rhythm`: `oni_board.rs`, `registers.rs`) is a port of the Open Ephys
+[acquisition-board plugin](https://github.com/open-ephys-plugins/acquisition-board), and
+through it of Intan's `Rhd2000Registers`: the register writes, their order and their timing
+follow it, so the board and the Intan chips are set up as the Open Ephys GUI sets them up.
+The few places where kalila deliberately differs are marked `DIFF:` in the source.
+
+Recordings are written in the Open Ephys Binary format, as the GUI's Record Node writes
+it, so that the tools built around the GUI (open-ephys-python-tools, neo, SpikeInterface)
+read them.
+
+kalila is not an Open Ephys product, and its faults are its own.
 
 ## License
 
