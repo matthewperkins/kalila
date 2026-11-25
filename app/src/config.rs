@@ -635,6 +635,39 @@ mod tests {
         assert_eq!(Config::default().defaults_rev, DEFAULTS_REV);
     }
 
+    /// The four board-level outputs are stored twice: in `outputs` (the panel) and in `board`
+    /// (what the board was last programmed with; `App::sync_outputs` mirrors them there while
+    /// acquiring). Loading keeps both as saved: nothing reconciles them at load. At run time
+    /// `board` is what the board gets at open and at Apply, `outputs` from the first
+    /// `sync_outputs` of each acquisition on (package 3e's analysis).
+    #[test]
+    fn board_and_outputs_keep_their_own_output_values_at_load() {
+        let s = r#"{
+            "board": {"ttl_output_mode": true, "dac_hpf_enabled": true, "dac_hpf_hz": 150.0, "noise_slicer": 20},
+            "outputs": {"ttl_threshold_mode": false, "dac_hpf_enabled": false, "dac_hpf_hz": 300.0, "noise_slicer": 5}
+        }"#;
+        let c = Config::parse(s).unwrap();
+        let b = &c.board;
+        assert_eq!(
+            (b.ttl_output_mode, b.dac_hpf_enabled, b.dac_hpf_hz, b.noise_slicer),
+            (true, true, 150.0, 20)
+        );
+        let o = &c.outputs;
+        assert_eq!(
+            (o.ttl_threshold_mode, o.dac_hpf_enabled, o.dac_hpf_hz, o.noise_slicer),
+            (false, false, 300.0, 5)
+        );
+        // A board section without them (or a config without one) gets the board defaults,
+        // which are the panel's defaults.
+        let c = Config::parse(r#"{"board": {"sample_rate": 20000}}"#).unwrap();
+        let (b, o) = (&c.board, &c.outputs);
+        assert_eq!(
+            (b.ttl_output_mode, b.dac_hpf_enabled, b.dac_hpf_hz, b.noise_slicer),
+            (o.ttl_threshold_mode, o.dac_hpf_enabled, o.dac_hpf_hz, o.noise_slicer)
+        );
+        assert_eq!((b.sample_rate, b.noise_slicer, b.dac_hpf_hz), (20000, 0, 300.0));
+    }
+
     #[test]
     fn electrode_settings_follow_their_electrodes_across_a_layout_change() {
         use engine::rhythm::{Board, SimBoard};

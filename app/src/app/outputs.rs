@@ -80,8 +80,9 @@ impl Outputs {
                         Some(e) => names.get(e).cloned().unwrap_or_else(|| format!("#{}", e + 1)),
                         None => "off".into(),
                     };
+                    // Monospace while following: the proportional font has no ♪ (it drew an empty box).
                     ui.add_enabled_ui(!follow, |ui| {
-                        egui::ComboBox::from_id_salt(("dac", d)).width(64.0).selected_text(if follow { format!("♪ {text}") } else { text }).show_ui(ui, |ui| {
+                        egui::ComboBox::from_id_salt(("dac", d)).width(64.0).selected_text(if follow { RichText::new(format!("♪ {text}")).monospace() } else { RichText::new(text) }).show_ui(ui, |ui| {
                             ui.selectable_value(&mut o.dacs[d].electrode, None, "off");
                             for (i, n) in names.iter().enumerate() {
                                 ui.selectable_value(&mut o.dacs[d].electrode, Some(i), n);
