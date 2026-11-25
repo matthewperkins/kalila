@@ -1,5 +1,5 @@
-use crate::config::{Config, ElectrodeMap, OutputSettings, ViewFilter, electrode_keys};
-use crate::spikes::{SLOTS, SpikeCallback, SpikeFrame, SpikeGpu};
+use crate::config::{Config, ElectrodeMap, ViewFilter, electrode_keys};
+use crate::spikes::SpikeGpu;
 use crate::sweep::Sweeps;
 use crate::traces::{
     FilterBank, MAX_CUTS, RING, SweepFrame, TraceCallback, TraceConfig, TraceFrame, TraceGpus, review_key,
@@ -8,7 +8,7 @@ use crate::ttl::{TtlGeom, TtlOverlay};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use eframe::egui_wgpu;
 use engine::audio::GainMode;
-use engine::dsp::{Spike, ThresholdMode};
+use engine::dsp::ThresholdMode;
 use engine::rhythm::{BoardSettings, ChannelKind, LiveCommand, StreamLayout};
 use engine::{BoardChoice, Engine};
 use std::collections::VecDeque;
@@ -16,7 +16,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+mod outputs;
+mod spike_grid;
 mod views;
+use outputs::{Outputs, OutputsEnv};
+use spike_grid::{GridInput, SpikeGrid};
 use views::{SharedViews, ViewsShared};
 
 const PALETTE: [[f32; 3]; 8] = [
@@ -105,13 +109,7 @@ pub struct App {
     /// Which CAR the CAR window is editing, if open.
     car_window: bool,
     colors_dirty: bool,
-    spike_colors: Option<Arc<Vec<[f32; 4]>>>,
-    // spikes
-    spike_slot: Vec<usize>,
-    spike_new: Vec<(usize, usize, f32, Arc<Spike>)>,
-    spike_times: Vec<VecDeque<f64>>,
-    spike_reset: bool,
-    t0: Instant,
+    spikes: SpikeGrid,
     // stats
     frame_times: VecDeque<f32>,
     last_frame: Instant,
@@ -130,20 +128,12 @@ pub struct App {
     /// (`notes::route`: a note finished after its recording ended is told about).
     rec_span: Option<(i64, i64)>,
     dirty_cfg: Instant,
-    /// Wheel movement over the spike grid not yet turned into rows (`wheel_rows`).
-    spike_scroll: f32,
     /// Audio underruns: (start of the current minute, the total then, the count in the minute
     /// before), so the chip shows recent trouble, not the total since startup.
     underrun_window: std::cell::Cell<(Instant, u64, u64)>,
     autostart: bool,
-    // outputs
     was_acquiring: bool,
-    /// Manual TTL-out word (reset to 0 at every acquisition start, as the board does).
-    ttl_out_word: u16,
-    /// Last DAC route sent per DAC: (electrode, threshold µV).
-    dac_sent: [Option<(Option<usize>, f32)>; 8],
-    /// Last board-level output settings sent.
-    outputs_sent: Option<(bool, bool, u64, i32)>,
+    outputs: Outputs,
 }
 
 impl App {
@@ -173,8 +163,8 @@ impl App {
             BoardChoice::Simulated(cfg.sim_headstages.clone())
         };
         engine.open_board(choice, cfg.board.clone());
-        if cfg.load_error.is_some() {
-            engine.last_error = cfg.load_error.clone();
+        if let Some(e) = &cfg.load_error {
+            engine.report(e);
         }
         let audio_text = channels_to_text(&cfg.audio.channels);
         let shared = Arc::new(parking_lot::Mutex::new(ViewsShared::new(
@@ -198,12 +188,7 @@ impl App {
             ui_script: crate::uiscript::UiScript::from_env(),
             car_window: false,
             colors_dirty: true,
-            spike_colors: None,
-            spike_slot: Vec::new(),
-            spike_new: Vec::new(),
-            spike_times: Vec::new(),
-            spike_reset: true,
-            t0: Instant::now(),
+            spikes: SpikeGrid::new(),
             frame_times: VecDeque::new(),
             last_frame: Instant::now(),
             confirm_stop: false,
@@ -215,13 +200,10 @@ impl App {
             rec_stopping: false,
             rec_span: None,
             dirty_cfg: Instant::now(),
-            spike_scroll: 0.0,
             underrun_window: std::cell::Cell::new((Instant::now(), 0, 0)),
             autostart,
             was_acquiring: false,
-            ttl_out_word: 0,
-            dac_sent: [None; 8],
-            outputs_sent: None,
+            outputs: Outputs::default(),
         }
         .with_load_notice()
     }
@@ -312,33 +294,7 @@ impl App {
             sh.check_stalls();
         }
         // Spikes.
-        if self.spike_slot.len() != nel {
-            self.spike_slot = vec![0; nel];
-            self.spike_times = vec![VecDeque::new(); nel];
-            self.spike_reset = true;
-        }
-        let now = self.t0.elapsed().as_secs_f64();
-        if let Some(rx) = self.engine.spike_rx() {
-            for sp in rx.try_iter() {
-                if sp.channel >= nel {
-                    continue;
-                }
-                let slot = self.spike_slot[sp.channel];
-                self.spike_slot[sp.channel] = (slot + 1) % SLOTS;
-                self.spike_times[sp.channel].push_back(now);
-                self.spike_new.push((sp.channel, slot, now as f32, Arc::new(sp)));
-            }
-            // Drained only while the main window draws: when it's hidden for hours, keep just
-            // what can still be shown, the newest spike in each tile slot (nel × SLOTS).
-            if self.spike_new.len() > 2 * nel * SLOTS {
-                compact_newest_per_slot(&mut self.spike_new);
-            }
-        }
-        for q in &mut self.spike_times {
-            while q.front().is_some_and(|&t| now - t > 2.0) {
-                q.pop_front();
-            }
-        }
+        self.spikes.ingest(nel, self.engine.spike_rx().map(|rx| rx.try_iter()));
     }
 
     fn channel_colors(&self, l: &StreamLayout, per_row: usize) -> Vec<[f32; 4]> {
@@ -397,7 +353,7 @@ impl App {
                 {
                     self.reset_views();
                     if let Err(e) = self.engine.start_acquisition() {
-                        self.engine.last_error = Some(format!("{e:#}"));
+                        self.engine.report(e);
                     }
                 }
             } else if ui
@@ -602,9 +558,8 @@ impl App {
 
     fn reset_views(&mut self) {
         self.shared.lock().reset_all();
-        self.spike_reset = true;
+        self.spikes.reset();
         self.colors_dirty = true;
-        self.spike_new.clear();
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -793,72 +748,29 @@ impl App {
         });
     }
 
-    /// DAC/TTL outputs. All live: sent while acquiring, and again at every acquisition start
-    /// (`sync_outputs`). Writes only the board's DAC-select/threshold, HPF, DAC-control
-    /// (noise slicer), MODE (TTL-out mode) registers and the TTL-out device.
+    /// DAC/TTL outputs panel; the manual TTL-out words it produces go to the board here.
     fn outputs_section(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("Outputs (DAC / TTL)").strong()).default_open(false).show(ui, |ui| {
-            let acquiring = self.engine.is_acquiring();
-            let names: Vec<String> = self.layout().map(|l| l.channels.iter().filter(|c| c.kind == ChannelKind::Electrode).map(|c| c.name.clone()).collect()).unwrap_or_default();
-            let audio_first = self.engine.audio_settings.lock().channels.first().copied();
-            let o = &mut self.cfg.outputs;
-            let old = o.clone();
-            ui.small("Applied live while acquiring and re-sent at every start.");
-            ui.checkbox(&mut o.dac1_follows_audio, "DAC 1 follows audio monitor").on_hover_text("DAC 1 (board audio L) plays the first channel on the audio monitor");
-            egui::Grid::new("dacs").num_columns(3).spacing([6.0, 3.0]).show(ui, |ui| {
-                for d in 0..8 {
-                    ui.label(format!("DAC {}{}", d + 1, match d {
-                        0 => " L",
-                        1 => " R",
-                        _ => "",
-                    }))
-                    .on_hover_text(if d < 2 { "Also the board's audio output (noise slicer applies)" } else { "Analog output" });
-                    let follow = d == 0 && o.dac1_follows_audio;
-                    let cur = if follow { audio_first } else { o.dacs[d].electrode };
-                    let text = match cur {
-                        Some(e) => names.get(e).cloned().unwrap_or_else(|| format!("#{}", e + 1)),
-                        None => "off".into(),
-                    };
-                    ui.add_enabled_ui(!follow, |ui| {
-                        egui::ComboBox::from_id_salt(("dac", d)).width(64.0).selected_text(if follow { format!("♪ {text}") } else { text }).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut o.dacs[d].electrode, None, "off");
-                            for (i, n) in names.iter().enumerate() {
-                                ui.selectable_value(&mut o.dacs[d].electrode, Some(i), n);
-                            }
-                        });
-                    });
-                    ui.add(egui::DragValue::new(&mut o.dacs[d].threshold_uv).range(-5000.0..=5000.0).speed(1.0).suffix(" µV"))
-                        .on_hover_text("Comparator threshold: ≥ 0 fires at or above it, < 0 at or below it. Drives TTL out n in threshold mode.");
-                    ui.end_row();
-                }
-            });
-            ui.checkbox(&mut o.ttl_threshold_mode, "Threshold → TTL out").on_hover_text("TTL out n goes high while DAC n crosses its threshold (stock \"DAC TTL\")");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut o.dac_hpf_enabled, "DAC high-pass");
-                ui.add_enabled(o.dac_hpf_enabled, egui::DragValue::new(&mut o.dac_hpf_hz).range(1.0..=5000.0).speed(5.0).suffix(" Hz"));
-            });
-            ui.add(egui::Slider::new(&mut o.noise_slicer, 0..=127).text("noise slicer (DAC L/R)"));
-            ui.horizontal(|ui| {
-                ui.label("TTL out");
-                let manual = acquiring && !o.ttl_threshold_mode;
-                for i in 0..8 {
-                    let on = self.ttl_out_word & (1 << i) != 0;
-                    let b = egui::Button::new(RichText::new(format!("{}", i + 1)).monospace()).selected(on).min_size(egui::vec2(18.0, 0.0));
-                    if ui.add_enabled(manual, b).on_hover_text("Toggle TTL output line").clicked() {
-                        self.ttl_out_word ^= 1 << i;
-                        self.engine.send_live(LiveCommand::SetTtlOut(self.ttl_out_word));
-                    }
-                }
-            });
-            if o.ttl_threshold_mode {
-                ui.weak("TTL out follows the DAC comparators (manual off)");
-            } else if !acquiring {
-                ui.weak("Manual TTL out needs acquisition running");
-            }
-            if *o != old {
-                self.dirty_cfg = Instant::now();
-            }
+        let acquiring = self.engine.is_acquiring();
+        let engine = &self.engine;
+        let res = self.outputs.ui(ui, &mut self.cfg.outputs, acquiring, || OutputsEnv {
+            names: engine
+                .layout()
+                .map(|l| {
+                    l.channels
+                        .iter()
+                        .filter(|c| c.kind == ChannelKind::Electrode)
+                        .map(|c| c.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            audio_first: engine.audio_settings.lock().channels.first().copied(),
         });
+        for w in res.ttl_out {
+            self.engine.send_live(LiveCommand::SetTtlOut(w));
+        }
+        if res.changed {
+            self.dirty_cfg = Instant::now();
+        }
     }
 
     /// When the electrode layout changes (16-ch toggle, rescan, another board), move every
@@ -917,38 +829,13 @@ impl App {
             return;
         }
         let nel = self.electrode_rows();
-        let o: OutputSettings = self.cfg.outputs.clone();
         let audio_first = self.engine.audio_settings.lock().channels.first().copied();
-        for d in 0..8 {
-            let e = if d == 0 && o.dac1_follows_audio {
-                audio_first
-            } else {
-                o.dacs[d].electrode
-            };
-            let want = (e.filter(|&e| e < nel), o.dacs[d].threshold_uv);
-            if force || self.dac_sent[d] != Some(want) {
-                self.engine.send_live(LiveCommand::DacRoute {
-                    dac: d,
-                    electrode: want.0,
-                    threshold_uv: want.1,
-                });
-                self.dac_sent[d] = Some(want);
-            }
+        let (cmds, board_level) = self.outputs.plan(&self.cfg.outputs, nel, audio_first, force);
+        for c in cmds {
+            self.engine.send_live(c);
         }
-        let want = (
-            o.ttl_threshold_mode,
-            o.dac_hpf_enabled,
-            o.dac_hpf_hz.to_bits(),
-            o.noise_slicer,
-        );
-        if force || self.outputs_sent != Some(want) {
-            self.engine.send_live(LiveCommand::SetTtlMode(o.ttl_threshold_mode));
-            self.engine.send_live(LiveCommand::SetDacHpf {
-                enabled: o.dac_hpf_enabled,
-                hz: o.dac_hpf_hz,
-            });
-            self.engine.send_live(LiveCommand::SetNoiseSlicer(o.noise_slicer));
-            self.outputs_sent = Some(want);
+        if board_level {
+            let o = &self.cfg.outputs;
             // Mirror into the board settings so they never show up as "changed" (Apply).
             for b in [&mut self.edit_board, &mut self.cfg.board] {
                 b.ttl_output_mode = o.ttl_threshold_mode;
@@ -1193,118 +1080,26 @@ impl App {
 
     fn spike_view(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let Some(l) = self.layout() else { return };
-        let nel = l.num_electrodes();
-        if nel == 0 {
+        if l.num_electrodes() == 0 {
             return;
         }
-        let ppp = ui.ctx().pixels_per_point();
-        let d = self.cfg.display.clone();
-        let gc = d.spike_grid_cols.max(1) as usize;
-        let cell_w = rect.width() / gc as f32;
-        let cell_h = (cell_w * 0.75).max(40.0);
-        let rows_fit = ((rect.height() / cell_h).floor() as usize).max(1);
-        // Mouse wheel scrolls the grid by rows of tiles.
-        let total_rows = nel.div_ceil(gc);
-        let max_first = total_rows.saturating_sub(rows_fit);
-        let hovered = ui.rect_contains_pointer(rect);
-        let scroll = if hovered {
-            ui.input(|i| i.smooth_scroll_delta.y)
-        } else {
-            0.0
-        };
-        let mut first_row = self.cfg.display.spike_first_row.min(max_first);
-        let step = wheel_rows(&mut self.spike_scroll, scroll);
-        if step != 0 {
-            first_row = (first_row as isize - step).clamp(0, max_first as isize) as usize;
+        let monitored = self.engine.audio_settings.lock().channels.clone();
+        let stats = self.engine.channel_stats.lock().clone();
+        let out = self.spikes.ui(
+            ui,
+            rect,
+            &GridInput {
+                layout: &l,
+                display: &self.cfg.display,
+                monitored: &monitored,
+                stats: &stats,
+            },
+        );
+        self.cfg.display.spike_first_row = out.first_row;
+        if out.scrolled {
             self.dirty_cfg = Instant::now();
         }
-        self.cfg.display.spike_first_row = first_row;
-        let first = first_row * gc;
-        let ncells = (gc * rows_fit).min(nel.saturating_sub(first));
-        let now = self.t0.elapsed().as_secs_f32();
-        let frame = SpikeFrame {
-            nch: nel,
-            reset: std::mem::take(&mut self.spike_reset),
-            new: std::mem::take(&mut self.spike_new),
-            vp_px: [rect.width() * ppp, rect.height() * ppp],
-            cell_px: [cell_w * ppp, cell_h * ppp],
-            grid_cols: gc as u32,
-            first_ch: first as u32,
-            ncells: ncells as u32,
-            uv_range: d.spike_uv_range,
-            now,
-            tau: d.spike_tau_s,
-            thickness: ppp.max(1.0),
-            colors: self.spike_colors.take().map(|c| {
-                Arc::new(
-                    c.iter()
-                        .take(nel)
-                        .copied()
-                        .map(|mut x| {
-                            x[3] = 0.55;
-                            x
-                        })
-                        .collect(),
-                )
-            }),
-        };
-        ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(10, 10, 12));
-        ui.painter()
-            .add(egui_wgpu::Callback::new_paint_callback(rect, SpikeCallback(frame)));
-        let resp = ui.interact(rect, ui.scope_id().with("spike_tiles"), egui::Sense::click());
-        let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
-        let mut clicked_ch = None;
-        let mon = self.engine.audio_settings.lock().channels.clone();
-        let p = ui.painter_at(rect);
-        let cs = self.engine.channel_stats.lock().clone();
-        for i in 0..ncells {
-            let ch = first + i;
-            let o = rect.min + egui::vec2((i % gc) as f32 * cell_w, (i / gc) as f32 * cell_h);
-            let cell = egui::Rect::from_min_size(o, egui::vec2(cell_w, cell_h));
-            if click.is_some_and(|pos| cell.contains(pos)) {
-                clicked_ch = Some(ch);
-            }
-            let mc = monitor_color32(&mon, ch);
-            let monitored = mc.is_some();
-            let (border, label) = match mc {
-                Some(c) => (Stroke::new(1.5, c), c),
-                None => (Stroke::new(1.0, Color32::from_gray(35)), Color32::from_gray(160)),
-            };
-            p.rect_stroke(cell.shrink(1.0), 2.0, border, egui::StrokeKind::Inside);
-            let rate = self.spike_times.get(ch).map(|q| q.len() as f32 / 2.0).unwrap_or(0.0);
-            p.with_clip_rect(cell.shrink(1.0)).text(
-                o + egui::vec2(5.0, 3.0),
-                egui::Align2::LEFT_TOP,
-                format!(
-                    "{}{}  {:.1} Hz",
-                    l.channels[ch].name,
-                    if monitored { " ♪" } else { "" },
-                    rate
-                ),
-                egui::FontId::monospace(10.5),
-                label,
-            );
-            if let Some(&thr) = cs.threshold_uv.get(ch) {
-                let k = (cell_h * 0.5 - 4.0) / d.spike_uv_range;
-                let y = o.y + cell_h * 0.5 - thr * k;
-                if y > o.y && y < o.y + cell_h {
-                    p.line_segment(
-                        [egui::pos2(o.x + 4.0, y), egui::pos2(o.x + cell_w - 4.0, y)],
-                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(220, 80, 80, 90)),
-                    );
-                }
-                if let Some(s) = cs.sigma_uv.get(ch) {
-                    p.text(
-                        o + egui::vec2(cell_w - 5.0, cell_h - 3.0),
-                        egui::Align2::RIGHT_BOTTOM,
-                        format!("σ {s:.1}"),
-                        egui::FontId::monospace(10.0),
-                        Color32::from_gray(110),
-                    );
-                }
-            }
-        }
-        if let Some(ch) = clicked_ch {
+        if let Some(ch) = out.clicked {
             self.monitor_click(ui, vec![ch]);
         }
     }
@@ -1412,7 +1207,7 @@ impl eframe::App for App {
             if std::mem::take(&mut self.autostart)
                 && let Err(e) = self.engine.start_acquisition()
             {
-                self.engine.last_error = Some(format!("{e:#}"));
+                self.engine.report(e);
             }
         }
         if !self.engine.is_busy()
@@ -1431,7 +1226,7 @@ impl eframe::App for App {
         // then only changes (e.g. DAC 1 following a new audio channel).
         let acquiring = self.engine.is_acquiring();
         if acquiring && !self.was_acquiring {
-            self.ttl_out_word = 0;
+            self.outputs.acquisition_started();
             self.sync_outputs(true);
         } else {
             self.sync_outputs(false);
@@ -1482,7 +1277,7 @@ impl eframe::App for App {
             && let Some(l) = self.layout()
         {
             self.colors_dirty = false;
-            self.spike_colors = Some(Arc::new(self.channel_colors(&l, 1)));
+            self.spikes.set_colors(Arc::new(self.channel_colors(&l, 1)));
         }
         if self.dirty_cfg.elapsed() > Duration::from_secs(1) && self.dirty_cfg.elapsed() < Duration::from_secs(2) {
             self.save_cfg();
@@ -1583,7 +1378,6 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.stop_recording_now();
-                        std::thread::sleep(Duration::from_millis(50));
                         self.stop_acquisition_now();
                         self.confirm_stop = false;
                     }
@@ -1711,16 +1505,6 @@ fn style(ctx: &egui::Context) {
     });
 }
 
-/// Keeps the last entry for each (channel, slot), in order: later spikes overwrite earlier
-/// ones in a slot, so the dropped ones would never have been seen.
-fn compact_newest_per_slot<T>(v: &mut Vec<(usize, usize, f32, T)>) {
-    let mut seen = std::collections::HashSet::new();
-    let mut keep: Vec<bool> = v.iter().rev().map(|e| seen.insert((e.0, e.1))).collect();
-    keep.reverse();
-    let mut k = keep.into_iter();
-    v.retain(|_| k.next().unwrap());
-}
-
 fn channels_to_text(v: &[usize]) -> String {
     v.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join(", ")
 }
@@ -1739,23 +1523,7 @@ fn text_to_channels(s: &str, max: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod wheel_tests {
-    use super::{compact_newest_per_slot, wheel_rows};
-
-    #[test]
-    fn hidden_spike_backlog_keeps_the_newest_per_slot() {
-        // Channel 0 slots 0,1,0,1,0 and channel 1 slot 0, in time order (value = time).
-        let mut v = vec![
-            (0, 0, 1.0, ()),
-            (0, 1, 2.0, ()),
-            (1, 0, 3.0, ()),
-            (0, 0, 4.0, ()),
-            (0, 1, 5.0, ()),
-            (0, 0, 6.0, ()),
-        ];
-        compact_newest_per_slot(&mut v);
-        let t: Vec<f32> = v.iter().map(|e| e.2).collect();
-        assert_eq!(t, vec![3.0, 5.0, 6.0]);
-    }
+    use super::wheel_rows;
 
     #[test]
     fn a_notch_spread_over_frames_scrolls_its_rows() {

@@ -162,6 +162,11 @@ impl Engine {
         }
     }
 
+    /// Shows `e` in the error bar (an error's whole chain, for an `anyhow::Error`).
+    pub fn report(&mut self, e: impl std::fmt::Display) {
+        self.last_error = Some(format!("{e:#}"));
+    }
+
     // -------------------------------------------------------------- board lifecycle
     pub fn open_board(&mut self, choice: BoardChoice, settings: BoardSettings) {
         if self.is_busy() || self.is_acquiring() {
