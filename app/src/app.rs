@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod views;
-use views::{CarTarget, SharedViews, ViewsShared};
+use views::{SharedViews, ViewsShared};
 
 const PALETTE: [[f32; 3]; 8] = [
     [0.40, 0.76, 0.95],
@@ -103,7 +103,7 @@ pub struct App {
     /// Scripted test input (`KALILA_UI_SCRIPT`), off by default.
     ui_script: Option<crate::uiscript::UiScript>,
     /// Which CAR the CAR window is editing, if open.
-    car_window: Option<CarTarget>,
+    car_window: bool,
     colors_dirty: bool,
     spike_colors: Option<Arc<Vec<[f32; 4]>>>,
     // spikes
@@ -190,7 +190,7 @@ impl App {
                 .ok()
                 .map(Arc::new),
             ui_script: crate::uiscript::UiScript::from_env(),
-            car_window: None,
+            car_window: false,
             colors_dirty: true,
             spike_colors: None,
             spike_slot: Vec::new(),
@@ -985,7 +985,7 @@ impl App {
                 .on_hover_text("Shared by spike detection and audio")
                 .clicked()
             {
-                self.car_window = Some(CarTarget::Global);
+                self.car_window = true;
             }
         });
     }
@@ -1451,7 +1451,7 @@ impl eframe::App for App {
             ui.allocate_rect(full, egui::Sense::hover());
         });
 
-        self.car_palette(ui.ctx(), CarTarget::Global);
+        self.car_palette(ui.ctx());
         self.trace_windows(ui.ctx());
         // Window close (Hyprland killactive, Meta+C): refused while recording; stop it first.
         if refuse_close(

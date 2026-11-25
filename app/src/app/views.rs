@@ -199,15 +199,6 @@ impl Nav {
     }
 }
 
-/// What the CAR window edits.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(super) enum CarTarget {
-    /// Spike detection and audio (global sets).
-    Global,
-    /// A trace view's display CAR, by view id.
-    View(u32),
-}
-
 /// Time-window limits (s). Live keeps up to one window of samples per view in memory, so it
 /// stops at 20 s; review reads from the recording and reaches further.
 const LIVE_MIN_S: f32 = 0.05;
@@ -564,6 +555,76 @@ pub(super) fn view_rows(l: &StreamLayout, v: &TraceViewSettings) -> (Vec<u32>, V
     let mut order = el;
     order.extend(an);
     (order, rowtab)
+}
+
+/// The reference / subtract set editor shared by both CAR palettes: counts, then one block of
+/// per-headstage All / None buttons and electrode toggles for each set. Returns whether
+/// anything changed (the caller sorts the sets and persists).
+fn car_sets_ui(ui: &mut egui::Ui, groups: &[(String, Vec<(usize, String)>)], car: &mut ViewCar) -> bool {
+    let mut changed = false;
+    ui.weak(format!(
+        "reference {} · subtract {}",
+        car.reference.len(),
+        car.subtract.len()
+    ));
+    let mut copy_ref = false;
+    for (title, set) in [
+        ("Reference (averaged)", &mut car.reference),
+        ("Subtract from", &mut car.subtract),
+    ] {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(title);
+            if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
+                copy_ref = true;
+            }
+        });
+        for (gname, chans) in groups {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(gname).small());
+                if ui.small_button("All").clicked() {
+                    set.extend(
+                        chans
+                            .iter()
+                            .map(|(i, _)| *i)
+                            .filter(|i| !set.contains(i))
+                            .collect::<Vec<_>>(),
+                    );
+                    changed = true;
+                }
+                if ui.small_button("None").clicked() {
+                    set.retain(|x| !chans.iter().any(|(i, _)| i == x));
+                    changed = true;
+                }
+            });
+            egui::Grid::new((title, gname.as_str()))
+                .spacing([2.0, 2.0])
+                .show(ui, |ui| {
+                    for (n, (i, name)) in chans.iter().enumerate() {
+                        let on = set.contains(i);
+                        let b = egui::Button::new(RichText::new(name.trim_start_matches("CH")).monospace().size(11.0))
+                            .selected(on)
+                            .min_size(egui::vec2(26.0, 0.0));
+                        if ui.add(b).on_hover_text(name.as_str()).clicked() {
+                            if on {
+                                set.retain(|x| x != i);
+                            } else {
+                                set.push(*i);
+                            }
+                            changed = true;
+                        }
+                        if n % 16 == 15 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        }
+    }
+    if copy_ref {
+        car.subtract = car.reference.clone();
+        changed = true;
+    }
+    changed
 }
 
 /// Electrodes of the given headstages (all if empty), grouped by headstage, for the CAR window.
@@ -1155,7 +1216,6 @@ impl ViewsShared {
 
     /// This view's display-CAR window (only this view's electrodes).
     fn car_palette(&mut self, ctx: &egui::Context, id: u32) {
-        let target = CarTarget::View(id);
         let Some(l) = self.layout.clone() else { return };
         let mut open = true;
         let mut changed = false;
@@ -1168,9 +1228,8 @@ impl ViewsShared {
             electrode_groups(&l, &v.headstages),
             &mut v.car,
         );
-        let (mut spikes, mut audio) = (false, false);
         egui::Window::new(title)
-            .id(egui::Id::unique(("car-window", format!("{target:?}"))))
+            .id(egui::Id::unique(("car-window", format!("View({id})"))))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -1179,80 +1238,9 @@ impl ViewsShared {
                 ui.small("Recordings always keep the original signals.");
                 ui.horizontal(|ui| {
                     ui.label("Apply to");
-                    match target {
-                        CarTarget::Global => {
-                            changed |= ui.checkbox(&mut spikes, "spike detection").changed();
-                            changed |= ui.checkbox(&mut audio, "audio").changed();
-                        }
-                        CarTarget::View(_) => {
-                            changed |= ui.checkbox(&mut car.enabled, "this window (300–6k view)").changed();
-                        }
-                    }
+                    changed |= ui.checkbox(&mut car.enabled, "this window (300–6k view)").changed();
                 });
-                ui.weak(format!(
-                    "reference {} · subtract {}",
-                    car.reference.len(),
-                    car.subtract.len()
-                ));
-                let mut copy_ref = false;
-                for (title, set) in [
-                    ("Reference (averaged)", &mut car.reference),
-                    ("Subtract from", &mut car.subtract),
-                ] {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.strong(title);
-                        if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
-                            copy_ref = true;
-                        }
-                    });
-                    for (gname, chans) in &groups {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(gname).small());
-                            if ui.small_button("All").clicked() {
-                                set.extend(
-                                    chans
-                                        .iter()
-                                        .map(|(i, _)| *i)
-                                        .filter(|i| !set.contains(i))
-                                        .collect::<Vec<_>>(),
-                                );
-                                changed = true;
-                            }
-                            if ui.small_button("None").clicked() {
-                                set.retain(|x| !chans.iter().any(|(i, _)| i == x));
-                                changed = true;
-                            }
-                        });
-                        egui::Grid::new((title, gname.as_str()))
-                            .spacing([2.0, 2.0])
-                            .show(ui, |ui| {
-                                for (n, (i, name)) in chans.iter().enumerate() {
-                                    let on = set.contains(i);
-                                    let b = egui::Button::new(
-                                        RichText::new(name.trim_start_matches("CH")).monospace().size(11.0),
-                                    )
-                                    .selected(on)
-                                    .min_size(egui::vec2(26.0, 0.0));
-                                    if ui.add(b).on_hover_text(name.as_str()).clicked() {
-                                        if on {
-                                            set.retain(|x| x != i);
-                                        } else {
-                                            set.push(*i);
-                                        }
-                                        changed = true;
-                                    }
-                                    if n % 16 == 15 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    }
-                }
-                if copy_ref {
-                    car.subtract = car.reference.clone();
-                    changed = true;
-                }
+                changed |= car_sets_ui(ui, &groups, car);
             });
         if changed {
             car.reference.sort_unstable();
@@ -1356,8 +1344,8 @@ impl App {
     }
 
     /// The global CAR window (spike detection and audio), in the main window.
-    pub(super) fn car_palette(&mut self, ctx: &egui::Context, target: CarTarget) {
-        if self.car_window != Some(target) {
+    pub(super) fn car_palette(&mut self, ctx: &egui::Context) {
+        if !self.car_window {
             return;
         }
         let Some(l) = self.layout() else { return };
@@ -1370,18 +1358,10 @@ impl App {
             reference: g.reference.clone(),
             subtract: g.subtract.clone(),
         };
-        let (title, groups, car) = match target {
-            CarTarget::Global => (
-                "CAR: spike detection and audio".to_string(),
-                electrode_groups(&l, &[]),
-                &mut global,
-            ),
-            // A view's CAR window lives in that view's own window (ViewsShared::car_palette).
-            CarTarget::View(_) => return,
-        };
+        let (title, groups, car) = ("CAR: spike detection and audio", electrode_groups(&l, &[]), &mut global);
         let (mut spikes, mut audio) = (self.cfg.display.car.spikes, self.cfg.display.car.audio);
         egui::Window::new(title)
-            .id(egui::Id::unique(("car-window", format!("{target:?}"))))
+            .id(egui::Id::unique(("car-window", "Global".to_string())))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -1390,95 +1370,23 @@ impl App {
                 ui.small("Recordings always keep the original signals.");
                 ui.horizontal(|ui| {
                     ui.label("Apply to");
-                    match target {
-                        CarTarget::Global => {
-                            changed |= ui.checkbox(&mut spikes, "spike detection").changed();
-                            changed |= ui.checkbox(&mut audio, "audio").changed();
-                        }
-                        CarTarget::View(_) => {
-                            changed |= ui.checkbox(&mut car.enabled, "this window (300–6k view)").changed();
-                        }
-                    }
+                    changed |= ui.checkbox(&mut spikes, "spike detection").changed();
+                    changed |= ui.checkbox(&mut audio, "audio").changed();
                 });
-                ui.weak(format!(
-                    "reference {} · subtract {}",
-                    car.reference.len(),
-                    car.subtract.len()
-                ));
-                let mut copy_ref = false;
-                for (title, set) in [
-                    ("Reference (averaged)", &mut car.reference),
-                    ("Subtract from", &mut car.subtract),
-                ] {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.strong(title);
-                        if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
-                            copy_ref = true;
-                        }
-                    });
-                    for (gname, chans) in &groups {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(gname).small());
-                            if ui.small_button("All").clicked() {
-                                set.extend(
-                                    chans
-                                        .iter()
-                                        .map(|(i, _)| *i)
-                                        .filter(|i| !set.contains(i))
-                                        .collect::<Vec<_>>(),
-                                );
-                                changed = true;
-                            }
-                            if ui.small_button("None").clicked() {
-                                set.retain(|x| !chans.iter().any(|(i, _)| i == x));
-                                changed = true;
-                            }
-                        });
-                        egui::Grid::new((title, gname.as_str()))
-                            .spacing([2.0, 2.0])
-                            .show(ui, |ui| {
-                                for (n, (i, name)) in chans.iter().enumerate() {
-                                    let on = set.contains(i);
-                                    let b = egui::Button::new(
-                                        RichText::new(name.trim_start_matches("CH")).monospace().size(11.0),
-                                    )
-                                    .selected(on)
-                                    .min_size(egui::vec2(26.0, 0.0));
-                                    if ui.add(b).on_hover_text(name.as_str()).clicked() {
-                                        if on {
-                                            set.retain(|x| x != i);
-                                        } else {
-                                            set.push(*i);
-                                        }
-                                        changed = true;
-                                    }
-                                    if n % 16 == 15 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    }
-                }
-                if copy_ref {
-                    car.subtract = car.reference.clone();
-                    changed = true;
-                }
+                changed |= car_sets_ui(ui, &groups, car);
             });
         if changed {
             car.reference.sort_unstable();
             car.subtract.sort_unstable();
-            if target == CarTarget::Global {
-                let g = &mut self.cfg.display.car;
-                g.reference = global.reference.clone();
-                g.subtract = global.subtract.clone();
-                g.spikes = spikes;
-                g.audio = audio;
-            }
+            let g = &mut self.cfg.display.car;
+            g.reference = global.reference.clone();
+            g.subtract = global.subtract.clone();
+            g.spikes = spikes;
+            g.audio = audio;
             self.dirty_cfg = Instant::now();
         }
         if !open {
-            self.car_window = None;
+            self.car_window = false;
         }
     }
 }
