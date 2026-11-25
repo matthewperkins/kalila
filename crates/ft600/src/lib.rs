@@ -19,6 +19,9 @@
 
 mod chip;
 mod driver;
+/// A scripted FT600 and board for the driver's tests (Linux: it hooks into `usbfs.rs`).
+#[cfg(all(test, not(target_os = "macos")))]
+mod fake;
 #[cfg(target_os = "macos")]
 #[path = "usb_iokit.rs"]
 mod usb;

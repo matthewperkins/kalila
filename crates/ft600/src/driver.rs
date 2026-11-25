@@ -434,8 +434,16 @@ unsafe fn cast<'a>(p: sys::oni_driver_ctx) -> &'a mut Ctx {
 fn guard(f: impl FnOnce() -> c_int) -> c_int {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
         error!("panic inside the FT600 driver");
+        #[cfg(test)]
+        PANICS.with(|n| n.set(n.get() + 1));
         sys::ONI_EINIT
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Panics `guard` has caught on this thread (the tests check there were none).
+    static PANICS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 extern "C" fn create_ctx() -> sys::oni_driver_ctx {
@@ -699,6 +707,11 @@ pub fn register() {
         unsafe { sys::oni_register_builtin_driver(name.into_raw(), &table) };
     });
 }
+
+/// The driver against a scripted chip (`crate::fake`).
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "driver_fake_tests.rs"]
+mod fake_tests;
 
 #[cfg(test)]
 mod tests {

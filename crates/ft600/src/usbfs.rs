@@ -129,6 +129,10 @@ fn sysfs(dir: &std::path::Path, attr: &str) -> Option<String> {
 /// Every USB device with this vendor id, one of `products`, and exactly this product string,
 /// in bus then device order (the same from run to run).
 pub fn find(vendor: u16, products: &[u16], product_string: &str) -> Vec<Location> {
+    #[cfg(test)]
+    if let Some(loc) = crate::fake::location() {
+        return vec![loc];
+    }
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir("/sys/bus/usb/devices") else {
         return out;
@@ -180,14 +184,30 @@ fn errno() -> c_int {
 
 pub struct Device {
     fd: c_int,
+    /// Tests only: the scripted chip (`crate::fake`) this device talks to instead of the
+    /// kernel. It is reached from the four entry points below and nowhere else, so it sees
+    /// exactly what would have gone to the kernel.
+    #[cfg(test)]
+    fake: Option<crate::fake::Handle>,
 }
 
 impl Device {
     pub fn open(loc: Location) -> Result<Device, UsbError> {
+        #[cfg(test)]
+        if let Some(fake) = crate::fake::attach(loc) {
+            return Ok(Device {
+                fd: -1,
+                fake: Some(fake),
+            });
+        }
         let path = CString::new(format!("/dev/bus/usb/{:03}/{:03}", loc.bus, loc.dev)).unwrap();
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd >= 0 {
-            return Ok(Device { fd });
+            return Ok(Device {
+                fd,
+                #[cfg(test)]
+                fake: None,
+            });
         }
         Err(match errno() {
             libc::EACCES | libc::EPERM => UsbError::AccessDenied,
@@ -199,7 +219,7 @@ impl Device {
     /// A device on which every call fails (for tests).
     #[cfg(test)]
     pub(crate) fn invalid() -> Device {
-        Device { fd: -1 }
+        Device { fd: -1, fake: None }
     }
 
     /// An ioctl, retried on EINTR. Returns the result or the errno.
@@ -217,6 +237,10 @@ impl Device {
     }
 
     pub fn claim_interface(&self, interface: u32) -> Result<(), UsbError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.borrow_mut().on_claim(interface);
+        }
         let mut n = interface;
         self.ioctl(USBDEVFS_CLAIMINTERFACE, &mut n as *mut u32 as *mut c_void)
             .map(|_| ())
@@ -228,6 +252,11 @@ impl Device {
     }
 
     pub fn release_interface(&self, interface: u32) {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            fake.borrow_mut().on_release(interface);
+            return;
+        }
         let mut n = interface;
         let _ = self.ioctl(USBDEVFS_RELEASEINTERFACE, &mut n as *mut u32 as *mut c_void);
     }
@@ -243,6 +272,12 @@ impl Device {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<usize, UsbError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake
+                .borrow_mut()
+                .on_control(request_type, request, value, index, data, timeout_ms);
+        }
         let mut ct = CtrlTransfer {
             request_type,
             request,
@@ -267,6 +302,17 @@ impl Device {
     /// the transfer is cancelled and whatever arrived before is reported in `actual`. An OUT
     /// buffer is only read by the kernel. When this returns, nothing is still in flight.
     pub fn bulk(&self, endpoint: u8, buf: *mut u8, len: usize, timeout_ms: u32) -> Result<Transfer, UsbError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            // SAFETY: as for the kernel, `buf` is valid for `len` bytes; an OUT buffer is only read.
+            return if endpoint & 0x80 != 0 {
+                let buf = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+                fake.borrow_mut().on_bulk_in(endpoint, buf, timeout_ms)
+            } else {
+                let buf = unsafe { std::slice::from_raw_parts(buf as *const u8, len) };
+                fake.borrow_mut().on_bulk_out(endpoint, buf, timeout_ms)
+            };
+        }
         let mut urb = Urb {
             kind: USBDEVFS_URB_TYPE_BULK,
             endpoint,

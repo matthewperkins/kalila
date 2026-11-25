@@ -192,13 +192,10 @@ impl Ft600 {
             ft.firmware & 0xff
         );
         // As D3XX does on open: both IN pipes start from a known state.
-        let r = ft
-            .command(Channel::Data.pipe_in(), CMD_ABORT, 0)
-            .and_then(|_| ft.command(Channel::Control.pipe_in(), CMD_ABORT, 0));
-        if let Err(e) = r {
-            ft.release();
-            return Err(e);
-        }
+        // On error, dropping `ft` releases both interfaces (once: releasing here as well
+        // released them twice).
+        ft.command(Channel::Data.pipe_in(), CMD_ABORT, 0)
+            .and_then(|_| ft.command(Channel::Control.pipe_in(), CMD_ABORT, 0))?;
         Ok(ft)
     }
 
