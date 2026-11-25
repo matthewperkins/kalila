@@ -340,6 +340,137 @@ impl ReviewView {
     }
 }
 
+/// How long a pyramid image that did not cover every column is kept before it is redrawn.
+pub const PYRAMID_REFRESH: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Whether a span is drawn from the min/max pyramid: a bucket or more samples per column.
+pub fn uses_pyramid(span: u32, cols: u32, bucket: u64) -> bool {
+    span as u64 / cols.max(1) as u64 >= bucket
+}
+
+/// Whether a span is short enough to read and filter directly (longer ones wait for the pyramid).
+pub fn direct_ok(span: u32, sample_rate: f64, direct_max_s: f64) -> bool {
+    span as f64 / sample_rate <= direct_max_s
+}
+
+/// Whether the last recording can be reviewed by this window: it has the board's channel count.
+pub fn source_usable(src_nch: usize, nch: usize) -> bool {
+    src_nch == nch
+}
+
+/// The next chunk of a loaded stretch to hand to the GPU (in samples), given `total` samples
+/// and `fed` already handed over, and whether that chunk completes it. Chunks stay under the
+/// GPU's binding limit (8 MiB of i16 across channels).
+pub fn next_feed(total: usize, fed: usize, nch: usize) -> (usize, bool) {
+    let chunk = ((8usize << 20) / nch.max(1)).max(1).min(total - fed);
+    (chunk, fed + chunk >= total)
+}
+
+/// Facts the review decision needs beyond the view's state.
+pub struct PlanInputs {
+    pub now: std::time::Instant,
+    pub sample_rate: f64,
+    /// Filter lead-in in samples (0 for Raw rows only).
+    pub lead: i64,
+    /// Samples per pyramid bucket (`engine::pyramid::BUCKET`).
+    pub pyramid_bucket: u64,
+    /// Longest span read directly, in seconds.
+    pub direct_max_s: f64,
+    /// The pyramid was already tried this frame (and could not serve the span).
+    pub pyramid_tried: bool,
+}
+
+/// A direct read to start.
+#[derive(Debug, PartialEq)]
+pub struct FillPlan {
+    /// Continue the shown image (in its own GPU state) instead of filling the other one.
+    pub append: bool,
+    pub buf: u8,
+    pub from: i64,
+    pub n: usize,
+    pub words_from: i64,
+    pub words_n: usize,
+}
+
+/// What one frame of review does about the wanted stretch.
+#[derive(Debug, PartialEq)]
+pub enum Plan {
+    /// Draw it from the pyramids into GPU state `buf`; if they cannot serve it, plan again
+    /// with `pyramid_tried`.
+    TryPyramid { buf: u8 },
+    /// Bump the generation and send this read.
+    StartFill(FillPlan),
+    /// An image is in flight; it completes first. The shown image is drawn shifted and scaled.
+    WaitForFill,
+    /// Too long to read, and the pyramid cannot serve it yet.
+    WaitForPyramid,
+    /// The shown image is the wanted one.
+    Current,
+}
+
+/// Decide what to do for the wanted stretch `key` (the view's clamped `t0` and `span`).
+/// Pure: the caller carries it out.
+pub fn plan(rv: &ReviewView, key: &Key, i: &PlanInputs) -> Plan {
+    let use_pyr = uses_pyramid(rv.span, key.cols, i.pyramid_bucket);
+    let shown_is_key = rv.shown.as_ref().is_some_and(|s| s.key == *key);
+    if use_pyr && rv.filling.is_none() && !i.pyramid_tried {
+        let stale = !shown_is_key;
+        let refresh = rv.shown.as_ref().is_some_and(|s| {
+            s.key == *key
+                && s.pyramid
+                    .is_some_and(|(at, complete)| !complete && i.now.saturating_duration_since(at) > PYRAMID_REFRESH)
+        });
+        if stale || refresh {
+            return Plan::TryPyramid {
+                buf: rv.shown.as_ref().map_or(0, |s| 1 - s.buf),
+            };
+        }
+    }
+    let served = use_pyr && rv.filling.is_none() && shown_is_key;
+    let direct = direct_ok(rv.span, i.sample_rate, i.direct_max_s);
+    if !served && direct && rv.filling.is_none() && !shown_is_key {
+        // A pan to the right by less than a window appends to the shown image.
+        let append = rv.shown.as_ref().filter(|s| {
+            let d = key.t0 - s.key.t0;
+            d > 0
+                && d < s.key.span as i64
+                && Key {
+                    t0: s.key.t0,
+                    ..key.clone()
+                } == s.key
+        });
+        return Plan::StartFill(match append {
+            Some(s) => {
+                let from = s.key.t0 + s.key.span as i64;
+                let n = (key.t0 - s.key.t0) as usize;
+                FillPlan {
+                    append: true,
+                    buf: s.buf,
+                    from,
+                    n,
+                    words_from: from,
+                    words_n: n,
+                }
+            }
+            None => FillPlan {
+                append: false,
+                buf: rv.shown.as_ref().map_or(0, |s| 1 - s.buf),
+                from: key.t0 - i.lead,
+                n: (i.lead + key.span as i64) as usize,
+                words_from: key.t0,
+                words_n: key.span as usize,
+            },
+        });
+    }
+    if rv.filling.is_some() {
+        Plan::WaitForFill
+    } else if shown_is_key {
+        Plan::Current
+    } else {
+        Plan::WaitForPyramid
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +602,369 @@ mod tests {
         );
         assert_eq!((r.from, r.data.len()), (1000, 6));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const FS: f64 = 30000.0;
+
+    fn key(t0: i64, span: u32) -> Key {
+        Key {
+            t0,
+            span,
+            cols: 800,
+            nch: 4,
+            filters: vec![crate::config::ViewFilter::Band; 4],
+            band: (1, 2),
+            car: None,
+        }
+    }
+
+    fn shown(k: Key, buf: u8, pyramid: Option<(std::time::Instant, bool)>) -> Shown {
+        Shown {
+            config: crate::traces::TraceConfig {
+                nch: k.nch,
+                cols: k.cols,
+                window: k.span,
+                bank: Default::default(),
+                nslots: 0,
+            },
+            key: k,
+            buf,
+            ttl: Default::default(),
+            pos_t0: 0,
+            pyramid,
+        }
+    }
+
+    fn filling(k: Key) -> Filling {
+        Filling {
+            key: k,
+            generation: 1,
+            buf: 0,
+            append: false,
+            loaded: None,
+            started: std::time::Instant::now(),
+            loaded_at: None,
+        }
+    }
+
+    /// The view as a row describes it: what is shown, whether a fill is in flight.
+    fn view(want: &Key, shown: Option<Shown>, fill: bool) -> ReviewView {
+        let mut v = ReviewView::new(want.t0, want.span);
+        v.shown = shown;
+        v.filling = fill.then(|| filling(want.clone()));
+        v
+    }
+
+    fn inputs(lead: i64, tried: bool, now: std::time::Instant) -> PlanInputs {
+        PlanInputs {
+            now,
+            sample_rate: FS,
+            lead,
+            pyramid_bucket: 64,
+            direct_max_s: 60.0,
+            pyramid_tried: tried,
+        }
+    }
+
+    /// An append: the words are those of the appended stretch.
+    fn append(buf: u8, from: i64, n: usize) -> Plan {
+        Plan::StartFill(FillPlan {
+            append: true,
+            buf,
+            from,
+            n,
+            words_from: from,
+            words_n: n,
+        })
+    }
+
+    /// A full read: the words are those of the visible stretch only (no lead-in).
+    fn full(buf: u8, lead: i64, k: &Key) -> Plan {
+        Plan::StartFill(FillPlan {
+            append: false,
+            buf,
+            from: k.t0 - lead,
+            n: (lead + k.span as i64) as usize,
+            words_from: k.t0,
+            words_n: k.span as usize,
+        })
+    }
+
+    struct Row {
+        name: &'static str,
+        want: Key,
+        shown: Option<Shown>,
+        filling: bool,
+        lead: i64,
+        tried: bool,
+        now: std::time::Instant,
+        expect: Plan,
+    }
+
+    fn row(name: &'static str, want: Key, shown: Option<Shown>, filling: bool, tried: bool, expect: Plan) -> Row {
+        Row {
+            name,
+            want,
+            shown,
+            filling,
+            lead: 0,
+            tried,
+            now: std::time::Instant::now(),
+            expect,
+        }
+    }
+
+    #[test]
+    fn plan_table() {
+        let t = std::time::Instant::now();
+        let later = t + std::time::Duration::from_millis(400);
+        let soon = t + std::time::Duration::from_millis(100);
+        let (short, mid, long) = (30_000u32, 100_000u32, 2_000_000u32);
+        let sh = short as i64;
+        let mut other_filters = key(1000, short);
+        other_filters.filters[0] = crate::config::ViewFilter::Raw;
+        let mut other_cols = key(1500, short);
+        other_cols.cols = 700;
+        let mut rows = vec![
+            Row {
+                lead: 1500,
+                ..row(
+                    "first entry, short span: full read into state 0, with lead-in",
+                    key(1000, short),
+                    None,
+                    false,
+                    false,
+                    full(0, 1500, &key(1000, short)),
+                )
+            },
+            row(
+                "small pan forward appends to the shown image, in its own state",
+                key(1500, short),
+                Some(shown(key(1000, short), 1, None)),
+                false,
+                false,
+                append(1, 1000 + sh, 500),
+            ),
+            row(
+                "pan forward by a whole window: full read into the other state",
+                key(1000 + sh, short),
+                Some(shown(key(1000, short), 1, None)),
+                false,
+                false,
+                full(0, 0, &key(1000 + sh, short)),
+            ),
+            row(
+                "pan back: full read into the other state",
+                key(500, short),
+                Some(shown(key(1000, short), 0, None)),
+                false,
+                false,
+                full(1, 0, &key(500, short)),
+            ),
+            row(
+                "zoom in (span changes): full read",
+                key(1000, short / 2),
+                Some(shown(key(1000, short), 0, None)),
+                false,
+                false,
+                full(1, 0, &key(1000, short / 2)),
+            ),
+            row(
+                "forward pan with other filters: not an append",
+                key(1500, short),
+                Some(shown(other_filters, 0, None)),
+                false,
+                false,
+                full(1, 0, &key(1500, short)),
+            ),
+            row(
+                "forward pan with other columns: not an append",
+                other_cols.clone(),
+                Some(shown(key(1000, short), 0, None)),
+                false,
+                false,
+                full(1, 0, &other_cols),
+            ),
+            row(
+                "shown is wanted, read directly: nothing to do",
+                key(1000, short),
+                Some(shown(key(1000, short), 0, None)),
+                false,
+                false,
+                Plan::Current,
+            ),
+            row(
+                "span for the pyramid, nothing shown: try it into state 0",
+                key(1000, mid),
+                None,
+                false,
+                false,
+                Plan::TryPyramid { buf: 0 },
+            ),
+            row(
+                "span for the pyramid, other image in state 1: try it into state 0",
+                key(500_000, mid),
+                Some(shown(key(1000, mid), 1, Some((t, true)))),
+                false,
+                false,
+                Plan::TryPyramid { buf: 0 },
+            ),
+            Row {
+                lead: 1500,
+                ..row(
+                    "pyramid cannot serve (fine level released), under 60 s: direct read",
+                    key(1000, mid),
+                    None,
+                    false,
+                    true,
+                    full(0, 1500, &key(1000, mid)),
+                )
+            },
+            row(
+                "pyramid cannot serve: the direct read goes into the other state",
+                key(500_000, mid),
+                Some(shown(key(1000, mid), 0, Some((t, true)))),
+                false,
+                true,
+                full(1, 0, &key(500_000, mid)),
+            ),
+            row(
+                "over 60 s, pyramid cannot serve: wait (shown image stays, shifted)",
+                key(1000, long),
+                Some(shown(key(1000, long / 2), 0, Some((t, true)))),
+                false,
+                true,
+                Plan::WaitForPyramid,
+            ),
+            row(
+                "over 60 s, nothing shown: try the pyramid first",
+                key(1000, long),
+                None,
+                false,
+                false,
+                Plan::TryPyramid { buf: 0 },
+            ),
+            Row {
+                now: later,
+                ..row(
+                    "shown from the pyramid is wanted and complete: nothing to do",
+                    key(1000, mid),
+                    Some(shown(key(1000, mid), 0, Some((t, true)))),
+                    false,
+                    false,
+                    Plan::Current,
+                )
+            },
+            Row {
+                now: later,
+                ..row(
+                    "incomplete pyramid image older than 300 ms: redraw into the other state",
+                    key(1000, mid),
+                    Some(shown(key(1000, mid), 0, Some((t, false)))),
+                    false,
+                    false,
+                    Plan::TryPyramid { buf: 1 },
+                )
+            },
+            Row {
+                now: soon,
+                ..row(
+                    "incomplete pyramid image younger than 300 ms: keep it",
+                    key(1000, mid),
+                    Some(shown(key(1000, mid), 0, Some((t, false)))),
+                    false,
+                    false,
+                    Plan::Current,
+                )
+            },
+            Row {
+                now: later,
+                ..row(
+                    "redraw failed (pyramid gone): keep the image",
+                    key(1000, mid),
+                    Some(shown(key(1000, mid), 0, Some((t, false)))),
+                    false,
+                    true,
+                    Plan::Current,
+                )
+            },
+            row(
+                "fill in flight, wanted stretch moved: nothing cancelled, wait",
+                key(9000, short),
+                Some(shown(key(1000, short), 0, None)),
+                true,
+                false,
+                Plan::WaitForFill,
+            ),
+            row(
+                "fill in flight, span for the pyramid: the pyramid is not tried either",
+                key(9000, mid),
+                Some(shown(key(1000, mid), 0, None)),
+                true,
+                false,
+                Plan::WaitForFill,
+            ),
+            row(
+                "fill completed (now shown), view moved on: the newest is requested",
+                key(90_000, short),
+                Some(shown(key(1000, short), 1, None)),
+                false,
+                false,
+                full(0, 0, &key(90_000, short)),
+            ),
+            row(
+                "DOUBTFUL, kept: a small pan forward appends to an image drawn from the pyramid",
+                key(1500, mid / 4),
+                Some(shown(key(1000, mid / 4), 1, Some((t, true)))),
+                false,
+                true,
+                append(1, 1000 + (mid / 4) as i64, 500),
+            ),
+            row(
+                "exactly 60 s is still read directly",
+                key(0, 1_800_000),
+                None,
+                false,
+                true,
+                full(0, 0, &key(0, 1_800_000)),
+            ),
+        ];
+        for r in rows.drain(..) {
+            let v = view(&r.want, r.shown, r.filling);
+            assert_eq!(
+                plan(&v, &r.want, &inputs(r.lead, r.tried, r.now)),
+                r.expect,
+                "{}",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_recording_shorter_than_the_span_is_read_whole() {
+        // 100000 samples asked, 20000 recorded: the span shrinks to the recording, which is
+        // too short for the pyramid, so it is read directly.
+        let mut v = ReviewView::new(1000, 100_000);
+        v.clamp(1000, 21_000, 40, 108_000_000);
+        assert_eq!((v.t0, v.span), (1000, 20_000));
+        let k = key(v.t0, v.span);
+        let t = std::time::Instant::now();
+        assert_eq!(plan(&v, &k, &inputs(0, false, t)), full(0, 0, &k));
+    }
+
+    #[test]
+    fn a_window_leaves_review_when_the_recording_does_not_fit() {
+        assert!(source_usable(4, 4));
+        assert!(!source_usable(2, 4));
+    }
+
+    #[test]
+    fn the_gpu_is_fed_in_bounded_chunks_and_completes_on_the_last() {
+        let big = (8usize << 20) / 4;
+        assert_eq!(next_feed(10, 0, 4), (10, true));
+        assert_eq!(next_feed(0, 0, 4), (0, true));
+        assert_eq!(next_feed(big + 10, 0, 4), (big, false));
+        assert_eq!(next_feed(big + 10, big, 4), (10, true));
+        assert_eq!(next_feed(big, 0, 4), (big, true));
     }
 }

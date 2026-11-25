@@ -823,7 +823,7 @@ impl ViewFrame<'_> {
         } = rs;
         let fs = l.sample_rate;
         let nch = l.num_channels();
-        let Some(src) = self.rec_source.filter(|s| s.nch == nch) else {
+        let Some(src) = self.rec_source.filter(|s| review::source_usable(s.nch, nch)) else {
             self.leave_review();
             return;
         };
@@ -890,118 +890,84 @@ impl ViewFrame<'_> {
             rot: xf.2,
             columns: None,
         };
+        // What to do about the wanted stretch is decided by `review::plan` (pure, tested);
+        // this carries it out.
+        let inputs = |pyramid_tried: bool| review::PlanInputs {
+            now: Instant::now(),
+            sample_rate: fs,
+            lead,
+            pyramid_bucket: engine::pyramid::BUCKET,
+            direct_max_s: DIRECT_MAX_S as f64,
+            pyramid_tried,
+        };
+        let use_pyr = review::uses_pyramid(rv.span, cols, engine::pyramid::BUCKET);
+        let direct_ok = review::direct_ok(rv.span, fs, DIRECT_MAX_S as f64);
+        let mut plan = review::plan(rv, &key, &inputs(false));
         // Spans of a bucket or more per column come from the min/max pyramid: the whole
         // column buffer is computed here and uploaded in one go, so the image changes with the
         // pointer. While the pyramid is still being backfilled (band changed, or the raw one is
         // closing a gap), the covered part is drawn and the rest redrawn every 300 ms.
-        let use_pyr = rv.span as u64 / cols.max(1) as u64 >= engine::pyramid::BUCKET;
-        let mut served = false;
-        if use_pyr && rv.filling.is_none() {
-            let stale = rv.shown.as_ref().is_none_or(|s| s.key != key);
-            let refresh = rv.shown.as_ref().is_some_and(|s| {
-                s.key == key
-                    && s.pyramid
-                        .is_some_and(|(at, complete)| !complete && at.elapsed() > Duration::from_millis(300))
-            });
-            if stale || refresh {
-                let st = self.pyramids.lock();
-                if let Some((columns, words, complete)) = pyramid_columns(&st, src, id, l, filters, &key) {
-                    drop(st);
-                    let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
-                    let config = TraceConfig {
-                        nch,
-                        cols,
-                        window: rv.span.max(1),
-                        bank: bank.clone(),
-                        nslots: 0,
-                    };
-                    let mut fr = frame(
-                        review_key(id, buf),
-                        config.clone(),
-                        true,
-                        (Arc::new(Vec::new()), 0),
-                        0,
-                        0,
-                        false,
-                        (0.0, 1.0, 0),
-                    );
-                    fr.columns = Some(Arc::new(columns));
-                    ui.painter()
-                        .add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
-                    rv.shown = Some(review::Shown {
-                        key: key.clone(),
-                        buf,
-                        config,
-                        ttl: TtlOverlay::from_columns(&words),
-                        pos_t0: 0,
-                        pyramid: Some((Instant::now(), complete)),
-                    });
-                    if !complete {
-                        ui.ctx().request_repaint_after(Duration::from_millis(300));
-                    }
+        if let review::Plan::TryPyramid { buf } = plan {
+            let st = self.pyramids.lock();
+            if let Some((columns, words, complete)) = pyramid_columns(&st, src, id, l, filters, &key) {
+                drop(st);
+                let config = TraceConfig {
+                    nch,
+                    cols,
+                    window: rv.span.max(1),
+                    bank: bank.clone(),
+                    nslots: 0,
+                };
+                let mut fr = frame(
+                    review_key(id, buf),
+                    config.clone(),
+                    true,
+                    (Arc::new(Vec::new()), 0),
+                    0,
+                    0,
+                    false,
+                    (0.0, 1.0, 0),
+                );
+                fr.columns = Some(Arc::new(columns));
+                ui.painter()
+                    .add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
+                rv.shown = Some(review::Shown {
+                    key: key.clone(),
+                    buf,
+                    config,
+                    ttl: TtlOverlay::from_columns(&words),
+                    pos_t0: 0,
+                    pyramid: Some((Instant::now(), complete)),
+                });
+                if !complete {
+                    ui.ctx().request_repaint_after(Duration::from_millis(300));
                 }
+            } else {
+                drop(st);
             }
-            served = rv.shown.as_ref().is_some_and(|s| s.key == key);
+            // Either way, decide again with what is shown now: a span the pyramid cannot
+            // serve (a released level, say) is read directly.
+            plan = review::plan(rv, &key, &inputs(true));
         }
-        // Spans too long to read directly wait for the pyramid.
-        let direct_ok = rv.span as f64 / fs <= DIRECT_MAX_S as f64;
         // One image in flight at a time; it always completes (cancelling it every frame while
         // the pointer moves would mean never updating). Meanwhile the shown image is drawn
         // panned and zoomed to the current stretch, so the traces follow the pointer.
-        if !served && direct_ok && rv.filling.is_none() && rv.shown.as_ref().is_none_or(|s| s.key != key) {
+        if let review::Plan::StartFill(f) = plan {
             rv.generation += 1;
-            // A pan to the right by less than a window appends to the shown image: the
-            // filter state continues from its end, with no lead-in and no refiltering.
-            let append = rv.shown.as_ref().filter(|s| {
-                let d = key.t0 - s.key.t0;
-                d > 0
-                    && d < s.key.span as i64
-                    && review::Key {
-                        t0: s.key.t0,
-                        ..key.clone()
-                    } == s.key
+            let _ = self.reader.tx.send(review::Req {
+                view: id,
+                generation: rv.generation,
+                src: src.clone(),
+                from: f.from,
+                n: f.n,
+                words_from: f.words_from,
+                words_n: f.words_n,
             });
-            let (req, buf, append) = match append {
-                Some(s) => {
-                    let from = s.key.t0 + s.key.span as i64;
-                    let n = (key.t0 - s.key.t0) as usize;
-                    (
-                        review::Req {
-                            view: id,
-                            generation: rv.generation,
-                            src: src.clone(),
-                            from,
-                            n,
-                            words_from: from,
-                            words_n: n,
-                        },
-                        s.buf,
-                        true,
-                    )
-                }
-                None => {
-                    let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
-                    (
-                        review::Req {
-                            view: id,
-                            generation: rv.generation,
-                            src: src.clone(),
-                            from: rv.t0 - lead,
-                            n: (lead + rv.span as i64) as usize,
-                            words_from: rv.t0,
-                            words_n: rv.span as usize,
-                        },
-                        buf,
-                        false,
-                    )
-                }
-            };
-            let _ = self.reader.tx.send(req);
             rv.filling = Some(review::Filling {
                 key: key.clone(),
                 generation: rv.generation,
-                buf,
-                append,
+                buf: f.buf,
+                append: f.append,
                 loaded: None,
                 started: Instant::now(),
                 loaded_at: None,
@@ -1014,7 +980,7 @@ impl ViewFrame<'_> {
             && let Some(ld) = f.loaded.as_mut()
         {
             let total = ld.data.len() / nch.max(1);
-            let chunk = ((8usize << 20) / nch.max(1)).max(1).min(total - ld.fed);
+            let (chunk, done) = review::next_feed(total, ld.fed, nch);
             let span = f.key.span.max(1);
             let config = TraceConfig {
                 nch,
@@ -1050,7 +1016,7 @@ impl ViewFrame<'_> {
                 sh.pos_t0 = ((sh.pos_t0 as u64 + chunk as u64) % span as u64) as u32;
             }
             ld.fed += chunk;
-            complete = ld.fed >= total;
+            complete = done;
             if !complete {
                 ui.ctx().request_repaint();
             }
