@@ -21,11 +21,18 @@
 //!
 //! Behind the chip: a data FIFO the board fills with seeded bytes before each data read, and
 //! a control FIFO carrying register replies (to the ONI commands written on EP 0x03), signal
-//! packets and noise bytes. Timeouts take no time.
+//! packets and noise bytes.
+//!
+//! Time: the fake has its own clock, which the driver reads instead of `Instant::now()` while
+//! a fake is installed (`now`). A transfer that times out advances it by its timeout, as on
+//! the board; everything else takes no time. Under a random policy the board is never quiet
+//! on one endpoint for longer than `Policy::max_quiet_ms` (it is slow, not silent); the
+//! faults and `hush` make it silent for longer.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use crate::usb::{Location, Transfer, UsbError};
 
@@ -49,6 +56,11 @@ pub(crate) fn uninstall() {
 /// `usb::find`: the installed fake's location, if there is one.
 pub(crate) fn location() -> Option<Location> {
     INSTALLED.with(|i| i.borrow().as_ref().map(|f| f.borrow().loc))
+}
+
+/// The driver's clock: the installed fake's, if there is one.
+pub(crate) fn now() -> Option<Instant> {
+    INSTALLED.with(|i| i.borrow().as_ref().map(|f| f.borrow().now()))
 }
 
 /// `usb::Device::open`: the installed fake, if `loc` is its location.
@@ -103,6 +115,10 @@ pub(crate) struct Policy {
     pub noise: u64,
     /// OUT transfers that time out after part of the data.
     pub out_partial: u64,
+    /// The longest the board leaves one endpoint without moving a byte, in the fake's
+    /// milliseconds: a timeout that would make it longer moves data instead (if there is any
+    /// to move). `u64::MAX`: no such limit.
+    pub max_quiet_ms: u64,
 }
 
 impl Policy {
@@ -119,6 +135,7 @@ impl Policy {
             signal: 0,
             noise: 0,
             out_partial: 0,
+            max_quiet_ms: u64::MAX,
         }
     }
 
@@ -144,6 +161,9 @@ impl Policy {
             signal: rate(rng, 400),
             noise: rate(rng, 200),
             out_partial: rate(rng, 200),
+            // Below the driver's 3 s: one or two empty 1 s data reads in a row, 10 to 29
+            // empty 100 ms control reads.
+            max_quiet_ms: rng.range(1000, 2999) as u64,
         }
     }
 }
@@ -173,6 +193,12 @@ pub(crate) enum Fault {
     BusyInterface1,
     /// The board sends a signal packet that never ends (no 0 byte), 1 KiB per control read.
     Flood,
+    /// From the `after`-th call on, the board is silent: IN reads deliver nothing and, with
+    /// `refuse_writes`, OUT transfers on the data and control pipes accept nothing.
+    GoesSilent {
+        after: u64,
+        refuse_writes: bool,
+    },
 }
 
 /// Consecutive transfers that moved nothing after which the host is taken to be spinning:
@@ -228,6 +254,14 @@ pub(crate) struct Fake {
     /// True once the host went `SPIN_LIMIT` transfers without anything moving.
     pub spun: bool,
     pub gone: bool,
+    /// The fake's clock: `base` plus the time its transfers have taken.
+    base: Instant,
+    elapsed: Duration,
+    /// Per endpoint, the fake's milliseconds since it last moved a byte (`max_quiet_ms`).
+    quiet: HashMap<u8, u64>,
+    /// Per IN pipe (0x82, 0x83): the board delivers nothing on it until this much of the
+    /// fake's time has passed in reads of that pipe (a slow reply, or a gap in the stream).
+    pub hush: [u64; 2],
 }
 
 fn hex(b: &[u8]) -> String {
@@ -300,6 +334,53 @@ impl Fake {
             idle: 0,
             spun: false,
             gone: false,
+            base: Instant::now(),
+            elapsed: Duration::ZERO,
+            quiet: HashMap::new(),
+            hush: [0; 2],
+        }
+    }
+
+    /// The fake's clock.
+    pub fn now(&self) -> Instant {
+        self.base + self.elapsed
+    }
+
+    /// After a transfer on `ep`: a timeout took its time, and the endpoint's quiet time grows
+    /// unless bytes moved.
+    fn tick(&mut self, ep: u8, r: &Result<Transfer, UsbError>, timeout_ms: u32) {
+        let Ok(t) = r else { return };
+        if t.timed_out {
+            self.elapsed += Duration::from_millis(timeout_ms as u64);
+        }
+        let q = self.quiet.entry(ep).or_insert(0);
+        if t.actual > 0 {
+            *q = 0;
+        } else if t.timed_out {
+            *q += timeout_ms as u64;
+        }
+    }
+
+    /// Whether a timeout of `timeout_ms` on `ep` would leave it quiet for longer than the
+    /// policy allows: then the board moves data instead.
+    fn must_move(&self, ep: u8, timeout_ms: u32) -> bool {
+        let q = self.quiet.get(&ep).copied().unwrap_or(0);
+        q.saturating_add(timeout_ms as u64) > self.policy.max_quiet_ms
+    }
+
+    fn silent(&self) -> bool {
+        match self.fault {
+            Fault::Silent => true,
+            Fault::GoesSilent { after, .. } => self.calls > after,
+            _ => false,
+        }
+    }
+
+    fn refuses_writes(&self) -> bool {
+        match self.fault {
+            Fault::OutRefuses => true,
+            Fault::GoesSilent { after, refuse_writes } => refuse_writes && self.calls > after,
+            _ => false,
         }
     }
 
@@ -460,7 +541,8 @@ impl Fake {
     }
 
     pub fn on_bulk_out(&mut self, ep: u8, buf: &[u8], timeout_ms: u32) -> Result<Transfer, UsbError> {
-        let r = self.bulk_out_inner(ep, buf);
+        let r = self.bulk_out_inner(ep, buf, timeout_ms);
+        self.tick(ep, &r, timeout_ms);
         let res = outcome(&r);
         if ep == 0x01 && buf.len() == 20 {
             let len = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -476,7 +558,7 @@ impl Fake {
         r
     }
 
-    fn bulk_out_inner(&mut self, ep: u8, buf: &[u8]) -> Result<Transfer, UsbError> {
+    fn bulk_out_inner(&mut self, ep: u8, buf: &[u8], timeout_ms: u32) -> Result<Transfer, UsbError> {
         self.begin(ep)?;
         match ep {
             0x01 => {
@@ -502,9 +584,10 @@ impl Fake {
                         self.out_ann[i]
                     ));
                 }
-                let n = if self.fault == Fault::OutRefuses {
+                let n = if self.refuses_writes() {
                     0
-                } else if !buf.is_empty() && self.rng.chance(self.policy.out_partial) {
+                } else if !buf.is_empty() && !self.must_move(ep, timeout_ms) && self.rng.chance(self.policy.out_partial)
+                {
                     self.rng.below(buf.len() as u64) as usize
                 } else {
                     buf.len()
@@ -563,7 +646,8 @@ impl Fake {
     }
 
     pub fn on_bulk_in(&mut self, ep: u8, buf: &mut [u8], timeout_ms: u32) -> Result<Transfer, UsbError> {
-        let r = self.bulk_in_inner(ep, buf);
+        let r = self.bulk_in_inner(ep, buf, timeout_ms);
+        self.tick(ep, &r, timeout_ms);
         let res = outcome(&r);
         let shown = match &r {
             Ok(t) if ep == 0x83 => format!(" {}", hex(&buf[..t.actual.min(24)])),
@@ -573,14 +657,19 @@ impl Fake {
         r
     }
 
-    fn bulk_in_inner(&mut self, ep: u8, buf: &mut [u8]) -> Result<Transfer, UsbError> {
+    fn bulk_in_inner(&mut self, ep: u8, buf: &mut [u8], timeout_ms: u32) -> Result<Transfer, UsbError> {
         self.begin(ep)?;
         if ep != 0x82 && ep != 0x83 {
             self.violation(format!("read on endpoint {ep:02x}"));
             return Err(UsbError::Stall);
         }
         let i = (ep - 0x82) as usize;
-        if self.fault == Fault::Silent {
+        if self.silent() {
+            self.moved(0);
+            return timeout(0);
+        }
+        if self.hush[i] > 0 {
+            self.hush[i] = self.hush[i].saturating_sub(timeout_ms as u64);
             self.moved(0);
             return timeout(0);
         }
@@ -594,8 +683,15 @@ impl Fake {
             self.moved(0);
             return timeout(0);
         }
+        let forced = self.must_move(ep, timeout_ms);
         if i == 0 {
             self.produce();
+            if forced && self.data_fifo.is_empty() {
+                // A slow board, not a silent one: at least a byte has come by now.
+                let b = self.data_rng.next() as u8;
+                self.data_fifo.push_back(b);
+                self.produced.push(b);
+            }
         } else {
             self.board_traffic();
         }
@@ -609,12 +705,13 @@ impl Fake {
             self.ctl_fifo.len()
         };
         let p = self.policy;
-        if self.rng.chance(p.timeout_empty) || cap == 0 {
+        if (!forced && self.rng.chance(p.timeout_empty)) || cap == 0 {
             self.moved(0);
             return timeout(0);
         }
         // Each case below delivers `k` bytes and leaves the announcement as the chip has it.
-        let roll = self.rng.below(1000);
+        // When the board must move data, it delivers normally (the last case).
+        let roll = if forced { 1000 } else { self.rng.below(1000) };
         let below_cap = (cap - 1).min(avail); // what a transfer that did not complete can carry
         let (k, r) = if roll < p.timeout_partial && below_cap >= ps {
             let k = ps * self.rng.range(1, below_cap / ps);

@@ -13,11 +13,79 @@
 use std::os::raw::{c_int, c_void};
 use std::time::{Duration, Instant};
 
-use log::{error, info};
+use log::{error, info, warn};
 use oni_sys as sys;
 
 use crate::chip::{Channel, Error, Ft600};
 use crate::usb::UsbError;
+
+// ------------------------------------------------------------------ giving up on a silent board
+//
+// DIFF: upstream retries a read that times out with nothing, or a write the chip does not
+// accept, for as long as it takes; on a board that has stopped answering (powered but its
+// FPGA quiet, the FT600's buffers full) a call then never returns. Here each loop gives up
+// once its stream has moved no byte for the limit below. Any byte moved starts the clock
+// again, so a slow stream never trips it; only silence does. The limits are wall time, not
+// retry counts, because the per-transfer timeouts differ (1 s on data and writes, 100 ms on
+// control reads). The clock starts when the call starts: time between calls is the caller's.
+//
+// Pacing (`read_data`) sleeps at most 5 ms between reads, and only after a read; those
+// sleeps fall inside the measured time but are three orders of magnitude below the limits,
+// and the limits never change what pacing does.
+
+/// The data stream (channel 0) while acquiring. The longest legitimate silence is one sample
+/// period plus the chip's turnaround: the chip ends a transfer as soon as its FIFO runs empty
+/// and delivers what it has (a block arrives in many pieces, often one frame each), so bytes
+/// keep coming at the frame rate whatever the block size: every 1 ms at 1 kHz, and every
+/// 10 ms from the memory monitor (100 Hz) alone. Even if the chip held data for a whole
+/// block, the slowest allowed combination with a headstage (1 kHz, one stream of about
+/// 140 bytes per frame, a 32 KiB block) fills in about 0.25 s. Data is read only in the
+/// running state (`read_data` refuses otherwise), so no reset, scan setup or stop reads it;
+/// the port scan reads 64 frames of a run of 8192. 3 s, like `STOP_WAIT` and well above the
+/// port scan's own 2 s, is far above all of that.
+const DATA_SILENCE: Duration = Duration::from_secs(3);
+/// Register replies and the signal stream (channel 1). The board's ONI controller answers a
+/// register read at once; a device register access (I2C included) or a reset's device table
+/// takes milliseconds. Slow operations (the sample-clock PLL, the ADC calibration run, board
+/// memory start-up) are polled by `OniBoard` with repeated quick reads under its own 1 to 2 s
+/// limits, never as one long wait here.
+const CONTROL_SILENCE: Duration = Duration::from_secs(3);
+/// Writes (commands on channel 1, frames on channel 0) the chip does not take. The board
+/// drains both pipes as they arrive; the chip refuses only when its buffer is full.
+const WRITE_SILENCE: Duration = Duration::from_secs(3);
+
+/// The time now. Under test with a fake chip installed, the fake's clock, which advances by a
+/// transfer's timeout whenever one times out (`crate::fake`); otherwise, and always outside
+/// tests, `Instant::now()`.
+fn now() -> Instant {
+    #[cfg(all(test, not(target_os = "macos")))]
+    if let Some(t) = crate::fake::now() {
+        return t;
+    }
+    Instant::now()
+}
+
+/// How long a stream has gone without moving a byte.
+struct Quiet {
+    last: Instant,
+}
+
+impl Quiet {
+    fn start() -> Self {
+        Quiet { last: now() }
+    }
+    /// `n` bytes moved: if any, the stream is not silent.
+    fn moved(&mut self, n: usize) {
+        if n > 0 {
+            self.last = now();
+        }
+    }
+    /// The silent time, if it has reached `limit`.
+    fn over(&self, limit: Duration) -> Option<Duration> {
+        let q = now().saturating_duration_since(self.last);
+        (q >= limit).then_some(q)
+    }
+}
 
 /// The name to pass to `oni_create_ctx` once `register` has run.
 pub const DRIVER_NAME: &str = "kalilausb";
@@ -108,6 +176,10 @@ struct Ctx {
     sig_state: SigState,
     sig_offset: usize,
     sig_error: bool,
+    /// A register read gave up after its request had gone out. Replies carry no tag, so if
+    /// that reply came late it would be taken for the next read's value; every later register
+    /// read fails at once instead, until the context is closed.
+    replies_lost: bool,
     reg_op: RegOp,
     /// Read pacing: how long the board takes to produce one byte (running estimate, 0 =
     /// unknown), and when the last block was completed.
@@ -129,6 +201,7 @@ impl Ctx {
             sig_state: SigState::Cmd,
             sig_offset: 0,
             sig_error: false,
+            replies_lost: false,
             reg_op: RegOp::default(),
             ns_per_byte: 0.0,
             last_block: None,
@@ -166,12 +239,14 @@ impl Ctx {
                     }
                     let part = &data[first..=index];
                     // DIFF: upstream spins until there is room, which cannot happen on one
-                    // thread; report it instead.
-                    if !self.signal.can_write(part.len()) {
+                    // thread; report it instead. The bytes that do not fit are dropped, but
+                    // parsing goes on, so the parser keeps to the packet framing: a register
+                    // reply later in this read, or in the next, is still read as one.
+                    if self.signal.can_write(part.len()) {
+                        self.signal.write(part);
+                    } else {
                         self.sig_error = true;
-                        return;
                     }
-                    self.signal.write(part);
                     if data[index] == 0 {
                         self.sig_state = SigState::Cmd;
                     }
@@ -181,11 +256,11 @@ impl Ctx {
                     // DIFF: upstream takes min(4, left) even after a split reply; take the
                     // rest of the 4-byte value.
                     let n = (4 - self.sig_offset).min(data.len() - index);
-                    if !self.reg.can_write(n) {
+                    if self.reg.can_write(n) {
+                        self.reg.write(&data[index..index + n]);
+                    } else {
                         self.sig_error = true;
-                        return;
                     }
-                    self.reg.write(&data[index..index + n]);
                     self.sig_offset = (self.sig_offset + n) % 4;
                     index += n;
                     if self.sig_offset == 0 {
@@ -197,21 +272,49 @@ impl Ctx {
     }
 
     /// Reads whatever the control channel has (waiting up to 100 ms) into the buffers.
-    fn update_control(&mut self) {
+    /// Returns the bytes read.
+    fn update_control(&mut self) -> usize {
         let Some(ft) = self.ft.as_mut() else {
             self.sig_error = true;
-            return;
+            return 0;
         };
         let mut aux = std::mem::take(&mut self.aux);
+        let mut got = 0;
         match ft.read(Channel::Control, &mut aux, 100) {
             Ok(n) => {
                 if n > 0 {
                     self.fill_control_buffers(&aux[..n]);
                 }
+                got = n;
             }
             Err(_) => self.sig_error = true,
         }
         self.aux = aux;
+        got
+    }
+
+    /// Reads the control channel until `ready`. Fails with `ONI_ESEEKFAILURE` (as upstream on
+    /// a failed read) on a USB error or a full buffer, and when the channel has moved no byte
+    /// for `CONTROL_SILENCE`.
+    fn wait_control(&mut self, what: &str, ready: impl Fn(&Ctx) -> bool) -> c_int {
+        let mut quiet = Quiet::start();
+        while !ready(self) {
+            let n = self.update_control();
+            if self.sig_error {
+                self.sig_error = false;
+                return sys::ONI_ESEEKFAILURE;
+            }
+            if n > 0 {
+                quiet.moved(n);
+            } else if let Some(q) = quiet.over(CONTROL_SILENCE) {
+                warn!(
+                    "FT600 control channel: nothing for {:.1} s while waiting for {what}; giving up",
+                    q.as_secs_f64()
+                );
+                return sys::ONI_ESEEKFAILURE;
+            }
+        }
+        sys::ONI_ESUCCESS
     }
 
     fn send_cmd(&mut self, data: &[u8]) -> c_int {
@@ -219,9 +322,22 @@ impl Ctx {
             return sys::ONI_EINVALSTATE;
         };
         let mut total = 0;
+        let mut quiet = Quiet::start();
         while total < data.len() {
             match ft.write(Channel::Control, &data[total..], 1000) {
-                Ok(n) => total += n,
+                Ok(n) => {
+                    total += n;
+                    if n > 0 {
+                        quiet.moved(n);
+                    } else if let Some(q) = quiet.over(WRITE_SILENCE) {
+                        warn!(
+                            "FT600 control channel: the chip took no command byte for {:.1} s ({total} of {} sent); giving up",
+                            q.as_secs_f64(),
+                            data.len()
+                        );
+                        return sys::ONI_ESEEKFAILURE;
+                    }
+                }
                 Err(_) => return sys::ONI_ESEEKFAILURE,
             }
         }
@@ -366,9 +482,23 @@ impl Ctx {
         // chip's FIFO does not run empty (`caught_up` is false) and there is no sleep.
         const MARGIN_NS: f64 = 100_000.0;
         let mut got = 0;
+        let mut quiet = Quiet::start();
         while got < want {
             match ft.read(Channel::Data, &mut dst[got..want], 1000) {
-                Ok(n) => got += n,
+                Ok(n) => {
+                    got += n;
+                    if n > 0 {
+                        quiet.moved(n);
+                    } else if let Some(q) = quiet.over(DATA_SILENCE) {
+                        // The announcement stays pending, as after any timed-out read: a
+                        // later read continues it, and stop, reset and close abort it.
+                        warn!(
+                            "FT600 data channel: nothing for {:.1} s ({got} of {want} bytes of the block); giving up",
+                            q.as_secs_f64()
+                        );
+                        return sys::ONI_EREADFAILURE;
+                    }
+                }
                 Err(e) => {
                     error!("data read failed: {e}");
                     return sys::ONI_EREADFAILURE;
@@ -486,12 +616,9 @@ extern "C" fn read_stream(
                 if size >= ctx.signal.buf.len() {
                     return sys::ONI_EBUFFERSIZE;
                 }
-                while ctx.signal.len() < size {
-                    ctx.update_control();
-                    if ctx.sig_error {
-                        ctx.sig_error = false;
-                        return sys::ONI_ESEEKFAILURE;
-                    }
+                let rc = ctx.wait_control("the signal stream", |c| c.signal.len() >= size);
+                if rc != sys::ONI_ESUCCESS {
+                    return rc;
                 }
                 ctx.signal.read(dst);
                 size as c_int
@@ -519,13 +646,26 @@ extern "C" fn write_stream(
         let src = unsafe { std::slice::from_raw_parts(data as *const u8, size) };
         let total = size & !3;
         let mut done = 0;
+        let mut quiet = Quiet::start();
         while done < total {
             let n = (total - done).min(ctx.out_block as usize);
             match ft.write(Channel::Data, &src[done..done + n], 1000) {
-                Ok(k) => done += k,
+                Ok(k) => {
+                    done += k;
+                    if k > 0 {
+                        quiet.moved(k);
+                    } else if let Some(q) = quiet.over(WRITE_SILENCE) {
+                        warn!(
+                            "FT600 data channel: the chip took no byte for {:.1} s ({done} of {total} written); giving up",
+                            q.as_secs_f64()
+                        );
+                        return sys::ONI_EWRITEFAILURE;
+                    }
+                }
                 Err(_) => return sys::ONI_EWRITEFAILURE,
             }
         }
+        // As upstream: the whole size, though only whole 32-bit words are sent.
         size as c_int
     })
 }
@@ -591,6 +731,9 @@ extern "C" fn write_config(p: sys::oni_driver_ctx, reg: sys::oni_config_t, value
 extern "C" fn read_config(p: sys::oni_driver_ctx, reg: sys::oni_config_t, value: *mut sys::oni_reg_val_t) -> c_int {
     guard(|| {
         let ctx = unsafe { cast(p) };
+        if ctx.replies_lost {
+            return sys::ONI_ESEEKFAILURE;
+        }
         let mut buf = [0u8; 5];
         buf[0] = CMD_READREG;
         buf[1..5].copy_from_slice(&reg_offset(reg).to_le_bytes());
@@ -598,12 +741,13 @@ extern "C" fn read_config(p: sys::oni_driver_ctx, reg: sys::oni_config_t, value:
         if res != sys::ONI_ESUCCESS {
             return res;
         }
-        while ctx.reg.len() < 4 {
-            ctx.update_control();
-            if ctx.sig_error {
-                ctx.sig_error = false;
-                return sys::ONI_ESEEKFAILURE;
+        let res = ctx.wait_control("a register reply", |c| c.reg.len() >= 4);
+        if res != sys::ONI_ESUCCESS {
+            if !ctx.replies_lost {
+                error!("FT600: a register reply was lost; register reads fail until the board is closed");
             }
+            ctx.replies_lost = true;
+            return res;
         }
         let mut v = [0u8; 4];
         ctx.reg.read(&mut v);
@@ -749,6 +893,27 @@ mod tests {
         ctx.signal.read(&mut s);
         assert_eq!(s, [5, 6, 7, 0, 9, 0]);
         assert!(!ctx.sig_error);
+    }
+
+    #[test]
+    fn a_full_signal_buffer_drops_the_packet_but_keeps_the_parser_in_step() {
+        let mut ctx = Ctx::new();
+        ctx.signal = Ring::new(8); // room for 7 bytes
+        // A 9-byte signal packet that does not fit, then a register reply in the same read.
+        ctx.fill_control_buffers(&[SIGRES_SIGNAL, 1, 2, 3, 4, 5, 6, 7, 8, 0, SIGRES_REG, 0x78, 0x56]);
+        assert!(ctx.sig_error);
+        assert_eq!(ctx.signal.len(), 0);
+        // The rest of the reply in the next read is still read as the reply.
+        ctx.fill_control_buffers(&[0x34, 0x12, SIGRES_SIGNAL, 9, 0]);
+        assert_eq!(ctx.reg.len(), 4);
+        let mut v = [0u8; 4];
+        ctx.reg.read(&mut v);
+        assert_eq!(u32::from_le_bytes(v), 0x1234_5678);
+        let mut s = [0u8; 2];
+        assert_eq!(ctx.signal.len(), 2);
+        ctx.signal.read(&mut s);
+        assert_eq!(s, [9, 0]);
+        assert_eq!(ctx.sig_state, SigState::Cmd);
     }
 
     #[test]

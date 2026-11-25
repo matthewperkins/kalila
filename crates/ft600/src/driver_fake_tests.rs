@@ -525,11 +525,15 @@ fn pacing_changes_nothing_but_when() {
 fn faults(seed: u64) -> Result<(), String> {
     let mut rng = Rng(seed);
     let mut f = fake_for(seed, &mut rng);
-    f.fault = match rng.below(3) {
+    f.fault = match rng.below(4) {
         0 => Fault::Unplug { after: rng.below(400) },
         1 => Fault::Stall {
             ep: [0, 0x01, 0x02, 0x03, 0x82, 0x83][rng.below(6) as usize],
             from: rng.below(60),
+        },
+        2 => Fault::GoesSilent {
+            after: rng.below(400),
+            refuse_writes: rng.chance(500),
         },
         _ => Fault::ShortCommand { from: rng.below(80) },
     };
@@ -540,6 +544,8 @@ fn faults(seed: u64) -> Result<(), String> {
         return Err(ctx("init", rc));
     }
     let gone = |b: &Board| b.fake().gone;
+    // Silent from before the call: nothing can have arrived for it.
+    let silent = |b: &Board| matches!(fault, Fault::GoesSilent { after, .. } if b.fake().calls() >= after);
     let mut model: HashMap<(u32, u32), u32> = HashMap::new();
     let mut consumed = 0;
     // After a failed control read the parser may have lost bytes: later signal bytes cannot
@@ -563,17 +569,18 @@ fn faults(seed: u64) -> Result<(), String> {
                         rc => return Err(ctx("device register write", rc)),
                     }
                 }
-                1 => match b.dev_read(idx, addr) {
-                    Ok(_) if gone(b) => return Err(format!("{fault:?}: a register read succeeded after unplug")),
-                    Ok(v) => {
+                1 => match (silent(b), b.dev_read(idx, addr)) {
+                    (_, Ok(_)) if gone(b) => return Err(format!("{fault:?}: a register read succeeded after unplug")),
+                    (true, Ok(_)) => return Err(format!("{fault:?}: a register read succeeded on a silent board")),
+                    (_, Ok(v)) => {
                         if let Some(&want) = model.get(&(idx, addr))
                             && v != want
                         {
                             return Err(format!("{fault:?}: register read {v:#x}, not {want:#x}"));
                         }
                     }
-                    Err(sys::ONI_ESEEKFAILURE | sys::ONI_EINVALSTATE) => {}
-                    Err(rc) => return Err(ctx("device register read", rc)),
+                    (_, Err(sys::ONI_ESEEKFAILURE | sys::ONI_EINVALSTATE)) => {}
+                    (_, Err(rc)) => return Err(ctx("device register read", rc)),
                 },
                 _ => {
                     let pending = b.fake().signal_sent.len() - consumed;
@@ -620,10 +627,14 @@ fn faults(seed: u64) -> Result<(), String> {
             continue;
         }
         let mut buf = vec![0u8; block as usize];
+        let was_silent = silent(&b);
         match b.read_data(&mut buf) {
             rc if rc == block as c_int => {
                 if gone(&b) {
                     return Err(format!("{fault:?}: a data read succeeded after unplug"));
+                }
+                if was_silent {
+                    return Err(format!("{fault:?}: a data read succeeded on a silent board"));
                 }
                 if stream_ok {
                     out.extend_from_slice(&buf);
@@ -792,13 +803,23 @@ fn a_failed_firmware_read_is_not_fatal() {
     verdict(&h.borrow()).unwrap();
 }
 
-// Findings: a board that stops answering. Each case below makes the driver retry forever
-// (upstream's `onidriver_ft600.c` loops the same way); on the board each retry is a
-// 1000 ms (data, writes) or 100 ms (control) timeout, so the call never returns. The fake
-// ends the loop after `SPIN_LIMIT` empty transfers, which is what these tests detect.
+// ---------------------------------------------------------------- 6. a board that stops answering
+
+// Upstream (`onidriver_ft600.c`) retries forever, and so did this driver: on the board each
+// retry is a 1000 ms (data, writes) or 100 ms (control) timeout, so the call never returned.
+// Now each loop gives up once its stream has moved no byte for its limit (`DATA_SILENCE`,
+// `CONTROL_SILENCE`, `WRITE_SILENCE`), on the fake's clock. The fake also ends any loop after
+// `SPIN_LIMIT` empty transfers (`spun`).
+
+/// What `f` returned, and how much of the fake's time it took.
+fn timed<T>(b: &mut Board, f: impl FnOnce(&mut Board) -> T) -> (T, Duration) {
+    let t0 = b.fake().now();
+    let r = f(b);
+    let dt = b.fake().now() - t0;
+    (r, dt)
+}
 
 #[test]
-#[ignore = "finding: read_data retries a timed-out empty read forever (silent board)"]
 fn a_silent_board_fails_the_data_read_instead_of_waiting_forever() {
     let mut f = Fake::new(10, Policy::exact());
     f.policy.produce_max = 4096;
@@ -807,41 +828,208 @@ fn a_silent_board_fails_the_data_read_instead_of_waiting_forever() {
     assert_eq!(b.start(4096), 0);
     b.fake().fault = Fault::Silent;
     let mut buf = vec![0u8; 4096];
-    let rc = b.read_data(&mut buf);
+    let (rc, dt) = timed(&mut b, |b| b.read_data(&mut buf));
     let spun = b.fake().spun;
     assert!(
         !spun,
         "read_data kept retrying (returned {rc} only when the fake gave up)"
     );
     assert_eq!(rc, sys::ONI_EREADFAILURE);
+    // At the limit, within one more read's timeout.
+    assert!(
+        dt >= DATA_SILENCE && dt < DATA_SILENCE + Duration::from_secs(1),
+        "gave up after {dt:?}"
+    );
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
 }
 
 #[test]
-#[ignore = "finding: read_config waits forever for a register reply that never comes"]
 fn a_register_read_without_a_reply_fails_instead_of_waiting_forever() {
     let (mut b, rc) = Board::open(Fake::new(11, Policy::exact()));
     assert_eq!(rc, 0);
     b.fake().fault = Fault::Silent;
-    let r = b.read(sys::ONI_CONFIG_RUNNING);
+    let (r, dt) = timed(&mut b, |b| b.read(sys::ONI_CONFIG_RUNNING));
     let spun = b.fake().spun;
     assert!(
         !spun,
         "read_config kept retrying (returned {r:?} only when the fake gave up)"
     );
     assert_eq!(r, Err(sys::ONI_ESEEKFAILURE));
+    assert!(
+        dt >= CONTROL_SILENCE && dt < CONTROL_SILENCE + Duration::from_millis(100),
+        "gave up after {dt:?}"
+    );
+    // The signal stream gives up the same way.
+    let mut s = [0u8; 2];
+    let (rc, dt) = timed(&mut b, |b| b.read_signal(&mut s));
+    assert_eq!(rc, sys::ONI_ESEEKFAILURE);
+    assert!(dt >= CONTROL_SILENCE && dt < CONTROL_SILENCE + Duration::from_millis(100));
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
 }
 
 #[test]
-#[ignore = "finding: send_cmd and write_stream retry a write the chip never accepts forever"]
 fn a_write_the_chip_never_accepts_fails_instead_of_retrying_forever() {
     let (mut b, rc) = Board::open(Fake::new(12, Policy::exact()));
     assert_eq!(rc, 0);
     b.fake().fault = Fault::OutRefuses;
-    let rc = b.write(sys::ONI_CONFIG_RUNNING, 1);
+    let (rc, dt) = timed(&mut b, |b| b.write(sys::ONI_CONFIG_RUNNING, 1));
     let spun = b.fake().spun;
     assert!(
         !spun,
         "send_cmd kept retrying (returned {rc} only when the fake gave up)"
     );
     assert_eq!(rc, sys::ONI_ESEEKFAILURE);
+    assert!(
+        dt >= WRITE_SILENCE && dt < WRITE_SILENCE + Duration::from_secs(1),
+        "gave up after {dt:?}"
+    );
+    // A data frame write gives up the same way.
+    let (rc, dt) = timed(&mut b, |b| b.write_data(&[0; 16]));
+    assert_eq!(rc, sys::ONI_EWRITEFAILURE);
+    assert!(dt >= WRITE_SILENCE && dt < WRITE_SILENCE + Duration::from_secs(1));
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
+}
+
+/// A board that is slow but never silent for the limit: each block takes far longer than
+/// the limit, and no read gives up, because every byte starts the clock again.
+#[test]
+fn a_slow_but_moving_data_stream_never_gives_up() {
+    let mut f = Fake::new(13, Policy::exact());
+    f.policy.produce_max = 4; // 4 bytes before every read
+    f.policy.timeout_empty = 1000; // every read times out empty...
+    f.policy.max_quiet_ms = 2000; // ...unless the pipe has been quiet for 2 s: then it delivers
+    let (mut b, rc) = Board::open(f);
+    assert_eq!(rc, 0);
+    assert_eq!(b.start(4096), 0);
+    let mut out = Vec::new();
+    for _ in 0..2 {
+        let mut buf = vec![0u8; 4096];
+        let (rc, dt) = timed(&mut b, |b| b.read_data(&mut buf));
+        assert_eq!(rc, 4096);
+        assert!(dt > 100 * DATA_SILENCE, "a block took only {dt:?}");
+        out.extend_from_slice(&buf);
+    }
+    assert_eq!(out, b.fake().produced[..out.len()]);
+    assert_eq!(b.stop(), 0);
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
+}
+
+/// The same for writes: the chip takes a little at a time, with timeouts in between.
+#[test]
+fn a_slow_but_moving_write_never_gives_up() {
+    let mut f = Fake::new(14, Policy::exact());
+    f.policy.out_partial = 1000; // every write times out after part of the data, often none...
+    f.policy.max_quiet_ms = 2000; // ...but never three times in a row
+    let (mut b, rc) = Board::open(f);
+    assert_eq!(rc, 0);
+    assert_eq!(b.start(4096), 0);
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i * 7) as u8).collect();
+    let (rc, dt) = timed(&mut b, |b| b.write_data(&data));
+    assert_eq!(rc, data.len() as c_int);
+    assert!(dt > WRITE_SILENCE, "the write took only {dt:?}");
+    assert_eq!(b.fake().data_out, data);
+    assert_eq!(b.write(sys::ONI_CONFIG_RUNNING, 1), 0);
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
+}
+
+/// A register reply or signal packet after a silence shorter than the limit (a board slow
+/// after a reset, say) is read as before.
+#[test]
+fn a_reply_after_a_silence_below_the_limit_is_read() {
+    let (mut b, rc) = Board::open(Fake::new(15, Policy::exact()));
+    assert_eq!(rc, 0);
+    assert_eq!(b.write(sys::ONI_CONFIG_SYSCLKHZ, 0x1234_5678), 0);
+    assert_eq!(b.write(sys::ONI_CONFIG_RESET, 1), 0);
+    let just_below = CONTROL_SILENCE.as_millis() as u64 - 100;
+    b.fake().hush[1] = just_below;
+    let (r, dt) = timed(&mut b, |b| b.read(sys::ONI_CONFIG_SYSCLKHZ));
+    assert_eq!(r, Ok(0x1234_5678));
+    assert_eq!(dt, Duration::from_millis(just_below));
+    // A device register write's acknowledgement on the signal stream.
+    assert_eq!(b.dev_write(2, 5, 9), 0);
+    b.fake().hush[1] = just_below;
+    let mut s = [0u8; 3];
+    assert_eq!(b.read_signal(&mut s), 3);
+    assert_eq!(s, [0x57, 0x82, 0]);
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
+}
+
+/// A reply later than the limit: the read fails, and the late reply is never taken for the
+/// next read's (replies carry no tag), so register reads fail from then on, at once and
+/// without sending anything.
+#[test]
+fn a_reply_later_than_the_limit_is_never_taken_for_the_next_one() {
+    let (mut b, rc) = Board::open(Fake::new(16, Policy::exact()));
+    assert_eq!(rc, 0);
+    assert_eq!(b.write(sys::ONI_CONFIG_SYSCLKHZ, 111), 0);
+    assert_eq!(b.write(sys::ONI_CONFIG_ACQCLKHZ, 222), 0);
+    b.fake().hush[1] = CONTROL_SILENCE.as_millis() as u64 + 500;
+    let (r, dt) = timed(&mut b, |b| b.read(sys::ONI_CONFIG_SYSCLKHZ));
+    assert_eq!(r, Err(sys::ONI_ESEEKFAILURE));
+    assert!(dt >= CONTROL_SILENCE);
+    b.fake().log = Some(Vec::new());
+    let (r, dt) = timed(&mut b, |b| b.read(sys::ONI_CONFIG_ACQCLKHZ));
+    assert_eq!(r, Err(sys::ONI_ESEEKFAILURE));
+    assert_eq!(dt, Duration::ZERO);
+    assert_eq!(b.fake().log.take().unwrap(), Vec::<String>::new());
+    // Writes still go out.
+    assert_eq!(b.write(sys::ONI_CONFIG_RUNNING, 0), 0);
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
+}
+
+/// Data is read only while acquiring: outside it a read is refused at once, sends nothing
+/// and waits for nothing, as before the limit was added.
+#[test]
+fn a_data_read_outside_acquisition_is_refused_at_once() {
+    let mut f = Fake::new(17, Policy::exact());
+    f.policy.produce_max = 4096;
+    let (mut b, rc) = Board::open(f);
+    assert_eq!(rc, 0);
+    assert_eq!(b.opt(sys::ONI_OPT_BLOCKREADSIZE, 4096), 0);
+    let mut buf = vec![0u8; 4096];
+    b.fake().log = Some(Vec::new());
+    let (rc, dt) = timed(&mut b, |b| b.read_data(&mut buf));
+    assert_eq!((rc, dt), (sys::ONI_EINVALSTATE, Duration::ZERO));
+    assert_eq!(b.fake().log.take().unwrap(), Vec::<String>::new());
+    assert_eq!(b.start(4096), 0);
+    assert_eq!(b.read_data(&mut buf), 4096);
+    assert_eq!(b.stop(), 0);
+    b.fake().log = Some(Vec::new());
+    let (rc, dt) = timed(&mut b, |b| b.read_data(&mut buf));
+    assert_eq!((rc, dt), (sys::ONI_EINVALSTATE, Duration::ZERO));
+    assert_eq!(b.fake().log.take().unwrap(), Vec::<String>::new());
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
+}
+
+/// After giving up on a data read the chip's state is as after any timed-out read: when the
+/// board speaks again the stream continues where it was, and stop and close abort the
+/// pending announcement as usual (the protocol checks in `verdict`).
+#[test]
+fn after_giving_up_the_stream_continues_and_closes_cleanly() {
+    let mut f = Fake::new(18, Policy::exact());
+    f.policy.produce_max = 1000;
+    let (mut b, rc) = Board::open(f);
+    assert_eq!(rc, 0);
+    assert_eq!(b.start(4096), 0);
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(b.read_data(&mut buf), 4096);
+    let mut out = buf.clone();
+    b.fake().hush[0] = DATA_SILENCE.as_millis() as u64 + 1000;
+    let mut part = vec![0u8; 4096];
+    assert_eq!(b.read_data(&mut part), sys::ONI_EREADFAILURE);
+    assert_eq!(b.read_data(&mut buf), 4096);
+    out.extend_from_slice(&buf);
+    // Nothing was lost on the wire: the second block is the stream's next 4096 bytes.
+    assert_eq!(out, b.fake().produced[..8192]);
+    assert_eq!(b.stop(), 0);
+    let h = b.close();
+    verdict(&h.borrow()).unwrap();
 }
