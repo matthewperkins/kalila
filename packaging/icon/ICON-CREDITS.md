@@ -24,7 +24,9 @@ project's owner.
 [LICENSE](../../LICENSE)), like the code.
 
 To re-render the PNGs: `rsvg-convert -w N -h N kalila-icon.svg -o kalila-N.png` for N in
-32, 48, 64, 128, 256.
+32, 48, 64, 128, 256. `kalila-1024.png` (the macOS app's icon is made from it) was
+rendered on a Mac, where `rsvg-convert` is not installed:
+`swift packaging/macos/render-icon.swift kalila-icon.svg kalila-1024.png 1024`.
 
 Until 2026-11-13 the icon showed Bastet and Sekhmet, adapted from Wikimedia Commons drawings
 under CC BY-SA; those files are in the repository's history only.

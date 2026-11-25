@@ -15,7 +15,32 @@ mod uiscript;
 
 use eframe::egui_wgpu::{self, wgpu};
 
+/// macOS: started from Finder, the Dock or `open`, a program's stderr is /dev/null. The log
+/// then goes to `~/Library/Logs/kalila/kalila.log` (the run before it is kept as
+/// `kalila.log.1`), as the Linux desktop launcher does with its own file. A start from a
+/// terminal, or with stderr sent anywhere else, is left alone.
+#[cfg(target_os = "macos")]
+fn log_to_a_file_without_a_terminal() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(null) = std::fs::metadata("/dev/null") else { return };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(2, &mut st) } != 0 || st.st_rdev as u64 != null.rdev() || st.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = std::path::PathBuf::from(home).join("Library/Logs/kalila");
+    let log = dir.join("kalila.log");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::rename(&log, dir.join("kalila.log.1"));
+    if let Ok(f) = std::fs::File::create(&log) {
+        unsafe { libc::dup2(f.as_raw_fd(), 2) };
+    }
+}
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "macos")]
+    log_to_a_file_without_a_terminal();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn")).init();
     let mut cfg = config::Config::load();
     let args: Vec<String> = std::env::args().collect();

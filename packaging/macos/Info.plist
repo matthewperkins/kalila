@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- kalila.app's Info.plist. packaging/make-macos-app.sh fills in SHORTVERSION and VERSION
+     (Cargo.toml) and MINOS (what the binaries were built for, read from them). -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>kalila</string>
+    <key>CFBundleDisplayName</key>
+    <string>kalila</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.matthewperkins.kalila</string>
+    <key>CFBundleExecutable</key>
+    <string>kalila</string>
+    <key>CFBundleIconFile</key>
+    <string>kalila</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>SHORTVERSION</string>
+    <key>CFBundleVersion</key>
+    <string>VERSION</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.medical</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>MINOS</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>

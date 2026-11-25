@@ -38,7 +38,7 @@ packaging/       desktop launcher, icon, release build and packages (CI)
 
 ## Install
 
-Releases (<https://github.com/matthewperkins/kalila/releases>) have, for x86_64:
+Releases (<https://github.com/matthewperkins/kalila/releases>) have, for Linux on x86_64:
 
 | file | for |
 |---|---|
@@ -52,6 +52,34 @@ the release workflow (`.github/workflows/release.yml`). The packages install `ka
 `kalila-headless` (acquisition and recording without windows), a menu entry, the board's
 udev rule and real-time limits for the `realtime` group; see the package description, or
 `INSTALL.md` in a tarball. `SHA256SUMS` has the checksums.
+
+### macOS (Apple silicon)
+
+`kalila-macos-arm64.zip` holds `kalila.app`. It needs nothing installed: no Rust, no
+Homebrew, no driver. In Terminal:
+
+```zsh
+cd ~/Downloads && curl -L -O https://github.com/matthewperkins/kalila/releases/latest/download/kalila-macos-arm64.zip \
+  && unzip -o kalila-macos-arm64.zip && mv kalila.app /Applications/
+```
+
+Then open kalila from Launchpad, Spotlight or the Dock.
+
+- **The simulated board** (no hardware): `open -a kalila --args --sim --acquire`, or
+  "Switch to" at the top left of the window.
+- **Downloaded with a browser instead?** macOS then marks the app as from an unidentified
+  developer (it is signed ad hoc, not with a paid Apple Developer ID) and will not open it
+  at first. Either right-click the app → Open, once; or System Settings → Privacy &
+  Security → Open Anyway; or `xattr -dr com.apple.quarantine /Applications/kalila.app`.
+  `curl` does not mark the file, so the line above needs none of this.
+- **From a terminal:** `sudo ln -sf /Applications/kalila.app/Contents/MacOS/kalila /usr/local/bin/kalila`
+  (and the same for `kalila-headless`).
+- **The log** of an app started from Finder is `~/Library/Logs/kalila/kalila.log`.
+- **How far the Mac version has been tried:** on one MacBook Air (M4, macOS 27), with the
+  simulated board: display, audio, recording and scroll-back review. **The real board has
+  not yet been run from a Mac with kalila**: its USB code for macOS is written and untested.
+  Until that is done and says so here, record animals on Linux. The app is built for
+  macOS 11 or newer and has not been tried on anything older than 27.
 
 ## Build
 

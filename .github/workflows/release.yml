@@ -1,5 +1,6 @@
 # Builds kalila's release: a glibc tarball, .deb and .rpm (built on Rocky Linux 9, so glibc
-# 2.34 or newer), and a musl tarball (built on Alpine). Installs and runs them on each
+# 2.34 or newer), a musl tarball (built on Alpine), and kalila.app for macOS on Apple
+# silicon (kalila-macos-arm64.zip). Installs and runs them on each
 # supported distribution, and for a version tag drafts a GitHub release (never published
 # here: the owner reads the draft and publishes it). The steps are scripts in packaging/
 # (ci-build.sh, ci-test-install.sh), so they can be read and run without this file.
@@ -57,6 +58,34 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-musl
+          path: dist/
+          if-no-files-found: error
+
+  # kalila.app for Apple silicon: built, tested and checked by packaging/make-macos-app.sh
+  # (signature, no library outside the system, the simulator run from inside the bundle,
+  # and the zip unpacked as a user would).
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          rustc --version
+      - name: Test
+        run: cargo test --release --locked --workspace
+      - name: Build, check, zip
+        env:
+          KALILA_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: sh packaging/make-macos-app.sh dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-macos
           path: dist/
           if-no-files-found: error
 
@@ -126,7 +155,7 @@ jobs:
 
   release:
     if: github.ref_type == 'tag'
-    needs: [build-gnu, build-musl, test-package, test-gnu-tarball, test-musl]
+    needs: [build-gnu, build-musl, build-macos, test-package, test-gnu-tarball, test-musl]
     runs-on: ubuntu-latest
     permissions:
       contents: write

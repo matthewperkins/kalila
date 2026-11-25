@@ -366,7 +366,26 @@ they are; platform code sits behind small `cfg` seams.
   - Not measured: an external or 120 Hz monitor, the board streaming, and whether frames
     tear visibly without sync (they did in dimna).
   - `RUST_LOG=kalila=debug` logs the figure every 2 s ("to screen: …").
-- Still to do: the board sessions on the Mac, an `.app`.
+- **kalila.app** (2026-11-25, the pattern of the user's syncview-rs and of
+  `~/dimna/docs/plans/macos-app-bundle.md`): `packaging/make-macos-app.sh OUT_DIR` builds
+  the bundle (`kalila` and `kalila-headless` in `Contents/MacOS`, `Info.plist` from
+  `packaging/macos/`, the icon from `kalila-1024.png`, licences), signs it ad hoc, checks
+  it, and writes `kalila-macos-arm64.zip` (no version in the name, so
+  `releases/latest/download/…` is the newest). The CI's macOS job keeps the zip with each
+  run; the release workflow's `build-macos` job attaches it to the draft.
+  - Checks in the script: no library outside the system, `codesign --verify --strict`,
+    `kalila --help`, `kalila-headless` 3 s on the simulator with nothing lost, and the zip
+    unpacked with `unzip` still verifying.
+  - **The zip is made without extended attributes** (`ditto --norsrc --noextattr`). With
+    them, `unzip` wrote `._name` files into the bundle and the signature no longer
+    verified ("a sealed resource is missing or invalid").
+  - Started without a terminal (stderr is /dev/null), kalila logs to
+    `~/Library/Logs/kalila/kalila.log` (`main.rs`). Seen with `open -g`.
+  - `LSMinimumSystemVersion` is read from the binaries (11.0, Rust's default); nothing
+    older than 27 has been tried.
+  - Not done: the Dock icon and a browser download's Gatekeeper prompt looked at by the
+    user; a release (a `v*` tag on `main`, which `macos-port` is not merged into).
+- Still to do: the board sessions on the Mac.
 
 ## Trace windows (rig, 2026-11-06)
 
