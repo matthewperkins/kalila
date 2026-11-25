@@ -347,8 +347,24 @@ they are; platform code sits behind small `cfg` seams.
     window, 12 s each): `present_mode` "auto" (no sync) **mean 5.3–6.7 ms**, worst 19–33 ms
     in a 2 s stretch; "vsync" **mean 47–49 ms**, worst 50–66 ms. dimna's Metal test on the
     same Mac: 7.1 ms windowed without sync, 32 ms with. So "auto" stays the default.
-  - Not measured: fullscreen, an external or 120 Hz monitor, the board streaming, and
-    whether frames tear visibly without sync (they did in dimna).
+  - **Fullscreen is slower here, not quicker** (2026-11-25, same Mac and screen, 14 s each,
+    3172 columns):
+
+    | | "auto" (no sync) | "vsync" |
+    |---|---|---|
+    | windowed | 5.3–6.7 ms, worst 19–33 | 47–49 ms |
+    | macOS fullscreen Space (script step `fullscreen`) | 20–24 ms, worst 41–62 | 63–64 ms |
+    | borderless over the whole screen (script step `cover`) | 14–20 ms, worst 30–32 | 47 ms |
+
+    dimna's Metal test had fullscreen without sync at 5.2 ms on this Mac, so something
+    differs between how dimna and wgpu/winit present; not found yet. The no-sync fullscreen
+    figures look like frames shown only at the refresh (mean about one frame, worst about
+    two). Next: run `~/dimna/tools/metal-latency` and compare the layer's settings.
+  - **These runs take the keyboard.** A fullscreen or covering simulator window becomes the
+    key window, so what the user types elsewhere lands in it (both runs had their time base
+    changed part way, most likely by `+`/`-`). Ask before running them, and say so.
+  - Not measured: an external or 120 Hz monitor, the board streaming, and whether frames
+    tear visibly without sync (they did in dimna).
   - `RUST_LOG=kalila=debug` logs the figure every 2 s ("to screen: …").
 - Still to do: the board sessions on the Mac, an `.app`.
 
@@ -544,7 +560,7 @@ window's sweeps can start at a level crossing on one of its electrodes instead o
 
 No input-injection tools are installed on the rig. To click through the GUI, run the simulator
 with `KALILA_UI_SCRIPT=<file>`.
-- **Steps:** window, wait, move, click, drag, scroll, key, text, shot, log, quit. The format
+- **Steps:** window, wait, move, click, drag, scroll, key, text, shot, fullscreen, log, quit. The format
   is at the top of `app/src/uiscript.rs`.
 - **Input path:** `App::raw_input_hook` feeds the steps into one kalila window's own egui input,
   never the system pointer.

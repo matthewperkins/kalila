@@ -19,6 +19,9 @@
 //! text hello
 //! shot palette-open      # PNG of the target window into KALILA_UI_SHOTS (default: script dir)
 //! log any message
+//! fullscreen [off]       # the target window fills its screen (or stops)
+//! cover Traces           # macOS: the window with this in its title becomes a borderless
+//!                        # window over its whole screen, above the menu bar (not a Space)
 //! quit                   # ask the main window to close
 //! ```
 
@@ -38,6 +41,8 @@ enum Step {
     Key { key: egui::Key, mods: Modifiers },
     Text(String),
     Shot(String),
+    Fullscreen(bool),
+    Cover(String),
     Log(String),
     Quit,
 }
@@ -117,6 +122,8 @@ fn parse_line(line: &str) -> Result<Option<Step>, String> {
         "text" => Step::Text(rest.to_string()),
         "shot" => Step::Shot(if rest.is_empty() { "shot".into() } else { rest.to_string() }),
         "log" => Step::Log(rest.to_string()),
+        "fullscreen" => Step::Fullscreen(rest != "off"),
+        "cover" => Step::Cover(rest.to_string()),
         "quit" => Step::Quit,
         _ => return Err(format!("unknown step `{cmd}`")),
     }))
@@ -240,6 +247,13 @@ impl UiScript {
                     // Let the screenshot frame render before the next step changes anything.
                     self.wait_until = Some(Instant::now() + Duration::from_millis(300));
                 }
+                Step::Fullscreen(on) => ctx.send_viewport_cmd_to(target, ViewportCommand::Fullscreen(on)),
+                Step::Cover(title) => {
+                    #[cfg(target_os = "macos")]
+                    cover::cover(&title);
+                    #[cfg(not(target_os = "macos"))]
+                    log::warn!("ui-script: cover {title}: macOS only");
+                }
                 Step::Quit => ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close),
             }
             // Input steps end with the modifiers released.
@@ -251,6 +265,51 @@ impl UiScript {
         if self.steps.is_empty() && self.batches.is_empty() && self.wait_until.is_none() {
             log::info!("ui-script: done");
             self.done = true;
+        }
+    }
+}
+
+/// macOS, for latency measurements: a window made borderless over its whole screen, as
+/// dimna's fullscreen display is, instead of a fullscreen Space. Runs on the main thread
+/// (the script's steps do).
+#[cfg(target_os = "macos")]
+mod cover {
+    use objc2::encode::{Encode, Encoding};
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::msg_send;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect([f64; 4]);
+    unsafe impl Encode for Rect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[Encoding::Struct("CGPoint", &[Encoding::Double, Encoding::Double]), Encoding::Struct("CGSize", &[Encoding::Double, Encoding::Double])]);
+    }
+
+    pub fn cover(title: &str) {
+        unsafe {
+            let app: *mut AnyObject = msg_send![AnyClass::get(c"NSApplication").unwrap(), sharedApplication];
+            let windows: *mut AnyObject = msg_send![app, windows];
+            let n: usize = msg_send![windows, count];
+            for i in 0..n {
+                let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                let t: *mut AnyObject = msg_send![w, title];
+                let utf8: *const std::ffi::c_char = msg_send![t, UTF8String];
+                if utf8.is_null() || !std::ffi::CStr::from_ptr(utf8).to_string_lossy().contains(title) {
+                    continue;
+                }
+                let screen: *mut AnyObject = msg_send![w, screen];
+                if screen.is_null() {
+                    continue;
+                }
+                let frame: Rect = msg_send![screen, frame];
+                let _: () = msg_send![w, setStyleMask: 0usize]; // borderless
+                let _: () = msg_send![w, setLevel: 25isize]; // above the menu bar
+                let _: () = msg_send![w, setFrame: frame, display: true];
+                let _: () = msg_send![w, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+                log::info!("ui-script: '{title}' covers its screen ({} x {} points)", frame.0[2], frame.0[3]);
+                return;
+            }
+            log::warn!("ui-script: cover: no window titled '{title}'");
         }
     }
 }
