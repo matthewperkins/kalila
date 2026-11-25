@@ -88,7 +88,7 @@ Channels and rings (sizes in blocks; `blocks_per_s` = sample rate / `block_sampl
 
 | Queue | Bound | When full | Counted by |
 |---|---|---|---|
-| to recorder (`RecMsg`, `Engine::rec_tx`) | `unbounded()`, held to `rec_limit` by the producer: at most ~20 s of blocks or 1 GiB, at least 64 blocks | the acquisition thread waits in 200 µs sleeps (it sends only while `RecStatus::recording`) | `PipelineStats::rec_backpressure_us`, `rec_queue`; board DRAM overflow shows as `Health::dropped_samples` |
+| to recorder (`RecMsg`, `Engine::rec_tx`) | `unbounded()`, held to `rec_limit` by the producer: at most ~20 s of blocks or 1 GiB, at least 64 blocks | the acquisition thread parks until the recorder takes a message (`wait_for_room`; it looks again every `REC_WAIT_POLL`, 2 ms; it sends only while `RecStatus::recording`) | `PipelineStats::rec_backpressure_us`, `rec_queue`; board DRAM overflow shows as `Health::dropped_samples` |
 | display | `blocks_per_s / 2 + 4` | block dropped (`try_send`) | `PipelineStats::display_dropped` |
 | dsp | `blocks_per_s + 4` | dropped | `dsp_dropped` |
 | audio | `blocks_per_s / 4 + 4` | dropped | `audio_dropped` |

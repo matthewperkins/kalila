@@ -13,13 +13,18 @@
 //! Messages follow the stock GUI 1.x (`RecordNode::handleBroadcastMessage`): sample numbers in
 //! the main stream's clock, timestamps in its seconds, text as null-padded `|S513`.
 //!
-//! The recorder thread receives every block while acquiring (recording or not). Data reaches
-//! disk through large buffered writes; `.npy` headers are rewritten every second so a crash
-//! leaves readable files. Any I/O error stops the recording and is reported loudly.
+//! The recorder thread receives blocks only while recording: the acquisition thread sends
+//! them while `RecStatus::recording` is set, which only the recorder sets (when a recording
+//! opens). Blocks already queued when a recording ends are counted
+//! (`RecStatus::blocks_after_stop`) and not written. Control messages (Start, Stop, notes,
+//! acquisition start/stop) share the one FIFO queue with the data, so they keep their order
+//! relative to it. Data reaches disk through large buffered writes; `.npy` headers are
+//! rewritten every second so a crash leaves readable files. Any I/O error stops the
+//! recording and is reported loudly.
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use log::{error, info};
+use log::{debug, error, info};
 use parking_lot::Mutex;
 use rhythm::{Block, ChannelKind, StreamLayout};
 use serde_json::json;
@@ -34,6 +39,18 @@ const SOURCE_NAME: &str = "Acquisition Board";
 const SOURCE_ID: u32 = 100;
 const RECORD_NODE_ID: u32 = 101;
 const GUI_VERSION: &str = "1.0.0";
+
+/// How often the recorder syncs the open recording's `continuous.dat` to the device
+/// (`Recording::sync_main`), in wall time: what a power loss can cost at most.
+pub const SYNC_EVERY: Duration = Duration::from_secs(5);
+
+/// The periodic sync by default: on Linux only. On macOS `sync_data` is `F_FULLFSYNC`, which
+/// flushes the drive's whole cache and is slow (the simulation test takes ~135 s there against
+/// ~6 s on Linux, from the syncs in `finish` alone), so it is left to `finish` there until it
+/// has been measured on a Mac.
+pub fn default_sync_every() -> Option<Duration> {
+    cfg!(target_os = "linux").then_some(SYNC_EVERY)
+}
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("the Open Ephys binary format is little-endian");
@@ -226,6 +243,12 @@ struct Recording {
     /// See `RecSource::gaps`.
     gaps: Vec<(i64, u64)>,
     last_header_update: Instant,
+    /// How often `continuous.dat` is synced to the device (`SYNC_EVERY`; None: never until
+    /// `finish`), when it last was, and how long the last sync took (taken by the recorder
+    /// for `RecStatus`).
+    sync_every: Option<Duration>,
+    last_sync: Instant,
+    sync_took: Option<Duration>,
     oebin: serde_json::Value,
     dat_path: PathBuf,
     ttl_dir: PathBuf,
@@ -302,6 +325,9 @@ impl Recording {
             next: None,
             gaps: Vec::new(),
             last_header_update: Instant::now(),
+            sync_every: None,
+            last_sync: Instant::now(),
+            sync_took: None,
             oebin: json!({}),
             dat_path,
             ttl_dir: ed,
@@ -466,6 +492,26 @@ impl Recording {
         if self.last_header_update.elapsed() > Duration::from_secs(1) {
             self.checkpoint()?;
         }
+        if self.sync_every.is_some_and(|e| self.last_sync.elapsed() >= e) {
+            self.sync_main()?;
+        }
+        Ok(())
+    }
+
+    /// Flushes the main stream's `continuous.dat` and syncs its data to the device, so a power
+    /// loss costs at most `sync_every` of samples rather than the kernel's writeback window
+    /// (up to ~30 s by default). Only the data: the `.npy` headers and the other files are
+    /// synced in `finish`. An error here is a write error like any other.
+    fn sync_main(&mut self) -> Result<()> {
+        let t = Instant::now();
+        self.last_sync = t;
+        self.main.dat.flush()?;
+        self.main
+            .dat
+            .get_ref()
+            .sync_data()
+            .with_context(|| format!("syncing {}", self.dat_path.display()))?;
+        self.sync_took = Some(t.elapsed());
         Ok(())
     }
 
@@ -587,6 +633,32 @@ pub struct RecStatus {
     /// The recording being written (or the last one), for reading back while it grows
     /// (scroll-back review in the GUI). Set once its first sample is on its way to disk.
     pub source: Mutex<Option<RecSource>>,
+    /// Data blocks that reached the recorder with no recording open, never reset: those the
+    /// acquisition thread sent before a Stop, a write error or the end of acquisition took
+    /// effect. Not written anywhere (by design); a count, not yet shown in any UI.
+    pub blocks_after_stop: AtomicU64,
+    /// Periodic syncs of `continuous.dat` (`SYNC_EVERY`): how many, their total and longest
+    /// time (µs), never reset. Each one holds up the recorder thread, not acquisition (it
+    /// only lengthens the queue, which is bounded at ~20 s).
+    pub syncs: AtomicU64,
+    pub sync_us: AtomicU64,
+    pub sync_us_max: AtomicU64,
+    /// The thread waiting for room in the recorder queue (the acquisition thread, while the
+    /// queue is at its limit), and whether it is waiting: the recorder unparks it after
+    /// taking each message, so it doesn't have to poll. See `wait_for_room` in `lib.rs`.
+    pub(crate) waiter: Mutex<Option<std::thread::Thread>>,
+    pub(crate) waiting: AtomicBool,
+}
+
+impl RecStatus {
+    /// Wakes the producer if it waits for room (cheap otherwise: one atomic load).
+    pub(crate) fn wake_producer(&self) {
+        if self.waiting.load(Ordering::SeqCst)
+            && let Some(t) = self.waiter.lock().as_ref()
+        {
+            t.unpark();
+        }
+    }
 }
 
 /// Where a recording's files are, for reading them back while they are written.
@@ -661,163 +733,225 @@ fn needs_new_session(session_date: Option<chrono::NaiveDate>, today: chrono::Nai
     forced || session_date != Some(today)
 }
 
-pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
-    // However this thread ends (a panic included), clear `recording` so the acquisition
-    // thread stops sending and the GUI stops saying "Recording", and say why.
-    struct Exit<'a>(&'a RecStatus);
-    impl Drop for Exit<'_> {
-        fn drop(&mut self) {
-            if std::thread::panicking() {
-                *self.0.error.lock() = Some("the recorder thread crashed: this recording ends at that point (files are readable up to the last second). Restart kalila to record again.".into());
-            }
-            self.0.recording.store(false, Ordering::SeqCst);
+/// Held by the recorder thread: however it ends (a panic included), clears `recording` so the
+/// acquisition thread stops sending and the GUI stops saying "Recording", and says why.
+pub(crate) struct RecorderExit<'a>(pub(crate) &'a RecStatus);
+impl Drop for RecorderExit<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            *self.0.error.lock() = Some("the recorder thread crashed: this recording ends at that point (files are readable up to the last second). Restart kalila to record again.".into());
         }
+        self.0.recording.store(false, Ordering::SeqCst);
+        // A producer waiting for room sees `recording` cleared now, not at its timeout.
+        self.0.wake_producer();
     }
-    let _exit = Exit(&status);
-    let mut layout: Option<StreamLayout> = None;
-    let mut session: Option<PathBuf> = None;
-    let mut session_date: Option<chrono::NaiveDate> = None;
-    let mut session_root: Option<PathBuf> = None;
-    let mut experiment = 0u32;
-    let mut recording_idx = 0u32;
-    let mut acq_run_seen = false;
-    let mut rec: Option<Recording> = None;
-    // After a write error: finish what can be finished (the error is already reported).
-    let abandon = |r: Option<Recording>| {
-        if let Some(Err(e)) = r.map(Recording::finish) {
-            error!("finishing the recording after the error: {e:#}");
-        }
-    };
-    let fail = |status: &RecStatus, e: anyhow::Error| {
-        error!("recording error: {e:#}");
-        *status.error.lock() = Some(format!("{e:#}"));
-        status.errors.fetch_add(1, Ordering::SeqCst);
-        status.recording.store(false, Ordering::SeqCst);
-    };
+}
+
+pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
+    run_recorder_syncing(rx, status, default_sync_every());
+}
+
+/// `run_recorder` with the periodic sync of `continuous.dat` every `sync_every` (None: only
+/// when a recording finishes).
+pub fn run_recorder_syncing(rx: Receiver<RecMsg>, status: Arc<RecStatus>, sync_every: Option<Duration>) {
+    let _exit = RecorderExit(&status);
+    let mut r = Recorder::new(status.clone());
+    r.sync_every = sync_every;
     loop {
         let msg = match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(m) => m,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => RecMsg::Shutdown,
         };
+        // A message has left the queue: there is room again.
+        status.wake_producer();
+        if !r.on(msg) {
+            return;
+        }
+    }
+}
+
+/// The recorder thread's state between messages: the session and experiment it files
+/// recordings under, the acquisition run's layout, and the open recording.
+struct Recorder {
+    status: Arc<RecStatus>,
+    layout: Option<StreamLayout>,
+    session: Option<PathBuf>,
+    session_date: Option<chrono::NaiveDate>,
+    session_root: Option<PathBuf>,
+    experiment: u32,
+    recording_idx: u32,
+    acq_run_seen: bool,
+    rec: Option<Recording>,
+    sync_every: Option<Duration>,
+}
+
+impl Recorder {
+    fn new(status: Arc<RecStatus>) -> Self {
+        Self {
+            status,
+            layout: None,
+            session: None,
+            session_date: None,
+            session_root: None,
+            experiment: 0,
+            recording_idx: 0,
+            acq_run_seen: false,
+            rec: None,
+            sync_every: default_sync_every(),
+        }
+    }
+
+    /// A recording error: reported loudly, and `recording` cleared.
+    fn fail(&self, e: anyhow::Error) {
+        error!("recording error: {e:#}");
+        *self.status.error.lock() = Some(format!("{e:#}"));
+        self.status.errors.fetch_add(1, Ordering::SeqCst);
+        self.status.recording.store(false, Ordering::SeqCst);
+    }
+
+    /// After a write error: finish what can be finished (the error is already reported).
+    fn abandon(&mut self) {
+        if let Some(Err(e)) = self.rec.take().map(Recording::finish) {
+            error!("finishing the recording after the error: {e:#}");
+        }
+    }
+
+    /// Finishes the open recording, if any; an error in doing so is reported.
+    fn finish(&mut self) {
+        if let Some(r) = self.rec.take()
+            && let Err(e) = r.finish()
+        {
+            self.fail(e);
+        }
+    }
+
+    /// Handles one message; false once the recorder should exit (Shutdown).
+    fn on(&mut self, msg: RecMsg) -> bool {
+        let status = self.status.clone();
         match msg {
             RecMsg::Data(b) => {
-                if let Some(r) = rec.as_mut() {
-                    if let Err(e) = r.write_block(&b) {
-                        fail(&status, e);
-                        abandon(rec.take());
-                    } else {
-                        if status
-                            .source
-                            .lock()
-                            .as_ref()
-                            .is_none_or(|s| s.dat != r.dat_path || s.gaps.len() != r.gaps.len())
-                        {
-                            *status.source.lock() = r.source();
-                        }
-                        status.bytes.fetch_add(b.data.len() as u64 * 2, Ordering::Relaxed);
-                        status.samples.fetch_add(b.len() as u64, Ordering::Relaxed);
+                let Some(r) = self.rec.as_mut() else {
+                    status.blocks_after_stop.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                };
+                if let Err(e) = r.write_block(&b) {
+                    self.fail(e);
+                    self.abandon();
+                } else {
+                    if status
+                        .source
+                        .lock()
+                        .as_ref()
+                        .is_none_or(|s| s.dat != r.dat_path || s.gaps.len() != r.gaps.len())
+                    {
+                        *status.source.lock() = r.source();
+                    }
+                    status.bytes.fetch_add(b.data.len() as u64 * 2, Ordering::Relaxed);
+                    status.samples.fetch_add(b.len() as u64, Ordering::Relaxed);
+                    if let Some(t) = r.sync_took.take() {
+                        let us = t.as_micros() as u64;
+                        status.syncs.fetch_add(1, Ordering::Relaxed);
+                        status.sync_us.fetch_add(us, Ordering::Relaxed);
+                        status.sync_us_max.fetch_max(us, Ordering::Relaxed);
+                        debug!("synced {} in {us} µs", r.dat_path.display());
                     }
                 }
             }
             RecMsg::AcquisitionStarted(l) => {
-                layout = Some(l);
-                acq_run_seen = true;
+                self.layout = Some(l);
+                self.acq_run_seen = true;
             }
             RecMsg::AcquisitionStopped => {
-                if let Some(r) = rec.take()
-                    && let Err(e) = r.finish()
-                {
-                    fail(&status, e);
-                }
+                self.finish();
                 status.recording.store(false, Ordering::SeqCst);
-                layout = None;
+                self.layout = None;
             }
-            RecMsg::Start => {
-                if rec.is_some() {
-                    continue;
-                }
-                let Some(l) = layout.clone() else {
-                    fail(&status, anyhow::anyhow!("cannot record: acquisition is not running"));
-                    continue;
-                };
-                let now = chrono::Local::now();
-                let forced = status.new_session.swap(false, Ordering::SeqCst);
-                let root = status.root.lock().clone();
-                // A changed root directory (say, the next animal) also starts a new session.
-                if needs_new_session(session_date, now.date_naive(), forced) || session_root.as_ref() != Some(&root) {
-                    // Never reuse a session folder (two sessions within one second).
-                    let stem = now.format("%Y-%m-%d_%H-%M-%S").to_string();
-                    let name = (1..)
-                        .map(|k| if k == 1 { stem.clone() } else { format!("{stem}_{k}") })
-                        .find(|n| !root.join(n).exists())
-                        .unwrap();
-                    session_date = Some(now.date_naive());
-                    session = Some(root.join(name).join(format!("Record Node {RECORD_NODE_ID}")));
-                    session_root = Some(root);
-                    experiment = 0;
-                    acq_run_seen = true;
-                }
-                if acq_run_seen {
-                    experiment += 1;
-                    recording_idx = 0;
-                    acq_run_seen = false;
-                }
-                recording_idx += 1;
-                let rec_dir = |i: u32| {
-                    session
-                        .as_ref()
-                        .unwrap()
-                        .join(format!("experiment{experiment}"))
-                        .join(format!("recording{i}"))
-                };
-                // Never into an existing recording folder (its files would be refused anyway).
-                while rec_dir(recording_idx).exists() {
-                    recording_idx += 1;
-                }
-                let dir = rec_dir(recording_idx);
-                match fs::create_dir_all(&dir)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|_| Recording::open(&dir, &l))
-                {
-                    Ok(r) => {
-                        info!("recording to {}", dir.display());
-                        *status.error.lock() = None;
-                        *status.current_dir.lock() = Some(dir);
-                        status.bytes.store(0, Ordering::Relaxed);
-                        status.samples.store(0, Ordering::Relaxed);
-                        status.recording.store(true, Ordering::SeqCst);
-                        rec = Some(r);
-                    }
-                    Err(e) => fail(&status, e),
-                }
-            }
+            RecMsg::Start => self.start(),
             RecMsg::Stop => {
-                if let Some(r) = rec.take() {
-                    if let Err(e) = r.finish() {
-                        fail(&status, e);
-                    }
+                if self.rec.is_some() {
+                    self.finish();
                     info!("recording stopped");
                 }
                 status.recording.store(false, Ordering::SeqCst);
             }
             RecMsg::Message { sample, text, keys } => {
-                if let Some(r) = rec.as_mut()
+                if let Some(r) = self.rec.as_mut()
                     && let Err(e) = r.write_message(sample, &text, &keys)
                 {
-                    fail(&status, e);
-                    abandon(rec.take());
+                    self.fail(e);
+                    self.abandon();
                 }
             }
             RecMsg::Shutdown => {
-                if let Some(r) = rec.take()
-                    && let Err(e) = r.finish()
-                {
-                    fail(&status, e);
-                }
+                self.finish();
                 status.recording.store(false, Ordering::SeqCst);
-                return;
+                return false;
             }
+        }
+        true
+    }
+
+    /// Start: opens a new recording folder, unless one is open (then nothing happens).
+    fn start(&mut self) {
+        if self.rec.is_some() {
+            return;
+        }
+        let Some(l) = self.layout.clone() else {
+            self.fail(anyhow::anyhow!("cannot record: acquisition is not running"));
+            return;
+        };
+        let status = self.status.clone();
+        let now = chrono::Local::now();
+        let forced = status.new_session.swap(false, Ordering::SeqCst);
+        let root = status.root.lock().clone();
+        // A changed root directory (say, the next animal) also starts a new session.
+        if needs_new_session(self.session_date, now.date_naive(), forced) || self.session_root.as_ref() != Some(&root) {
+            // Never reuse a session folder (two sessions within one second).
+            let stem = now.format("%Y-%m-%d_%H-%M-%S").to_string();
+            let name = (1..)
+                .map(|k| if k == 1 { stem.clone() } else { format!("{stem}_{k}") })
+                .find(|n| !root.join(n).exists())
+                .unwrap();
+            self.session_date = Some(now.date_naive());
+            self.session = Some(root.join(name).join(format!("Record Node {RECORD_NODE_ID}")));
+            self.session_root = Some(root);
+            self.experiment = 0;
+            self.acq_run_seen = true;
+        }
+        if self.acq_run_seen {
+            self.experiment += 1;
+            self.recording_idx = 0;
+            self.acq_run_seen = false;
+        }
+        self.recording_idx += 1;
+        let session = self.session.clone().unwrap();
+        let experiment = self.experiment;
+        let rec_dir = |i: u32| {
+            session
+                .join(format!("experiment{experiment}"))
+                .join(format!("recording{i}"))
+        };
+        // Never into an existing recording folder (its files would be refused anyway).
+        while rec_dir(self.recording_idx).exists() {
+            self.recording_idx += 1;
+        }
+        let dir = rec_dir(self.recording_idx);
+        match fs::create_dir_all(&dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| Recording::open(&dir, &l))
+        {
+            Ok(mut r) => {
+                r.sync_every = self.sync_every;
+                info!("recording to {}", dir.display());
+                *status.error.lock() = None;
+                *status.current_dir.lock() = Some(dir);
+                status.bytes.store(0, Ordering::Relaxed);
+                status.samples.store(0, Ordering::Relaxed);
+                status.recording.store(true, Ordering::SeqCst);
+                self.rec = Some(r);
+            }
+            Err(e) => self.fail(e),
         }
     }
 }
@@ -845,6 +979,419 @@ mod tests {
             String::from_utf8(b[10..10 + hl].to_vec()).unwrap(),
             b[10 + hl..].to_vec(),
         )
+    }
+
+    fn table_layout() -> StreamLayout {
+        StreamLayout {
+            name: "acquisition_board".into(),
+            sample_rate: 30000.0,
+            channels: (0..2)
+                .map(|i| ChannelInfo {
+                    name: format!("CH{}", i + 1),
+                    kind: ChannelKind::Electrode,
+                    bit_volts: 0.195,
+                    units: "uV".into(),
+                    headstage: Some(0),
+                })
+                .collect(),
+            headstages: vec![],
+            ttl_lines: 8,
+            side_streams: vec![],
+            hw_clock_hz: 0.0,
+        }
+    }
+
+    fn data(first: i64) -> RecMsg {
+        let mut b = Block::with_capacity(2, 32);
+        b.first_sample = first;
+        for s in first..first + 32 {
+            b.data.extend([s as i16, 1]);
+            b.timestamps.push(s as f64 / 30000.0);
+            b.ttl.push(0);
+        }
+        RecMsg::Data(Arc::new(b))
+    }
+
+    fn note(sample: i64, keys: bool) -> RecMsg {
+        RecMsg::Message {
+            sample,
+            text: "note".into(),
+            keys: if keys { vec![(sample, "n".into())] } else { vec![] },
+        }
+    }
+
+    /// Records in an `.npy` file, by its header.
+    fn npy_count(path: &Path) -> usize {
+        let (h, _) = read_npy(path);
+        h.split("'shape': (")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// Recording folders under `root`, oldest first.
+    fn recording_dirs(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_owned()];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                if p.file_name().unwrap().to_string_lossy().starts_with("recording") {
+                    out.push(p);
+                } else {
+                    stack.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    enum Step {
+        Msg(RecMsg),
+        /// Makes the open recording's folder read-only (true) or writable again (false).
+        ReadOnly(bool),
+    }
+
+    fn set_read_only(dir: &Path, ro: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(if ro { 0o555 } else { 0o755 })).unwrap();
+    }
+
+    struct Want {
+        recording: bool,
+        errors: u64,
+        error: Option<&'static str>,
+        after_stop: u64,
+        /// Per recording folder: samples in sample_numbers.npy (its header and continuous.dat
+        /// agree), and notes in text.npy.
+        files: Vec<(usize, usize)>,
+    }
+
+    /// Message sequences through `Recorder::on`, each from a fresh recorder: the status and
+    /// the files on disk after each.
+    #[test]
+    fn message_sequences_leave_the_status_and_files_they_should() {
+        use RecMsg::*;
+        use Step::Msg;
+        // Read-only folders do not stop root.
+        let root_user = unsafe { libc::geteuid() } == 0;
+        let rows: Vec<(&str, Vec<Step>, Want)> = vec![
+            (
+                "data after Stop is counted, not written",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Msg(data(0)),
+                    Msg(Stop),
+                    Msg(data(32)),
+                    Msg(data(64)),
+                ],
+                Want {
+                    recording: false,
+                    errors: 0,
+                    error: None,
+                    after_stop: 2,
+                    files: vec![(32, 0)],
+                },
+            ),
+            (
+                "Start without acquisition",
+                vec![Msg(Start), Msg(data(0))],
+                Want {
+                    recording: false,
+                    errors: 1,
+                    error: Some("acquisition is not running"),
+                    after_stop: 1,
+                    files: vec![],
+                },
+            ),
+            (
+                "Start after acquisition has stopped (no layout)",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(AcquisitionStopped),
+                    Msg(Start),
+                ],
+                Want {
+                    recording: false,
+                    errors: 1,
+                    error: Some("acquisition is not running"),
+                    after_stop: 0,
+                    files: vec![],
+                },
+            ),
+            (
+                "a note before the first block",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Msg(note(5, true)),
+                    Msg(data(0)),
+                    Msg(Stop),
+                ],
+                Want {
+                    recording: false,
+                    errors: 0,
+                    error: None,
+                    after_stop: 0,
+                    files: vec![(32, 1)],
+                },
+            ),
+            (
+                "AcquisitionStopped while recording finishes it",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Msg(data(0)),
+                    Msg(note(10, false)),
+                    Msg(AcquisitionStopped),
+                    Msg(data(32)),
+                    Msg(Start),
+                ],
+                Want {
+                    recording: false,
+                    errors: 1,
+                    error: Some("acquisition is not running"),
+                    after_stop: 1,
+                    files: vec![(32, 1)],
+                },
+            ),
+            (
+                "Stop twice",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Msg(data(0)),
+                    Msg(Stop),
+                    Msg(Stop),
+                ],
+                Want {
+                    recording: false,
+                    errors: 0,
+                    error: None,
+                    after_stop: 0,
+                    files: vec![(32, 0)],
+                },
+            ),
+            (
+                "Start while recording changes nothing",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Msg(data(0)),
+                    Msg(Start),
+                    Msg(data(32)),
+                    Msg(Stop),
+                ],
+                Want {
+                    recording: false,
+                    errors: 0,
+                    error: None,
+                    after_stop: 0,
+                    files: vec![(64, 0)],
+                },
+            ),
+            (
+                "still recording until Stop",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Msg(data(0)),
+                    Msg(data(32)),
+                ],
+                Want {
+                    recording: true,
+                    errors: 0,
+                    error: None,
+                    after_stop: 0,
+                    files: vec![],
+                },
+            ),
+            (
+                "a write error on the first block (sync_messages.txt cannot be created)",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Step::ReadOnly(true),
+                    Msg(data(0)),
+                    Msg(data(32)),
+                    Step::ReadOnly(false),
+                ],
+                Want {
+                    recording: false,
+                    errors: 1,
+                    error: Some("ermission denied"),
+                    after_stop: 1,
+                    files: vec![(0, 0)],
+                },
+            ),
+            (
+                "a write error mid-recording (the keystroke log cannot be created)",
+                vec![
+                    Msg(AcquisitionStarted(table_layout())),
+                    Msg(Start),
+                    Msg(data(0)),
+                    Step::ReadOnly(true),
+                    Msg(note(40, true)),
+                    Msg(data(32)),
+                    Step::ReadOnly(false),
+                    Msg(Start),
+                    Msg(data(64)),
+                    Msg(Stop),
+                ],
+                // The first recording keeps its block; the note's records were written before
+                // the error (the keystroke log comes after them), so they count. A new Start
+                // opens a second recording; the error count stays.
+                Want {
+                    recording: false,
+                    errors: 1,
+                    error: None,
+                    after_stop: 1,
+                    files: vec![(32, 1), (32, 0)],
+                },
+            ),
+        ];
+        for (k, (name, steps, want)) in rows.into_iter().enumerate() {
+            if root_user && steps.iter().any(|s| matches!(s, Step::ReadOnly(_))) {
+                eprintln!("skipped as root: {name}");
+                continue;
+            }
+            let root = std::env::temp_dir().join(format!("kalila-rec-table-{}-{k}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let st = Arc::new(RecStatus::default());
+            *st.root.lock() = root.clone();
+            let mut r = Recorder::new(st.clone());
+            for s in steps {
+                match s {
+                    Msg(m) => assert!(r.on(m), "{name}"),
+                    Step::ReadOnly(ro) => set_read_only(&st.current_dir.lock().clone().unwrap(), ro),
+                }
+            }
+            assert_eq!(st.recording.load(Ordering::SeqCst), want.recording, "{name}: recording");
+            assert_eq!(st.errors.load(Ordering::SeqCst), want.errors, "{name}: errors");
+            let err = st.error.lock().clone();
+            match want.error {
+                None => assert!(err.is_none(), "{name}: {err:?}"),
+                Some(w) => assert!(err.as_deref().is_some_and(|e| e.contains(w)), "{name}: {err:?}"),
+            }
+            assert_eq!(
+                st.blocks_after_stop.load(Ordering::SeqCst),
+                want.after_stop,
+                "{name}: after stop"
+            );
+            if !want.recording {
+                let got: Vec<(usize, usize)> = recording_dirs(&root)
+                    .iter()
+                    .map(|d| {
+                        let cont = d.join("continuous/Acquisition_Board-100.acquisition_board");
+                        let n = npy_count(&cont.join("sample_numbers.npy"));
+                        assert_eq!(npy_count(&cont.join("timestamps.npy")), n, "{name}");
+                        let dat = fs::metadata(cont.join("continuous.dat")).unwrap().len();
+                        assert_eq!(dat, n as u64 * 2 * 2, "{name}: continuous.dat");
+                        assert!(d.join("structure.oebin").exists(), "{name}: structure.oebin");
+                        (n, npy_count(&d.join("events/MessageCenter/text.npy")))
+                    })
+                    .collect();
+                assert_eq!(got, want.files, "{name}: files");
+            }
+            assert!(!r.on(Shutdown), "{name}: Shutdown ends the recorder");
+            assert!(!st.recording.load(Ordering::SeqCst), "{name}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The recorder syncs `continuous.dat` on its interval while recording, counts it, and the
+    /// bytes on disk are those of a recording without it.
+    #[test]
+    fn the_periodic_sync_runs_and_changes_no_bytes() {
+        let mut dats = Vec::new();
+        for (k, every) in [None, Some(Duration::ZERO)].into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!("kalila-rec-sync-{}-{k}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let st = Arc::new(RecStatus::default());
+            *st.root.lock() = root.clone();
+            let mut r = Recorder::new(st.clone());
+            r.sync_every = every;
+            r.on(RecMsg::AcquisitionStarted(table_layout()));
+            r.on(RecMsg::Start);
+            for i in 0..20 {
+                r.on(data(i * 32));
+            }
+            r.on(RecMsg::Stop);
+            assert!(st.error.lock().is_none(), "{:?}", st.error.lock());
+            assert_eq!(st.syncs.load(Ordering::SeqCst), if every.is_some() { 20 } else { 0 });
+            let d = recording_dirs(&root).pop().unwrap();
+            dats.push(fs::read(d.join("continuous/Acquisition_Board-100.acquisition_board/continuous.dat")).unwrap());
+            let _ = fs::remove_dir_all(&root);
+        }
+        assert_eq!(dats[0].len(), 20 * 32 * 2 * 2);
+        assert!(dats[0] == dats[1]);
+        assert_eq!(default_sync_every(), cfg!(target_os = "linux").then_some(SYNC_EVERY));
+    }
+
+    /// What one periodic sync costs with the rig's load: 46 channels at 30 kHz, `SYNC_EVERY` of
+    /// samples dirty per sync, written as fast as the disk takes them. A measurement, not a
+    /// check: run it with `TMPDIR` on the disk that recordings go to (a tmpfs makes it free),
+    /// `cargo test --release -p engine -- --ignored --nocapture the_cost_of_a_periodic_sync`.
+    #[test]
+    #[ignore]
+    fn the_cost_of_a_periodic_sync() {
+        let nch = 46;
+        let root = std::env::temp_dir().join(format!("kalila-rec-sync-cost-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut layout = table_layout();
+        layout.channels = (0..nch)
+            .map(|i| ChannelInfo {
+                name: format!("CH{}", i + 1),
+                kind: ChannelKind::Electrode,
+                bit_volts: 0.195,
+                units: "uV".into(),
+                headstage: Some(0),
+            })
+            .collect();
+        let mut rec = Recording::open(&root, &layout).unwrap();
+        let per_sync = (SYNC_EVERY.as_secs_f64() * 30000.0) as i64 / 32;
+        let mut b = Block::with_capacity(nch, 32);
+        let mut times = Vec::new();
+        let mut write_time = Duration::ZERO;
+        for k in 0..per_sync * 6 {
+            b.first_sample = 32 * k;
+            b.data.clear();
+            b.timestamps.clear();
+            b.ttl.clear();
+            for s in 0..32 {
+                b.data.extend((0..nch).map(|c| (s * 7 + c * 13 + k as usize) as i16));
+                b.timestamps.push(0.0);
+                b.ttl.push(0);
+            }
+            let t = Instant::now();
+            rec.write_block(&b).unwrap();
+            write_time += t.elapsed();
+            if (k + 1) % per_sync == 0 {
+                rec.sync_main().unwrap();
+                times.push(rec.sync_took.take().unwrap());
+            }
+        }
+        rec.finish().unwrap();
+        let ms: Vec<f64> = times.iter().map(|t| t.as_secs_f64() * 1e3).collect();
+        eprintln!(
+            "{} syncs of {:.1} MB each in {}: {:?} ms (writing the data took {:.0} ms in all)",
+            ms.len(),
+            (per_sync * 32) as f64 * nch as f64 * 2.0 / 1e6,
+            root.display(),
+            ms.iter().map(|m| (m * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            write_time.as_secs_f64() * 1e3
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

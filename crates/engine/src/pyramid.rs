@@ -23,7 +23,7 @@
 //! coverage that the backfill closes.
 
 use crate::PipelineStats;
-use crate::dsp::{BandSpec, FilterBank};
+use crate::dsp::{BandSpec, CarPlan, FilterBank};
 use crate::record::{RecSource, RecStatus};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
@@ -433,8 +433,10 @@ impl Store {
 struct BandLive {
     key: BandKey,
     bank: FilterBank,
-    car_ref: Vec<usize>,
-    car_sub: Vec<bool>,
+    /// The display CAR resolved for this band's channels (None when off or empty).
+    car: Option<CarPlan>,
+    /// Scratch: the filtered block before rounding.
+    rows: Vec<f32>,
     /// Samples still to feed before the filter is settled (after a reset or a gap).
     warm: u64,
     /// Backfill may start (after the band settled); None = not before the next change.
@@ -443,43 +445,33 @@ struct BandLive {
 
 /// Fold `n` raw samples (all `nch_all` channels interleaved) into the band's channel subset,
 /// filtered and CAR-corrected, as i16 in raw LSB units. Returns `n × chans.len()`.
+///
+/// The CAR is taken from the raw samples and subtracted before the filter (as the spike
+/// detector and the slope trigger do); the filter is linear and the same on every channel,
+/// so this equals filtering first, to float rounding.
 fn band_filter(bl: &mut BandLive, data: &[i16], nch_all: usize, out: &mut Vec<i16>) {
-    let chans = &bl.key.chans;
+    let nchp = bl.key.chans.len();
     let n = data.len() / nch_all.max(1);
+    bl.rows.resize(n * nchp, 0.0);
+    bl.bank
+        .process(data, nch_all, Some(&bl.key.chans), 1.0, bl.car.as_ref(), &mut bl.rows);
     out.clear();
-    out.reserve(n * chans.len());
-    let mut row = vec![0f32; chans.len()];
-    for s in 0..n {
-        let src = &data[s * nch_all..(s + 1) * nch_all];
-        for (i, &c) in chans.iter().enumerate() {
-            row[i] = bl.bank.tick(i, src[c] as f32);
-        }
-        if !bl.car_ref.is_empty() {
-            let mean = bl.car_ref.iter().map(|&i| row[i]).sum::<f32>() / bl.car_ref.len() as f32;
-            for (i, v) in row.iter_mut().enumerate() {
-                if bl.car_sub[i] {
-                    *v -= mean;
-                }
-            }
-        }
-        out.extend(row.iter().map(|&v| v.round().clamp(-32768.0, 32767.0) as i16));
-    }
+    out.extend(bl.rows.iter().map(|&v| v.round().clamp(-32768.0, 32767.0) as i16));
 }
 
 fn band_live(key: &BandKey, fs: f64) -> BandLive {
     let nchp = key.chans.len();
-    let pos = |c: usize| key.chans.iter().position(|&x| x == c);
-    let (car_ref, car_sub) = match &key.car {
-        Some((r, s)) => (
+    let car = key.car.as_ref().and_then(|(r, s)| {
+        let pos = |c: usize| key.chans.contains(&c).then_some(c);
+        CarPlan::new(
             r.iter().filter_map(|&c| pos(c)).collect(),
-            (0..nchp).map(|i| s.contains(&key.chans[i])).collect(),
-        ),
-        None => (Vec::new(), vec![false; nchp]),
-    };
+            key.chans.iter().map(|c| s.contains(c)).collect(),
+        )
+    });
     BandLive {
         bank: FilterBank::new(key.band().sections(fs), nchp),
-        car_ref,
-        car_sub,
+        car,
+        rows: Vec::new(),
         warm: key.lead(fs),
         backfill_at: Some(Instant::now() + SETTLE),
         key: key.clone(),
@@ -947,5 +939,219 @@ mod tests {
         let mut out = Vec::new();
         band_filter(&mut bl, &data, 4, &mut out);
         assert_eq!(out, vec![10, 20, 85, -10, -30, 25]);
+    }
+
+    /// Small xorshift for seeded test data.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn gauss(&mut self) -> f64 {
+            let (u1, u2) = (self.next().max(1e-12), self.next());
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        }
+    }
+
+    /// A synthetic block: `n` rows of `stride` channels (the first `nel` are electrodes):
+    /// noise, a common-mode artefact (a 50 Hz drift plus a wideband burst) and a few spikes.
+    fn synthetic(n: usize, stride: usize, nel: usize, seed: u64) -> Vec<i16> {
+        let mut r = Rng(seed);
+        let mut data = vec![0i16; n * stride];
+        for t in 0..n {
+            let burst = if (t / 900) % 7 == 3 { 600.0 * r.gauss() } else { 0.0 };
+            let common = 1500.0 * (2.0 * std::f64::consts::PI * 50.0 * t as f64 / 30000.0).sin() + burst;
+            for ch in 0..stride {
+                let mut v = if ch < nel {
+                    common + 20.0 * r.gauss()
+                } else {
+                    1000.0 * r.gauss()
+                };
+                // A biphasic spike on a few electrodes.
+                if ch < nel && ch % 3 == 1 {
+                    let k = (t + 97 * ch) % 4000;
+                    if k < 20 {
+                        v -= 500.0 * (-((k as f64 - 6.0) / 3.0).powi(2)).exp();
+                    }
+                }
+                data[t * stride + ch] = v.round().clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+        data
+    }
+
+    /// The same CAR + band-pass through the three CPU implementations, on one block:
+    /// `dsp_thread`'s loop (CAR in LSB, then ×0.195, then filter; copied from lib.rs),
+    /// `band_filter` (filter in LSB, then CAR, rounded to i16), and the app's slope trigger
+    /// (`frame.rs`: CAR in LSB, ×bit_volts, then a one-channel `FilterBank`; copied).
+    #[test]
+    fn car_and_band_pass_agree_across_the_three_cpu_paths() {
+        use crate::dsp::{BandSpec, Car, FilterBank};
+        use rhythm::ELECTRODE_UV_PER_BIT;
+        let (fs, stride, nel, n) = (30000.0, 20, 12, 90000);
+        let data = synthetic(n, stride, nel, 0x5eed);
+        let reference = vec![2usize, 3, 5];
+        let subtract = vec![3usize, 6, 8];
+        let car = Car {
+            reference: reference.clone(),
+            subtract: subtract.clone(),
+        };
+
+        // dsp_thread.
+        let mask = car.mask(nel);
+        let mut bank = FilterBank::new(BandSpec::SPIKES.sections(fs), nel);
+        let mut dsp = vec![0f32; n * nel];
+        for t in 0..n {
+            let r = &data[t * stride..(t + 1) * stride];
+            let c = car.mean(r);
+            for ch in 0..nel {
+                let x = r[ch] as f32 - if mask[ch] { c } else { 0.0 };
+                dsp[t * nel + ch] = bank.tick(ch, x * ELECTRODE_UV_PER_BIT);
+            }
+        }
+
+        // band_filter, on a subset of the electrodes holding the whole CAR.
+        let chans = vec![1usize, 2, 3, 5, 6, 8];
+        let key = BandKey {
+            low_bits: 300f64.to_bits(),
+            high_bits: 6000f64.to_bits(),
+            chans: chans.clone(),
+            car: Some((reference, subtract)),
+        };
+        let mut bl = band_live(&key, fs);
+        let mut pyr = Vec::new();
+        band_filter(&mut bl, &data, stride, &mut pyr);
+
+        // The slope trigger's computation, per channel.
+        let mut worst_slope = 0f32;
+        let mut worst_pyr = 0f32;
+        let mut peak = 0f32;
+        let settled = 6000; // 0.2 s
+        for (i, &c) in chans.iter().enumerate() {
+            let mut one = FilterBank::new(BandSpec::SPIKES.sections(fs), 1);
+            let car_c = Some(&car).filter(|car| car.subtract.contains(&c));
+            for t in 0..n {
+                let row = &data[t * stride..(t + 1) * stride];
+                let x = row[c] as f32 - car_c.map_or(0.0, |car| car.mean(row));
+                let slope = one.tick(0, x * ELECTRODE_UV_PER_BIT);
+                let d = dsp[t * nel + c];
+                if t >= settled {
+                    worst_slope = worst_slope.max((slope - d).abs());
+                    let lsb = pyr[t * chans.len() + i] as f32;
+                    worst_pyr = worst_pyr.max((lsb - d / ELECTRODE_UV_PER_BIT).abs());
+                    peak = peak.max(d.abs());
+                }
+            }
+        }
+        eprintln!("oracle: peak {peak:.1} uV, slope vs dsp {worst_slope:e} uV, band_filter vs dsp {worst_pyr:.4} LSB");
+        // Same operations in the same order: identical.
+        assert_eq!(worst_slope, 0.0);
+        // band_filter rounds to whole LSB (0.5) and filters before the CAR: float error only.
+        assert!(worst_pyr <= 0.5 + 0.02, "{worst_pyr}");
+        assert!(peak > 50.0, "the spikes must come through");
+    }
+
+    /// The per-sample `band_filter` as it was before the block API: filter in LSB, then the
+    /// CAR over the filtered values.
+    fn band_filter_per_sample(key: &BandKey, bank: &mut FilterBank, data: &[i16], nch_all: usize) -> Vec<i16> {
+        let chans = &key.chans;
+        let pos = |c: usize| chans.iter().position(|&x| x == c);
+        let (car_ref, car_sub): (Vec<usize>, Vec<bool>) = match &key.car {
+            Some((r, s)) => (
+                r.iter().filter_map(|&c| pos(c)).collect(),
+                (0..chans.len()).map(|i| s.contains(&chans[i])).collect(),
+            ),
+            None => (Vec::new(), vec![false; chans.len()]),
+        };
+        let mut out = Vec::new();
+        let mut row = vec![0f32; chans.len()];
+        for src in data.chunks_exact(nch_all) {
+            for (i, &c) in chans.iter().enumerate() {
+                row[i] = bank.tick(i, src[c] as f32);
+            }
+            if !car_ref.is_empty() {
+                let mean = car_ref.iter().map(|&i| row[i]).sum::<f32>() / car_ref.len() as f32;
+                for (i, v) in row.iter_mut().enumerate() {
+                    if car_sub[i] {
+                        *v -= mean;
+                    }
+                }
+            }
+            out.extend(row.iter().map(|&v| v.round().clamp(-32768.0, 32767.0) as i16));
+        }
+        out
+    }
+
+    /// The block `band_filter` against the old per-sample one, over blocks of uneven sizes
+    /// (filter state carries across them). The CAR now comes before the filter, so the two
+    /// differ by float rounding only: a whole LSB at most, after rounding to i16.
+    #[test]
+    fn band_filter_block_matches_the_per_sample_one() {
+        let (fs, stride) = (30000.0, 20);
+        let data = synthetic(60000, stride, 12, 7);
+        let key = BandKey {
+            low_bits: 300f64.to_bits(),
+            high_bits: 6000f64.to_bits(),
+            chans: vec![1, 2, 3, 5, 6, 8],
+            car: Some((vec![2, 3, 5, 9], vec![3, 6, 8])),
+        };
+        let mut bl = band_live(&key, fs);
+        let mut old = band_live(&key, fs);
+        let (mut worst, mut differing, mut total) = (0i32, 0usize, 0usize);
+        let mut at = 0;
+        for len in [64usize, 1, 997, 4096, 32, 10000, 3, 20000, 24807] {
+            let blk = &data[at * stride..(at + len) * stride];
+            at += len;
+            let mut new = Vec::new();
+            band_filter(&mut bl, blk, stride, &mut new);
+            let o = band_filter_per_sample(&key, &mut old.bank, blk, stride);
+            assert_eq!(new.len(), o.len());
+            for (a, b) in new.iter().zip(&o) {
+                let d = (*a as i32 - *b as i32).abs();
+                worst = worst.max(d);
+                differing += (d != 0) as usize;
+                total += 1;
+            }
+        }
+        eprintln!("band_filter block vs per-sample: worst {worst} LSB, {differing} of {total} values differ");
+        assert!(worst <= 1);
+    }
+
+    /// Old against new, 30 kHz, 32 of 64 channels with a CAR, in 2048-sample stages.
+    /// `cargo test --release -p engine band_filter_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn band_filter_speed() {
+        let (fs, stride, secs) = (30000.0, 64, 10usize);
+        let data = synthetic(30000 * secs, stride, 60, 11);
+        let key = BandKey {
+            low_bits: 300f64.to_bits(),
+            high_bits: 6000f64.to_bits(),
+            chans: (0..32).collect(),
+            car: Some(((0..32).collect(), (0..32).collect())),
+        };
+        let block = 2048;
+        let t0 = Instant::now();
+        let mut old = band_live(&key, fs);
+        let mut sink = 0i64;
+        for b in data.chunks(block * stride) {
+            sink += band_filter_per_sample(&key, &mut old.bank, b, stride)[0] as i64;
+        }
+        let t_old = t0.elapsed();
+        let t0 = Instant::now();
+        let mut bl = band_live(&key, fs);
+        let mut out = Vec::new();
+        for b in data.chunks(block * stride) {
+            band_filter(&mut bl, b, stride, &mut out);
+            sink += out[0] as i64;
+        }
+        let t_new = t0.elapsed();
+        eprintln!(
+            "band_filter, 32 of 64 ch, {secs} s: per-sample {t_old:?}, block {t_new:?} (x{:.2}) [{sink}]",
+            t_old.as_secs_f64() / t_new.as_secs_f64()
+        );
     }
 }

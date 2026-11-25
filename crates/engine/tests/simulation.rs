@@ -15,10 +15,14 @@
 //! mid-recording would: the recorder must say so, and every file must read back correctly as
 //! far as it goes.
 //!
+//! Every 32nd seed has the recorder sync `continuous.dat` after every block (every 5 s in
+//! use), so the periodic sync runs mid-recording, also into a full disk; the test prints what
+//! the syncs cost (meaningful only when `TMPDIR` is on a real disk, not a tmpfs).
+//!
 //! Everything is a function of the seed; a failure prints the seed, and
 //! `KALILA_SIM_SEED=<n> cargo test -p engine --test simulation` reruns just that one.
 
-use engine::record::{RecMsg, RecStatus, run_recorder};
+use engine::record::{RecMsg, RecStatus, run_recorder_syncing};
 use rhythm::assemble::{Assembled, DeviceFrame, assemble};
 use rhythm::oni_board::{CHIP_ID_RHD2132, CHIP_ID_RHD2216, DEVICE_RHYTHM};
 use rhythm::parser::{RhythmParser, encode_payload};
@@ -27,7 +31,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Two streams as on the rig: an RHD2132 in 16-channel mode and an RHD2216, plus 8 ADC.
 const STREAMS: usize = 2;
@@ -296,6 +301,20 @@ fn find(dir: &Path, name: &str, under: &str) -> PathBuf {
     v.pop().unwrap()
 }
 
+/// The periodic sync: as in use (`default_sync_every`: every 5 s on Linux, so it never fires
+/// in a seed's run), except that every 32nd seed syncs after every block, so the sync runs
+/// mid-recording, also into a full disk (seeds 1008, 1024, 1040, 1056). Not on every seed: on
+/// a real disk each of these syncs costs ~1 ms; 17 seeds took the test from ~40 s to ~85 s on
+/// an NVMe SSD (2026-11-25), every seed would take it to ~6 min. On a tmpfs it costs nothing.
+fn sync_every(seed: u64) -> Option<Duration> {
+    engine::record::default_sync_every().map(|e| if seed.is_multiple_of(32) { Duration::ZERO } else { e })
+}
+
+/// Periodic syncs over all seeds: count, total and longest time (µs).
+static SYNCS: AtomicU64 = AtomicU64::new(0);
+static SYNC_US: AtomicU64 = AtomicU64::new(0);
+static SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+
 /// Runs one seed; returns a description of the first broken invariant. With `disk_limit`,
 /// no file may grow past that many bytes: the recorder must report the error, and every
 /// file must still read back correctly as far as its header (or length) says.
@@ -325,7 +344,7 @@ fn run(seed: u64, disk_limit: Option<u64>) -> Result<(), String> {
     let st = status.clone();
     fs::create_dir_all(&root).unwrap();
     file_size_limit(disk_limit);
-    let recorder = std::thread::spawn(move || run_recorder(rx, st));
+    let recorder = std::thread::spawn(move || run_recorder_syncing(rx, st, sync_every(seed)));
     tx.send(RecMsg::AcquisitionStarted(layout())).unwrap();
 
     // Acquisition: the board's block assembly over the simulated stream. Recordings open
@@ -383,6 +402,9 @@ fn run(seed: u64, disk_limit: Option<u64>) -> Result<(), String> {
     let joined = recorder.join();
     file_size_limit(None);
     joined.map_err(|_| "recorder panicked".to_string())?;
+    SYNCS.fetch_add(status.syncs.load(Ordering::Relaxed), Ordering::Relaxed);
+    SYNC_US.fetch_add(status.sync_us.load(Ordering::Relaxed), Ordering::Relaxed);
+    SYNC_US_MAX.fetch_max(status.sync_us_max.load(Ordering::Relaxed), Ordering::Relaxed);
     let rec_error = status.error.lock().clone();
     match (&rec_error, disk_limit) {
         (Some(e), None) => return Err(format!("recorder error: {e}")),
@@ -609,6 +631,17 @@ fn acquisition_to_recorder_under_seeded_faults() {
             })
         })
         .collect();
+    let n = SYNCS.load(Ordering::Relaxed);
+    eprintln!(
+        "periodic syncs of continuous.dat: {n}, mean {} µs, max {} µs (TMPDIR {})",
+        SYNC_US.load(Ordering::Relaxed) / n.max(1),
+        SYNC_US_MAX.load(Ordering::Relaxed),
+        std::env::temp_dir().display()
+    );
+    assert!(
+        n > 0 || seeds.iter().all(|&(s, _)| sync_every(s) != Some(Duration::ZERO)),
+        "the periodic sync never ran"
+    );
     assert!(
         failures.is_empty(),
         "{} of {} seeds failed (rerun one with KALILA_SIM_SEED=<n>):\n{}",

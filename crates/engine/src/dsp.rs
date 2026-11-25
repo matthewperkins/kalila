@@ -4,7 +4,7 @@ use std::f64::consts::PI;
 
 /// Common average reference on raw electrode samples. Applied before the band-pass filters,
 /// which is equivalent to applying it after them (both are linear and every electrode uses
-/// the same filter). Channels are global electrode indices.
+/// the same filter; `pyramid.rs` has a test that the CPU paths agree). Channels are global electrode indices.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Car {
     pub reference: Vec<usize>,
@@ -33,6 +33,33 @@ impl Car {
             }
         }
         m
+    }
+}
+
+impl Car {
+    /// Resolve this CAR for blocks of `stride` channels filtered on `nch` channels (the
+    /// electrodes, which come first in a row). None when it would change nothing.
+    pub fn plan(&self, stride: usize, nch: usize) -> Option<CarPlan> {
+        let reference = self.reference.iter().copied().filter(|&c| c < stride).collect();
+        CarPlan::new(reference, self.mask(nch))
+    }
+}
+
+/// A CAR resolved for one block layout, so a block is filtered without looking at the
+/// choice per sample: the columns whose mean is the reference, and which filtered channels
+/// it is subtracted from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CarPlan {
+    /// Columns of a raw row averaged into the reference (all inside the row).
+    reference: Vec<usize>,
+    /// Per filtered channel: subtract the reference from it.
+    subtract: Vec<bool>,
+}
+
+impl CarPlan {
+    /// None when there is no reference or nothing to subtract it from.
+    pub fn new(reference: Vec<usize>, subtract: Vec<bool>) -> Option<Self> {
+        (!reference.is_empty() && subtract.contains(&true)).then_some(Self { reference, subtract })
     }
 }
 
@@ -89,12 +116,6 @@ impl Biquad {
             1.0 - al / a,
         )
     }
-    pub fn notch(fs: f64, f: f64, q: f64) -> Self {
-        let w = 2.0 * PI * f / fs;
-        let (s, c) = w.sin_cos();
-        let al = s / (2.0 * q);
-        Self::from_f64(1.0, -2.0 * c, 1.0, 1.0 + al, -2.0 * c, 1.0 - al)
-    }
     /// Transposed direct form II; `z` is the 2-element state.
     #[inline(always)]
     pub fn tick(&self, x: f32, z: &mut [f32; 2]) -> f32 {
@@ -128,11 +149,6 @@ impl BandSpec {
         high_hz: 6000.0,
         order: 4,
     };
-    pub const LFP: BandSpec = BandSpec {
-        low_hz: 1.0,
-        high_hz: 300.0,
-        order: 2,
-    };
     pub fn sections(&self, fs: f64) -> Vec<Biquad> {
         let mut v = Vec::new();
         let nyq = fs / 2.0;
@@ -160,6 +176,8 @@ pub struct FilterBank {
     pub sections: Vec<Biquad>,
     nch: usize,
     state: Vec<[f32; 2]>,
+    /// Scratch for [`FilterBank::process`]: the reference mean of each sample.
+    means: Vec<f32>,
 }
 
 impl FilterBank {
@@ -169,6 +187,7 @@ impl FilterBank {
             sections,
             nch,
             state: vec![[0.0; 2]; n],
+            means: Vec::new(),
         }
     }
     #[inline]
@@ -182,6 +201,62 @@ impl FilterBank {
     }
     pub fn num_channels(&self) -> usize {
         self.nch
+    }
+
+    /// Filter a whole block. `data` holds raw rows of `stride` channels; filtered channel
+    /// `i` reads column `cols[i]` (column `i` when `cols` is None). Per sample the result is
+    /// `filter((x − reference mean) · scale)`, the reference being the mean of the plan's
+    /// columns in raw LSB, subtracted only on the plan's channels. `out` receives
+    /// `n × num_channels` values, sample-major. The CAR is resolved once, into one mean per
+    /// sample; each channel then runs through the block alone, so its filter state stays in
+    /// registers. Each value is computed with the same operations in the same order as
+    /// [`FilterBank::tick`], so the result is bit-identical to feeding it sample by sample.
+    pub fn process(
+        &mut self,
+        data: &[i16],
+        stride: usize,
+        cols: Option<&[usize]>,
+        scale: f32,
+        car: Option<&CarPlan>,
+        out: &mut [f32],
+    ) {
+        let nch = self.nch;
+        let n = data.len() / stride.max(1);
+        assert!(out.len() >= n * nch, "output too short for the block");
+        assert!(cols.is_none_or(|c| c.len() == nch && c.iter().all(|&c| c < stride)));
+        assert!(cols.is_some() || nch <= stride);
+        if let Some(plan) = car {
+            assert_eq!(plan.subtract.len(), nch);
+            self.means.clear();
+            self.means.extend(data.chunks_exact(stride).map(|row| {
+                let sum: i64 = plan.reference.iter().map(|&c| row[c] as i64).sum();
+                sum as f32 / plan.reference.len() as f32
+            }));
+        }
+        let ns = self.sections.len();
+        for ch in 0..nch {
+            let col = cols.map_or(ch, |c| c[ch]);
+            let st = &mut self.state[ch * ns..(ch + 1) * ns];
+            let sub = car.is_some_and(|p| p.subtract[ch]);
+            let rows = data.chunks_exact(stride).zip(out.chunks_exact_mut(nch));
+            if sub {
+                for ((row, o), &m) in rows.zip(&self.means) {
+                    o[ch] = Self::cascade(&self.sections, st, (row[col] as f32 - m) * scale);
+                }
+            } else {
+                for (row, o) in rows {
+                    o[ch] = Self::cascade(&self.sections, st, row[col] as f32 * scale);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn cascade(sections: &[Biquad], st: &mut [[f32; 2]], mut x: f32) -> f32 {
+        for (s, z) in sections.iter().zip(st.iter_mut()) {
+            x = s.tick(x, z);
+        }
+        x
     }
 }
 
@@ -493,5 +568,113 @@ mod tests {
         assert_eq!(out[0].waveform[SPIKE_PRE], -120.0);
         assert_eq!(out[0].waveform[SPIKE_PRE - 1], -60.0);
         assert_eq!(out[0].waveform[SPIKE_PRE + 1], -80.0);
+    }
+
+    /// `dsp_thread`'s loop as it was before the block API (CAR per sample, `tick` per channel).
+    fn per_sample(bank: &mut FilterBank, car: Option<&Car>, data: &[i16], stride: usize, nel: usize) -> Vec<f32> {
+        let mask = car.map(|c| c.mask(nel));
+        let mut out = Vec::new();
+        for r in data.chunks_exact(stride) {
+            let (c, mask) = match (car, &mask) {
+                (Some(c), Some(m)) => (c.mean(r), m.as_slice()),
+                _ => (0.0, &[][..]),
+            };
+            for (ch, &raw) in r[..nel].iter().enumerate() {
+                let x = raw as f32 - if mask.get(ch).copied().unwrap_or(false) { c } else { 0.0 };
+                out.push(bank.tick(ch, x * 0.195));
+            }
+        }
+        out
+    }
+
+    fn noise_data(n: usize, stride: usize, seed: u64) -> Vec<i16> {
+        let mut r = seed;
+        (0..n * stride)
+            .map(|_| {
+                r ^= r << 13;
+                r ^= r >> 7;
+                r ^= r << 17;
+                ((r >> 40) as i64 % 3000 - 1500) as i16
+            })
+            .collect()
+    }
+
+    /// The block API gives bit-identical values to the per-sample loop it replaces, with and
+    /// without a CAR (one reference column outside the electrodes, one beyond the row), over
+    /// blocks of uneven sizes.
+    #[test]
+    fn process_is_bit_identical_to_the_per_sample_loop() {
+        let (stride, nel) = (24, 16);
+        let data = noise_data(20000, stride, 99);
+        let cars = [
+            None,
+            Some(Car {
+                reference: vec![0, 3, 5, 20, 99],
+                subtract: vec![1, 3, 5, 15, 40],
+            }),
+            Some(Car {
+                reference: vec![99],
+                subtract: vec![1],
+            }),
+            Some(Car {
+                reference: vec![2],
+                subtract: vec![],
+            }),
+        ];
+        for car in &cars {
+            let sections = BandSpec::SPIKES.sections(30000.0);
+            let mut old = FilterBank::new(sections.clone(), nel);
+            let mut new = FilterBank::new(sections, nel);
+            let plan = car.as_ref().and_then(|c| c.plan(stride, nel));
+            let mut at = 0;
+            for len in [1usize, 64, 7, 5000, 128, 14800] {
+                let blk = &data[at * stride..(at + len) * stride];
+                at += len;
+                let want = per_sample(&mut old, car.as_ref(), blk, stride, nel);
+                let mut got = vec![0f32; len * nel];
+                new.process(blk, stride, None, 0.195, plan.as_ref(), &mut got);
+                assert!(
+                    want.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{car:?}"
+                );
+            }
+        }
+    }
+
+    /// Old against new, 30 kHz x 64 channels, CAR on, with the board's 32-sample blocks and
+    /// with 1024.
+    /// `cargo test --release -p engine process_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn process_speed() {
+        let (stride, nel, secs) = (64, 64, 10usize);
+        let data = noise_data(30000 * secs, stride, 5);
+        let car = Car {
+            reference: (0..32).collect(),
+            subtract: (0..64).collect(),
+        };
+        for block in [32usize, 1024] {
+            let sections = BandSpec::SPIKES.sections(30000.0);
+            let mut old = FilterBank::new(sections.clone(), nel);
+            let t0 = std::time::Instant::now();
+            let mut sink = 0f32;
+            for b in data.chunks(block * stride) {
+                sink += per_sample(&mut old, Some(&car), b, stride, nel)[0];
+            }
+            let t_old = t0.elapsed();
+            let mut new = FilterBank::new(sections, nel);
+            let plan = car.plan(stride, nel);
+            let mut rows = vec![0f32; block * nel];
+            let t0 = std::time::Instant::now();
+            for b in data.chunks(block * stride) {
+                new.process(b, stride, None, 0.195, plan.as_ref(), &mut rows);
+                sink += rows[0];
+            }
+            let t_new = t0.elapsed();
+            eprintln!(
+                "{nel} ch, {secs} s, {block}-sample blocks: per-sample {t_old:?}, block {t_new:?} (x{:.2}) [{sink}]",
+                t_old.as_secs_f64() / t_new.as_secs_f64()
+            );
+        }
     }
 }

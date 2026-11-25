@@ -18,7 +18,7 @@ mod sched;
 use anyhow::{Result, bail};
 use audio::{AudioMonitor, AudioSettings, AudioStats};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
-use dsp::{BandSpec, Car, FilterBank, Spike, SpikeDetector, ThresholdMode};
+use dsp::{BandSpec, Car, CarPlan, FilterBank, Spike, SpikeDetector, ThresholdMode};
 use log::{error, info, warn};
 use parking_lot::Mutex;
 use record::{RecMsg, RecStatus};
@@ -59,6 +59,8 @@ pub struct PipelineStats {
     pub dsp_dropped: AtomicU64,
     pub audio_dropped: AtomicU64,
     pub pyramid_dropped: AtomicU64,
+    /// Spikes the GUI's queue had no room for.
+    pub spikes_dropped: AtomicU64,
     /// Time (µs) the acquisition thread spent blocked on the recorder queue, total.
     pub rec_backpressure_us: AtomicU64,
     pub rec_queue: AtomicU64,
@@ -377,6 +379,7 @@ impl Engine {
         self.pipeline.dsp_dropped.store(0, Ordering::Relaxed);
         self.pipeline.audio_dropped.store(0, Ordering::Relaxed);
         self.pipeline.pyramid_dropped.store(0, Ordering::Relaxed);
+        self.pipeline.spikes_dropped.store(0, Ordering::Relaxed);
         self.pipeline.rec_backpressure_us.store(0, Ordering::Relaxed);
         self.pipeline.blocks.store(0, Ordering::Relaxed);
 
@@ -401,10 +404,11 @@ impl Engine {
             let rx = dsp_rx;
             let settings = self.dsp_settings.clone();
             let cs = self.channel_stats.clone();
+            let pipe = self.pipeline.clone();
             workers.push(
                 std::thread::Builder::new()
                     .name("dsp".into())
-                    .spawn(move || dsp_thread(rx, spk_tx, settings, cs, fs, nel))
+                    .spawn(move || dsp_thread(rx, spk_tx, settings, cs, pipe, fs, nel))
                     .unwrap(),
             );
         }
@@ -441,10 +445,17 @@ impl Engine {
             );
         }
 
-        let health = self.health.clone();
-        let pipe = self.pipeline.clone();
         let rec_tx = self.rec_tx.clone();
-        let rec_status = self.rec_status.clone();
+        let out = Fanout {
+            display: disp_tx,
+            dsp: dsp_tx,
+            audio: aud_tx,
+            pyramid: pyr_tx,
+            rec: rec_tx.clone(),
+            rec_status: self.rec_status.clone(),
+            rec_limit,
+            pipe: self.pipeline.clone(),
+        };
         let stop2 = stop.clone();
         let rt = Arc::new(AtomicBool::new(false));
         let rt2 = rt.clone();
@@ -457,20 +468,7 @@ impl Engine {
                 let _stopped = AcqStopped(rec_tx.clone());
                 let _awake = sched::KeepAwake::new();
                 rt2.store(set_realtime(), Ordering::Relaxed);
-                let r = acquisition_loop(
-                    board.as_mut(),
-                    &stop2,
-                    &live_rx,
-                    &disp_tx,
-                    &dsp_tx,
-                    &aud_tx,
-                    &pyr_tx,
-                    &rec_tx,
-                    &rec_status,
-                    rec_limit,
-                    &health,
-                    &pipe,
-                );
+                let r = acquisition_loop(board.as_mut(), &stop2, &live_rx, &out);
                 if let Err(e) = &r {
                     error!("acquisition loop ended with error: {e:#}");
                 }
@@ -603,21 +601,67 @@ fn worker_role(name: &str) -> &'static str {
 
 use sched::set_realtime;
 
-#[allow(clippy::too_many_arguments)]
+/// Where the acquisition thread sends each block.
+struct Fanout {
+    /// The lossy consumers (`try_send`; a full queue drops the block and counts it).
+    display: Sender<Arc<Block>>,
+    dsp: Sender<Arc<Block>>,
+    audio: Sender<Arc<Block>>,
+    pyramid: Sender<Arc<Block>>,
+    /// The recorder: lossless while recording, held to `rec_limit` messages by
+    /// `wait_for_room`.
+    rec: Sender<RecMsg>,
+    rec_status: Arc<RecStatus>,
+    rec_limit: u64,
+    pipe: Arc<PipelineStats>,
+}
+
+/// The longest one wait for room in the recorder queue sleeps before it looks at `stop` and
+/// `recording` again. The recorder wakes it sooner when it takes a message.
+const REC_WAIT_POLL: Duration = Duration::from_millis(2);
+
+/// Waits while the recorder queue holds `limit` messages or more, until there is room, `stop`
+/// is set or `recording` clears (it also clears when the recorder thread dies, so this can't
+/// wait forever). Returns how long it waited.
+///
+/// The queue stays unbounded, so the GUI thread's Start/Stop/Message and the `AcqStopped`
+/// guard never block and keep their order relative to data; only this producer is held to
+/// the limit. It parks instead of polling: the recorder unparks it after each message it
+/// takes (`RecStatus::wake_producer`). A wake-up missed in the race between the check and the
+/// park only costs `REC_WAIT_POLL`, after which it looks again.
+fn wait_for_room(rec: &Sender<RecMsg>, status: &RecStatus, limit: u64, stop: &AtomicBool) -> Duration {
+    let full =
+        || rec.len() as u64 >= limit && !stop.load(Ordering::Relaxed) && status.recording.load(Ordering::Relaxed);
+    if !full() {
+        return Duration::ZERO;
+    }
+    let t = Instant::now();
+    *status.waiter.lock() = Some(std::thread::current());
+    status.waiting.store(true, Ordering::SeqCst);
+    while full() {
+        std::thread::park_timeout(REC_WAIT_POLL);
+    }
+    status.waiting.store(false, Ordering::SeqCst);
+    t.elapsed()
+}
+
 fn acquisition_loop(
     board: &mut dyn Board,
     stop: &AtomicBool,
     live_rx: &Receiver<LiveCommand>,
-    disp: &Sender<Arc<Block>>,
-    dsp: &Sender<Arc<Block>>,
-    aud: &Sender<Arc<Block>>,
-    pyr: &Sender<Arc<Block>>,
-    rec: &Sender<RecMsg>,
-    rec_status: &RecStatus,
-    rec_limit: u64,
-    _health: &Health,
-    pipe: &PipelineStats,
+    out: &Fanout,
 ) -> Result<()> {
+    let Fanout {
+        display: disp,
+        dsp,
+        audio: aud,
+        pyramid: pyr,
+        rec,
+        rec_status,
+        rec_limit,
+        pipe,
+    } = out;
+    let rec_limit = *rec_limit;
     // Block pool: reuse blocks once every consumer has released them, so the acquisition
     // thread doesn't allocate in steady state. A block can sit in every lossy queue at once,
     // so the pool covers their combined depth (a few seconds; ~16 MB at 64 channels): then a
@@ -653,15 +697,7 @@ fn acquisition_loop(
         // Recorder: lossless while recording. If the disk falls behind we block here; the
         // board's DRAM absorbs the stall (and any overflow shows up as counted gaps).
         if rec_status.recording.load(Ordering::Relaxed) {
-            let t = Instant::now();
-            // `recording` also clears if the recorder thread dies, so this can't spin forever.
-            while rec.len() as u64 >= rec_limit
-                && !stop.load(Ordering::Relaxed)
-                && rec_status.recording.load(Ordering::Relaxed)
-            {
-                std::thread::sleep(Duration::from_micros(200));
-            }
-            let w = t.elapsed().as_micros() as u64;
+            let w = wait_for_room(rec, rec_status, rec_limit, stop).as_micros() as u64;
             if w > 0 {
                 pipe.rec_backpressure_us.fetch_add(w, Ordering::Relaxed);
             }
@@ -690,49 +726,53 @@ fn dsp_thread(
     spikes: Sender<Spike>,
     settings: Arc<Mutex<DspSettings>>,
     cs: Arc<Mutex<ChannelStats>>,
+    pipe: Arc<PipelineStats>,
     fs: f64,
     nel: usize,
 ) {
     let mut cur = settings.lock().clone();
     let mut bank = FilterBank::new(cur.band.sections(fs), nel);
     let mut det = SpikeDetector::new(fs, nel, cur.threshold);
-    let mut row = vec![0.0f32; nel];
+    let mut rows = Vec::new();
     let mut out = Vec::new();
     let mut counts = vec![0u64; nel];
     let mut last_pub = Instant::now();
-    let mut car_mask = cur.car.as_ref().map(|c| c.mask(nel));
+    // The CAR resolved for the block layout; rebuilt when the CAR or the layout changes.
+    let mut plan: Option<(usize, Option<CarPlan>)> = None;
     while let Ok(b) = rx.recv() {
         let s = settings.lock().clone();
         if s.band != cur.band {
             bank = FilterBank::new(s.band.sections(fs), nel);
         }
         if s.car != cur.car {
-            car_mask = s.car.as_ref().map(|c| c.mask(nel));
+            plan = None;
         }
         det.mode = s.threshold;
         cur = s;
-        for t in 0..b.len() {
-            let r = b.sample(t);
-            let (car, mask) = match (&cur.car, &car_mask) {
-                (Some(c), Some(m)) => (c.mean(r), m.as_slice()),
-                _ => (0.0, &[][..]),
-            };
-            for (ch, v) in row.iter_mut().enumerate() {
-                let x = r[ch] as f32
-                    - if mask.get(ch).copied().unwrap_or(false) {
-                        car
-                    } else {
-                        0.0
-                    };
-                *v = bank.tick(ch, x * ELECTRODE_UV_PER_BIT);
-            }
-            if cur.detect {
-                det.push(b.first_sample + t as i64, &row, &mut out);
+        let stride = b.num_channels;
+        if plan.as_ref().is_none_or(|(st, _)| *st != stride) {
+            plan = Some((stride, cur.car.as_ref().and_then(|c| c.plan(stride, nel))));
+        }
+        let n = b.len();
+        rows.resize(n * nel, 0.0f32);
+        bank.process(
+            &b.data,
+            stride,
+            None,
+            ELECTRODE_UV_PER_BIT,
+            plan.as_ref().and_then(|p| p.1.as_ref()),
+            &mut rows,
+        );
+        if cur.detect {
+            for (t, row) in rows.chunks_exact(nel).enumerate() {
+                det.push(b.first_sample + t as i64, row, &mut out);
             }
         }
         for sp in out.drain(..) {
             counts[sp.channel] += 1;
-            let _ = spikes.try_send(sp);
+            if let Err(crossbeam_channel::TrySendError::Full(_)) = spikes.try_send(sp) {
+                pipe.spikes_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if last_pub.elapsed() > Duration::from_millis(200) {
             last_pub = Instant::now();
@@ -932,6 +972,126 @@ mod tests {
         );
         drop(e);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A recorder queue already at its limit (`n` messages), with `recording` set.
+    fn full_queue(n: usize) -> (Sender<RecMsg>, Receiver<RecMsg>, Arc<RecStatus>) {
+        let (tx, rx) = unbounded();
+        for _ in 0..n {
+            tx.send(RecMsg::Stop).unwrap();
+        }
+        let st = Arc::new(RecStatus::default());
+        st.recording.store(true, Ordering::SeqCst);
+        (tx, rx, st)
+    }
+
+    #[test]
+    fn a_wait_for_room_ends_when_the_recorder_takes_a_message() {
+        let (tx, rx, st) = full_queue(4);
+        let stop = AtomicBool::new(false);
+        let st2 = st.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = rx.recv().unwrap();
+            st2.wake_producer();
+            rx
+        });
+        let w = wait_for_room(&tx, &st, 4, &stop);
+        assert!(w >= Duration::from_millis(90), "{w:?}");
+        assert!(w < Duration::from_secs(2), "{w:?}");
+        assert_eq!(tx.len(), 3);
+        assert!(!st.waiting.load(Ordering::SeqCst));
+        drop(h.join().unwrap());
+        // Below the limit: no wait at all.
+        assert_eq!(wait_for_room(&tx, &st, 4, &stop), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_stop_ends_a_wait_for_room_promptly() {
+        let (tx, _rx, st) = full_queue(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            stop2.store(true, Ordering::SeqCst);
+        });
+        let w = wait_for_room(&tx, &st, 4, &stop);
+        assert!(w < Duration::from_millis(500), "{w:?}");
+        assert_eq!(tx.len(), 4, "nothing was taken");
+    }
+
+    /// A recorder thread that dies clears `recording` (its exit guard), which ends the wait;
+    /// the send that follows fails, as `acquisition_loop` expects.
+    #[test]
+    fn a_recorder_that_dies_ends_a_wait_for_room() {
+        let (tx, rx, st) = full_queue(4);
+        let stop = AtomicBool::new(false);
+        let st2 = st.clone();
+        let h = std::thread::spawn(move || {
+            let _exit = record::RecorderExit(&st2);
+            let _rx = rx;
+            std::thread::sleep(Duration::from_millis(50));
+            panic!("test: the recorder thread crashes");
+        });
+        let w = wait_for_room(&tx, &st, 4, &stop);
+        assert!(w < Duration::from_millis(500), "{w:?}");
+        assert!(!st.recording.load(Ordering::SeqCst));
+        assert!(h.join().is_err());
+        assert!(tx.send(RecMsg::Stop).is_err(), "the receiver is gone");
+        assert!(st.error.lock().as_deref().is_some_and(|e| e.contains("crashed")));
+    }
+
+    /// The acquisition loop against a recorder slower than the board: the queue never holds
+    /// more than the limit, the stall is counted, and every block arrives, in order.
+    #[test]
+    fn a_slow_recorder_holds_acquisition_to_the_queue_limit_without_losing_blocks() {
+        let limit = 8u64;
+        let (rec_tx, rec_rx) = unbounded();
+        let st = Arc::new(RecStatus::default());
+        st.recording.store(true, Ordering::SeqCst);
+        let pipe = Arc::new(PipelineStats::default());
+        let (disp, _d) = bounded(1);
+        let (dsp, _s) = bounded(1);
+        let (aud, _a) = bounded(1);
+        let (pyr, _p) = bounded(1);
+        let out = Fanout {
+            display: disp,
+            dsp,
+            audio: aud,
+            pyramid: pyr,
+            rec: rec_tx,
+            rec_status: st.clone(),
+            rec_limit: limit,
+            pipe: pipe.clone(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let acq = std::thread::spawn(move || {
+            let mut board = SimBoard::new(vec![16]);
+            board.start(Arc::new(Health::default())).unwrap();
+            let (_live_tx, live_rx) = unbounded();
+            acquisition_loop(&mut board, &stop2, &live_rx, &out).unwrap();
+        });
+        // ~2 ms per block against the board's ~1 ms: the queue fills and stays full.
+        let mut next = None;
+        for _ in 0..200 {
+            let msg = rec_rx.recv_timeout(Duration::from_secs(5)).expect("a block");
+            st.wake_producer();
+            let RecMsg::Data(b) = msg else { panic!("only data") };
+            if let Some(n) = next {
+                assert_eq!(b.first_sample, n, "a block was lost or reordered");
+            }
+            next = Some(b.first_sample + b.len() as i64);
+            assert!(rec_rx.len() as u64 <= limit, "queue at {}", rec_rx.len());
+            assert!(pipe.rec_queue.load(Ordering::Relaxed) <= limit);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let t = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        acq.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(1), "stop took {:?}", t.elapsed());
+        let bp = pipe.rec_backpressure_us.load(Ordering::Relaxed);
+        assert!(bp > 100_000, "stall counted: {bp} µs");
     }
 
     #[test]
