@@ -336,8 +336,21 @@ they are; platform code sits behind small `cfg` seams.
   cannot make one). Ctrl+Space and Ctrl+R stay Ctrl on both (Cmd+Space is Spotlight).
 - **CI** (`.github/workflows/ci.yml`): build and test on `macos-latest` and
   `ubuntu-latest` at every push to `main` and `macos-port`; both pass.
-- Still to do: the board sessions on the Mac, the display latency read-out from the
-  drawable's presented time, an `.app`.
+- **Time to screen** (`app/src/presented.rs`, 2026-11-24): on macOS the status chip's
+  "display" is sample acquired → shown, from each frame's `MTLDrawable.presentedTime`; the
+  hover text keeps the to-the-GPU figure. eframe owns the surface, so the drawable is not
+  reachable through wgpu (no `as_hal`): `-[CAMetalLayer nextDrawable]` is wrapped, and when
+  a trace window has just drawn live traces a presented handler is added to the drawable
+  returned. Nothing else about the drawable changes. Measurement only; macOS's own
+  report, not a photodiode's.
+  - Measured on the simulator (MacBook Air M4, built-in 60 Hz screen, windowed, one trace
+    window, 12 s each): `present_mode` "auto" (no sync) **mean 5.3–6.7 ms**, worst 19–33 ms
+    in a 2 s stretch; "vsync" **mean 47–49 ms**, worst 50–66 ms. dimna's Metal test on the
+    same Mac: 7.1 ms windowed without sync, 32 ms with. So "auto" stays the default.
+  - Not measured: fullscreen, an external or 120 Hz monitor, the board streaming, and
+    whether frames tear visibly without sync (they did in dimna).
+  - `RUST_LOG=kalila=debug` logs the figure every 2 s ("to screen: …").
+- Still to do: the board sessions on the Mac, an `.app`.
 
 ## Trace windows (rig, 2026-11-06)
 

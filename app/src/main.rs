@@ -1,5 +1,7 @@
 //! kalila — Open Ephys acquisition GUI in Rust (egui + wgpu/Vulkan).
 
+#[cfg(target_os = "macos")]
+mod presented;
 mod app;
 mod config;
 mod notes;
@@ -37,6 +39,8 @@ fn main() -> eframe::Result {
         c.instance_descriptor.backends = if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN | wgpu::Backends::GL };
         c.power_preference = wgpu::PowerPreference::HighPerformance;
     }
+    #[cfg(target_os = "macos")]
+    presented::install();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,

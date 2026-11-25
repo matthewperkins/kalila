@@ -691,6 +691,13 @@ impl ViewsShared {
         if self.car_open == Some(id) {
             self.car_palette(ui.ctx(), id);
         }
+        #[cfg(target_os = "macos")]
+        if self.acquiring
+            && self.states[vi].review.is_none()
+            && let Some(t) = self.newest_at
+        {
+            crate::presented::frame_shows(t);
+        }
         // Pace this window's own frames (continuous while acquiring).
         let period = Duration::from_secs_f32(1.0 / self.max_fps.max(10.0));
         ui.ctx().request_repaint_after(if self.acquiring { period } else { Duration::from_millis(250) });

@@ -366,7 +366,15 @@ impl App {
                 chip(ui, recent < 5, format!("audio {:.1} ms", a.latency_us.load(Ordering::Relaxed) as f32 / 1000.0), &format!("Audio latency after acquisition (ring + device buffer + filters). Red at 5 or more underruns within the last minute or so ({recent} recently, {total} since start)."));
             }
             let (lat, lat_max) = { let sh = self.shared.lock(); (sh.disp_latency, sh.disp_latency_max) };
-            chip(ui, lat_max < 25.0, format!("display {lat:.1} ms"), "Sample arrival → GPU submit (excludes compositor scan-out).");
+            #[cfg(target_os = "macos")]
+            let shown = crate::presented::latency();
+            #[cfg(not(target_os = "macos"))]
+            let shown: Option<(f32, f32)> = None;
+            match shown {
+                // macOS: to the screen, as the system reports each frame shown.
+                Some((ms, worst)) => chip(ui, worst < 40.0, format!("display {ms:.0} ms"), &format!("Sample arrival → shown on screen, as macOS reports it (worst of the last 2 s: {worst:.0} ms). To the GPU: {lat:.1} ms.")),
+                None => chip(ui, lat_max < 25.0, format!("display {lat:.1} ms"), "Sample arrival → GPU submit (excludes compositor scan-out)."),
+            }
             let (rv_bytes, rv_budget) = { let st = self.engine.pyramids.lock(); (st.bytes(), st.budget) };
             if rv_bytes > 0 {
                 chip(ui, rv_bytes <= rv_budget, format!("review {:.2} / {:.1} GB", rv_bytes as f64 / 1e9, rv_budget as f64 / 1e9), "RAM held by the scroll-back overview of this recording (review_ram_gb in the config). Over it, the oldest fine detail is released; short spans there are read from the file instead.");

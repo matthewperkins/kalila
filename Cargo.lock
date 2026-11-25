@@ -1485,6 +1485,7 @@ dependencies = [
 name = "kalila"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "bytemuck",
  "chrono",
  "crossbeam-channel",
@@ -1492,6 +1493,7 @@ dependencies = [
  "engine",
  "env_logger",
  "log",
+ "objc2 0.6.5",
  "parking_lot",
  "png",
  "serde",
