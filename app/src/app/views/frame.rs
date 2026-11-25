@@ -161,8 +161,11 @@ impl ViewFrame<'_> {
         let PlotGeom { plot, rows, first, .. } = *g;
         let RowSet { row_ch, rowtab, filters } = rs;
         let nrows_all = rowtab.len();
-        // egui turns Ctrl+wheel into a zoom factor (and no scroll delta): > 1 for wheel up.
-        let (scroll, ctrl, alt, shift, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl, i.modifiers.alt, i.modifiers.shift, i.zoom_delta()));
+        // egui turns Ctrl+wheel (Cmd+wheel on macOS: `command` is whichever the platform
+        // uses) into a zoom factor (and no scroll delta): > 1 for wheel up. On macOS a
+        // trackpad pinch arrives as the same factor with no key held, and scales too.
+        let (scroll, ctrl, alt, shift, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.command, i.modifiers.alt, i.modifiers.shift, i.zoom_delta()));
+        let ctrl = ctrl || (cfg!(target_os = "macos") && zoom != 1.0);
         if !(scroll != 0.0 || (ctrl && zoom != 1.0)) || alt {
             return;
         }

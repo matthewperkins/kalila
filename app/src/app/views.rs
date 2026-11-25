@@ -1,6 +1,9 @@
 //! Trace views: each is its own native window with its own channels, filter, CAR, scaling
 //! and sweep mode. The main window keeps the controls and the spike tiles.
 
+/// The key that scales and adds on this platform, as egui's `modifiers.command` reads it.
+pub(crate) const MOD: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+
 use super::*;
 use crate::config::{Slope, TraceViewSettings, TrigAlign, TrigSource, ViewCar};
 use crate::slope::{DEAD_S, SlopeParams, SlopeTrigger};
@@ -774,7 +777,7 @@ impl ViewsShared {
                         });
                     }
                     ui.end_row();
-                    ui.label("µV/row").on_hover_text("Each filter keeps its own range. Ctrl+wheel over a row scales that row alone, Ctrl+Shift+wheel its whole filter; setting a value here puts every row of that filter back on it");
+                    ui.label("µV/row").on_hover_text(format!("Each filter keeps its own range. {MOD}+wheel over a row scales that row alone, {MOD}+Shift+wheel its whole filter; setting a value here puts every row of that filter back on it"));
                     for f in ViewFilter::ALL {
                         let mut uv = d.uv(f);
                         if ui.add(egui::DragValue::new(&mut uv).range(10.0..=5000.0).speed(2.0)).changed() {
@@ -1143,7 +1146,7 @@ impl App {
                 self.dirty_cfg = Instant::now();
             }
             ui.add(egui::Slider::new(&mut self.cfg.display.max_fps, 30.0..=360.0).text("max fps"));
-            ui.small("Each window has its own channels, filter, CAR and scaling (control bar at its top). Click a channel label or spike tile to monitor it on audio; Ctrl+click adds/removes it from the mix. Scroll over traces to move rows; Ctrl+scroll to scale.");
+            ui.small(format!("Each window has its own channels, filter, CAR and scaling (control bar at its top). Click a channel label or spike tile to monitor it on audio; {MOD}+click adds/removes it from the mix. Scroll over traces to move rows; {MOD}+scroll to scale."));
         });
     }
 

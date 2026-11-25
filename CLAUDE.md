@@ -317,7 +317,15 @@ they are; platform code sits behind small `cfg` seams.
   48 kHz, latency 7 ms), the same with `present_mode` "vsync" and with the policy above, so
   neither the redraw rate (it free-runs at ~3000 fps with "auto") nor the feeder's
   priority. Not yet tried: the simulator's pacing sleep, the Core Audio callback sizes.
-- Still to do: the board sessions on the Mac, Cmd equivalents for the Ctrl gestures, a macOS CI job, an `.app`.
+- **Input** (2026-11-24): row scaling reads `modifiers.command` (Cmd on macOS, Ctrl on
+  Linux, where the two are the same flag), and on macOS a trackpad pinch scales too; the
+  help texts name the key through `views::MOD`. Checked on the Mac with a scripted
+  Cmd+wheel (one row scaled, "· per-row" shown); the pinch is not checked (the script
+  cannot make one). Ctrl+Space and Ctrl+R stay Ctrl on both (Cmd+Space is Spotlight).
+- **CI** (`.github/workflows/ci.yml`): build and test on `macos-latest` and
+  `ubuntu-latest` at every push to `main` and `macos-port`; both pass.
+- Still to do: the board sessions on the Mac, the display latency read-out from the
+  drawable's presented time, the audio underruns above, an `.app`.
 
 ## Trace windows (rig, 2026-11-06)
 
