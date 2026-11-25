@@ -1,0 +1,76 @@
+# Builds and tests the workspace on macOS (Apple silicon) and Linux on every push and pull
+# request, so neither port breaks silently. Build and tests only: no GUI is launched and no
+# board exists in CI. The Rust version matches packaging/ci-build.sh (RUST_VERSION).
+name: ci
+
+on:
+  push:
+    branches: [main, macos-port]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: 1.95.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+      - name: Build
+        run: cargo build --release --workspace
+      # engine's tests/simulation.rs takes about 135 s on macOS (it fsyncs a lot).
+      - name: Test
+        run: cargo test --release --workspace
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Same needs as packaging/ci-build.sh: ALSA and PipeWire headers (cpal), libclang
+      # (bindgen for the PipeWire bindings), a C compiler (liboni).
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libasound2-dev libpipewire-0.3-dev libclang-dev
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Test
+        run: cargo test --release --workspace
