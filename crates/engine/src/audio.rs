@@ -416,10 +416,8 @@ impl AudioMonitor {
             self.last_ctl = std::time::Instant::now();
             let minf = st.min_fill.swap(u32::MAX, Ordering::Relaxed);
             if minf != u32::MAX {
-                let margin = s.margin_ms as f64 * 1e-3 * self.fs_out;
-                let err = (minf as f64 - margin) / self.fs_out; // seconds of excess buffering
-                self.integ = (self.integ + err * 0.1).clamp(-0.05, 0.05);
-                let adj = (-(0.5 * err + 0.05 * self.integ)).clamp(-0.005, 0.005);
+                let margin_s = s.margin_ms as f64 * 1e-3;
+                let adj = drift_servo(&mut self.integ, minf as f64 / self.fs_out, margin_s);
                 self.resamp.adjust = adj;
                 st.ratio_ppm.store(((adj * 1e6) as i32) as u32, Ordering::Relaxed);
             }
@@ -457,6 +455,24 @@ impl AudioMonitor {
             unsafe { chunk.commit_all() };
         }
     }
+}
+
+/// One step (every 100 ms) of the clock-drift servo: from the smallest fill the device
+/// callback left in the last 100 ms (`min_fill_s`, seconds of audio) to the resampler's rate
+/// trim, which moves the fill towards `margin_s`.
+///
+/// Proportional plus integral. The integral is there for the steady difference between the
+/// board's clock and the sound card's, so it only accumulates while the fill is within one
+/// margin of its target. Away from it (the backlog at start-up, after a stall) the
+/// proportional term alone brings the fill back: integrating there wound the integral up,
+/// which then held the fill at empty, underrunning, for the half minute it took to unwind
+/// (seen on macOS, where the device starts ~200 ms late: 50 underruns in the first 12 s).
+fn drift_servo(integ: &mut f64, min_fill_s: f64, margin_s: f64) -> f64 {
+    let err = min_fill_s - margin_s; // seconds of excess buffering
+    if err.abs() <= margin_s {
+        *integ = (*integ + err * 0.1).clamp(-0.05, 0.05);
+    }
+    (-(0.5 * err + 0.05 * *integ)).clamp(-0.005, 0.005)
 }
 
 /// Exactly linear below `LIMIT_KNEE` (spikes sit at ~0.05–0.4 FS and are untouched);
@@ -563,6 +579,44 @@ impl Default for SincResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ring's smallest fill under the servo, stepped every 100 ms: the trim and the
+    /// clocks' difference (`drift`, as a rate) fill or empty it; it cannot go below empty.
+    /// Returns the fills seen, in seconds.
+    fn run_servo(start_fill_s: f64, margin_s: f64, drift: f64, seconds: f64) -> Vec<f64> {
+        let (mut integ, mut fill) = (0.0, start_fill_s);
+        (0..(seconds * 10.0) as usize)
+            .map(|_| {
+                let adj = drift_servo(&mut integ, fill, margin_s);
+                fill = (fill + 0.1 * (adj + drift)).max(0.0);
+                fill
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_servo_does_not_empty_the_ring_after_a_start_up_backlog() {
+        // 16 ms of backlog at the start (the device starts late), margin 1.5 ms.
+        let margin = 1.5e-3;
+        for drift in [0.0, 300e-6, -300e-6] {
+            let fills = run_servo(16e-3, margin, drift, 120.0);
+            let low = fills.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(low > 0.5 * margin, "drift {drift}: the fill fell to {:.2} ms", low * 1e3);
+            // Back near the margin within 15 s, and it stays there.
+            for f in &fills[150..] {
+                assert!((f - margin).abs() < 0.5 * margin, "drift {drift}: fill {:.2} ms after 15 s", f * 1e3);
+            }
+            // The steady difference between the clocks is left to the integral.
+            assert!((fills.last().unwrap() - margin).abs() < 0.05 * margin, "drift {drift}: ends at {:.3} ms", fills.last().unwrap() * 1e3);
+        }
+    }
+
+    #[test]
+    fn the_servo_recovers_from_an_empty_ring() {
+        let margin = 1.5e-3;
+        let fills = run_servo(0.0, margin, -200e-6, 60.0);
+        assert!((fills.last().unwrap() - margin).abs() < 0.05 * margin, "ends at {:.3} ms", fills.last().unwrap() * 1e3);
+    }
     use std::f64::consts::PI;
 
     fn tone_gain(f: f64) -> f64 {

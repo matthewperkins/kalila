@@ -313,10 +313,22 @@ they are; platform code sits behind small `cfg` seams.
   figures: period 1 ms, computation 0.5 ms, constraint 1 ms, preemptible), so the status
   chip reads RT; `KeepAwake` holds a `PreventUserIdleSystemSleep` assertion for the
   acquisition thread's lifetime (seen in `pmset -g assertions`).
-- **Open: audio underruns on the simulator**, about 2 per second (45 in 19 s, buffer 128 at
-  48 kHz, latency 7 ms), the same with `present_mode` "vsync" and with the policy above, so
-  neither the redraw rate (it free-runs at ~3000 fps with "auto") nor the feeder's
-  priority. Not yet tried: the simulator's pacing sleep, the Core Audio callback sizes.
+- **Audio underruns at start: the drift servo's integral wound up** (fixed 2026-11-24,
+  `audio::drift_servo`, shared with Linux). Core Audio starts the device ~200 ms late, so
+  the ring begins with a backlog; the servo integrated all the way down from it, and the
+  wound-up integral then held the fill at empty for the ~30 s it took to unwind: 50
+  underruns in the first 12 s, none in the 60 s after. The integral now accumulates only
+  while the fill is within one margin of its target; elsewhere the proportional term works
+  alone. With that: 0 underruns in 40 s on the simulator, latency 7.9 ms, trim settling at
+  ~0 ppm. Tests model the ring (start-up backlog with ±300 ppm of clock difference, and an
+  empty ring); the first fails with the old rule.
+  - Ruled out on the way: the simulator's pacing sleep (at most 0.13 ms late under the
+    time-constraint policy), the callbacks' spacing (2.67 ms ± 0.07 for 128 frames), the
+    redraw rate (same with "vsync").
+  - Still there: ~50 "overruns" in the first second (the backlog guard dropping blocks
+    while the device starts), one audible skip at most.
+  - **Not yet heard on the rig.** Steady state is unchanged (the integral works as before
+    near the target), but the start of acquisition there should be listened to once.
 - **Input** (2026-11-24): row scaling reads `modifiers.command` (Cmd on macOS, Ctrl on
   Linux, where the two are the same flag), and on macOS a trackpad pinch scales too; the
   help texts name the key through `views::MOD`. Checked on the Mac with a scripted
@@ -325,7 +337,7 @@ they are; platform code sits behind small `cfg` seams.
 - **CI** (`.github/workflows/ci.yml`): build and test on `macos-latest` and
   `ubuntu-latest` at every push to `main` and `macos-port`; both pass.
 - Still to do: the board sessions on the Mac, the display latency read-out from the
-  drawable's presented time, the audio underruns above, an `.app`.
+  drawable's presented time, an `.app`.
 
 ## Trace windows (rig, 2026-11-06)
 
