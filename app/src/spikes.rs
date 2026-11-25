@@ -21,6 +21,8 @@ struct U {
     tau: f32,
     thickness: f32,
 }
+// Size of `U` in spikes.wgsl (uniform layout rules).
+const _: () = assert!(size_of::<U>() == 48);
 
 pub struct SpikeFrame {
     pub nch: usize,

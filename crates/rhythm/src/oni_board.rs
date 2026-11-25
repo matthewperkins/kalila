@@ -54,11 +54,7 @@ const MAX_STREAMS: usize = 16;
 const INIT_STEP: usize = 64;
 const MEMORY_MONITOR_FS: u32 = 100;
 use crate::parser::{ADC_BIT_VOLTS, RHD2000_MAGIC};
-
-pub const CHIP_ID_RHD2132: i32 = 1;
-pub const CHIP_ID_RHD2216: i32 = 2;
-pub const CHIP_ID_RHD2164: i32 = 4;
-pub use crate::parser::CHIP_ID_RHD2164_B;
+pub use crate::types::{CHIP_ID_RHD2132, CHIP_ID_RHD2164, CHIP_ID_RHD2164_B, CHIP_ID_RHD2216};
 const REGISTER_59_MISO_A: i32 = 53;
 const DEVICE_ID_V3: u32 = 0x0102;
 const BNO_CHANNELS: usize = 18;
@@ -83,8 +79,6 @@ const BNO_BIT_VOLTS: [f32; BNO_CHANNELS] = [
     1.0,
     1.0,
 ];
-
-const HS_NAMES: [&str; 8] = ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuxSlot {
@@ -926,7 +920,7 @@ impl OniBoard {
                 }
                 info!(
                     "headstage {} found: {} ({} ch)",
-                    HS_NAMES[hs],
+                    HEADSTAGE_SLOTS[hs],
                     chip_name(tmp_chip[hs]),
                     self.headstages[hs].num_channels()
                 );
@@ -1113,7 +1107,7 @@ impl Board for OniBoard {
             }
             let idx = headstages.len();
             headstages.push(HeadstageInfo {
-                name: HS_NAMES[hs].into(),
+                name: HEADSTAGE_SLOTS[hs].into(),
                 slot: hs,
                 port: hs / 2,
                 chip: chip_name(h.chip_id).into(),

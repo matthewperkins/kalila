@@ -15,7 +15,7 @@
 //
 // Per-channel `chinfo` = (gain, flags, units_per_row, center):
 //   gain          physical units per int16 LSB (µV for electrodes, V for AUX/ADC)
-//   flags         bits 3-4: display filter (0 raw, 1 the view's band; AUX/ADC raw)
+//   flags         bit 3: display filter (0 raw, 1 the view's band; AUX/ADC raw)
 //                 bit 1: part of the CAR reference; bit 2: subtract the CAR
 //   units_per_row 0 = use the global µV/row; otherwise this channel's own row range
 //   center        value drawn at the row's centre line
@@ -27,16 +27,18 @@ struct Ingest {
     window: u32,
     cols: u32,
     pos0: u32,
-    nsec: u32,
     ring0: u32, // ring position of the first new sample
     ring: u32,  // ring length in samples; 0 = no ring (free-running)
     car: u32,   // 1 = apply the CAR (flags bits 1/2)
+    fsec: vec2<u32>,            // per filter (0 raw, 1 band): first section | count << 8
     _p0: u32,
     _p1: u32,
-    _p2: u32,
-    fsec: vec4<u32>,            // per preset: first section | count << 8
     coef: array<vec4<f32>, 16>, // per section: (b0, b1, b2, 0), (a1, a2, 0, 0)
 };
+
+// Biquad sections one filter may use; two state values each. Mirrors `MAX_FILTER_SECTIONS` in
+// traces.rs (keep equal); the state array below holds 2 * this.
+const MAX_FILTER_SECTIONS: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> P: Ingest;
 @group(0) @binding(1) var<storage, read> raw: array<u32>;
@@ -66,14 +68,14 @@ fn filt(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let sb = ch * 12u;
-    var z: array<f32, 8>;
-    for (var k = 0u; k < 8u; k++) {
+    var z: array<f32, 2u * MAX_FILTER_SECTIONS>;
+    for (var k = 0u; k < 2u * MAX_FILTER_SECTIONS; k++) {
         z[k] = state[sb + k];
     }
-    // This channel's preset: a run of sections in the shared bank (at most 4, so 8 states).
-    let fs = P.fsec[(flags(ch) >> 3u) & 3u];
+    // This channel's filter: a run of sections in the shared bank (at most MAX_FILTER_SECTIONS, so 2 * that many states).
+    let fs = P.fsec[(flags(ch) >> 3u) & 1u];
     let s0 = fs & 0xffu;
-    let nsec = min(fs >> 8u, 4u);
+    let nsec = min(fs >> 8u, MAX_FILTER_SECTIONS);
     for (var i = 0u; i < P.n_new; i++) {
         var x = sample(i, ch);
         for (var s = 0u; s < nsec; s++) {
@@ -86,7 +88,7 @@ fn filt(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         F[i * P.nch + ch] = x;
     }
-    for (var k = 0u; k < 8u; k++) {
+    for (var k = 0u; k < 2u * MAX_FILTER_SECTIONS; k++) {
         state[sb + k] = z[k];
     }
 }

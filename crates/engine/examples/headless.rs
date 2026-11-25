@@ -15,7 +15,7 @@
 //! default). `--16ch` runs the RHD2132 in the given slots as 16-channel headstages. `--car`
 //! applies a common average reference (all electrodes) to spike detection and audio.
 use engine::{BoardChoice, Engine};
-use rhythm::BoardSettings;
+use rhythm::{BoardSettings, HEADSTAGE_SLOTS};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -39,9 +39,8 @@ fn main() -> anyhow::Result<()> {
         settings.leds = true;
     }
     if let Some(list) = opt("--16ch") {
-        const SLOTS: [&str; 8] = ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"];
         for name in list.split(',') {
-            let slot = SLOTS.iter().position(|s| s.eq_ignore_ascii_case(name.trim()));
+            let slot = HEADSTAGE_SLOTS.iter().position(|s| s.eq_ignore_ascii_case(name.trim()));
             settings.rhd2132_16ch
                 [slot.ok_or_else(|| anyhow::anyhow!("--16ch: unknown headstage slot {name:?} (use A1..D2)"))?] = true;
         }

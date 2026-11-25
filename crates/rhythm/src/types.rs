@@ -6,6 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const ELECTRODE_UV_PER_BIT: f32 = 0.195;
 /// Volts per bit for RHD2000 auxiliary inputs (V).
 pub const AUX_V_PER_BIT: f32 = 0.0000374;
+/// Headstage slot names, in slot order (slot 0 = A1), as the board and the tools name them.
+pub const HEADSTAGE_SLOTS: [&str; 8] = ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"];
+/// Intan chip IDs as the ONI board reports them.
+pub const CHIP_ID_RHD2132: i32 = 1;
+pub const CHIP_ID_RHD2216: i32 = 2;
+pub const CHIP_ID_RHD2164: i32 = 4;
+/// Stream ID for the second half of an RHD2164 (not a chip ID the board reports).
+pub const CHIP_ID_RHD2164_B: i32 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChannelKind {

@@ -10,3 +10,6 @@ ft600 = { path = "../ft600" }
 anyhow.workspace = true
 log.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

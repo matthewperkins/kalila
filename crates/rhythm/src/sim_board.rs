@@ -1,5 +1,6 @@
 //! Real-time simulated acquisition board producing plausible extracellular data.
 
+use crate::parser::ADC_BIT_VOLTS;
 use crate::types::*;
 use anyhow::Result;
 use std::f64::consts::PI;
@@ -204,7 +205,7 @@ impl SimBoard {
         if self.settings.acquire_adc {
             for k in 0..8 {
                 let v = if k == 0 { 2.5 * (2.0 * PI * t).sin() } else { 0.0 };
-                blk.data.push((v / 0.00015258789) as i16);
+                blk.data.push((v / ADC_BIT_VOLTS) as i16);
             }
         }
         // TTL line 0: 10 ms pulse every second; line 1: square wave 2 Hz.
@@ -230,7 +231,7 @@ impl Board for SimBoard {
         for (i, &raw) in self.headstage_channels.iter().enumerate() {
             let n = self.hs_channels(i);
             headstages.push(HeadstageInfo {
-                name: ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"][i % 8].into(),
+                name: HEADSTAGE_SLOTS[i % 8].into(),
                 slot: i % 8,
                 port: i / 2,
                 chip: if raw == 64 { "RHD2164" } else { "RHD2132" }.into(),
@@ -265,7 +266,7 @@ impl Board for SimBoard {
                 channels.push(ChannelInfo {
                     name: format!("ADC{}", i + 1),
                     kind: ChannelKind::Adc,
-                    bit_volts: 0.00015258789,
+                    bit_volts: ADC_BIT_VOLTS as f32,
                     units: "V".into(),
                     headstage: None,
                 });

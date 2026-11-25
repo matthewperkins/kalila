@@ -6,11 +6,10 @@
 //! ```
 //! (`[a][b]` = outer a, inner b, i.e. stream index varies fastest.)
 
-use crate::types::{Block, Health};
+use crate::types::{Block, CHIP_ID_RHD2132, CHIP_ID_RHD2164_B, Health};
 use std::sync::atomic::Ordering;
 
 pub const RHD2000_MAGIC: u64 = 0xc691199927021942;
-pub const CHIP_ID_RHD2164_B: i32 = 1000;
 pub const ADC_BIT_VOLTS: f64 = 0.00015258789;
 /// First chip channel recorded from an RHD2132 used as a 16-channel headstage (stock
 /// plugin: `RHD2132_16CH_OFFSET`). Such headstages wire chip channels 8–23.
@@ -19,7 +18,7 @@ pub const RHD2132_16CH_OFFSET: usize = 8;
 /// First chip channel read from a stream: 8 for an RHD2132 in 16-channel mode, else 0.
 /// Same rule as the stock plugin (`chipId == RHD2132 && nChans == 16`).
 pub fn first_chip_channel(chip_id: i32, channels: usize) -> usize {
-    if chip_id == crate::oni_board::CHIP_ID_RHD2132 && channels == 16 {
+    if chip_id == CHIP_ID_RHD2132 && channels == 16 {
         RHD2132_16CH_OFFSET
     } else {
         0
@@ -244,8 +243,10 @@ mod tests {
         // Three streams: RHD2132 (32ch), RHD2164 A+B (32+32).
         let mut p = RhythmParser::new(vec![32, 32, 32], vec![1, 4, CHIP_ID_RHD2164_B], false, true, false);
         let h = Health::default();
-        let mut b = Block::default();
-        b.num_channels = p.num_channels();
+        let mut b = Block {
+            num_channels: p.num_channels(),
+            ..Default::default()
+        };
         let d = encode_payload(3, 7, |_, _| 0, amp_val, [0, 32768, 65535, 0, 0, 0, 0, 0], 0b1010_0101);
         assert_eq!(d.len(), p.payload_len());
         assert!(matches!(p.parse(&d, 0.0, &mut b, &h), ParseResult::Appended));
@@ -287,8 +288,10 @@ mod tests {
     fn aux_sample_and_hold_skips_2164b() {
         let mut p = RhythmParser::new(vec![32, 32], vec![4, CHIP_ID_RHD2164_B], true, false, false);
         let h = Health::default();
-        let mut b = Block::default();
-        b.num_channels = p.num_channels();
+        let mut b = Block {
+            num_channels: p.num_channels(),
+            ..Default::default()
+        };
         // counters 1,2,3 carry aux 0,1,2 (aux_num = (c+3)%4), counter 4 latches them.
         for c in 1..=4u32 {
             let d = encode_payload(
