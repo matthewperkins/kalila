@@ -123,6 +123,12 @@ pub struct App {
     close_refused: Option<Instant>,
     /// SIGTERM/SIGINT arrived: the app is closing on purpose, so a recording does not refuse it.
     signal_quit: bool,
+    /// Stop was sent to the recorder, which has not closed the recording yet: notes finished
+    /// now would queue behind the Stop and be dropped, so they are not sent.
+    rec_stopping: bool,
+    /// First and newest sample of the current or last recording of this acquisition run
+    /// (`notes::route`: a note finished after its recording ended is told about).
+    rec_span: Option<(i64, i64)>,
     dirty_cfg: Instant,
     /// Wheel movement over the spike grid not yet turned into rows (`wheel_rows`).
     spike_scroll: f32,
@@ -206,6 +212,8 @@ impl App {
             toast: None,
             close_refused: None,
             signal_quit: false,
+            rec_stopping: false,
+            rec_span: None,
             dirty_cfg: Instant::now(),
             spike_scroll: 0.0,
             underrun_window: std::cell::Cell::new((Instant::now(), 0, 0)),
@@ -236,6 +244,39 @@ impl App {
 
     fn toast(&mut self, s: impl Into<String>) {
         self.toast = Some((s.into(), Instant::now()));
+    }
+
+    /// Before any Stop reaches the recorder: the note being typed, if its stamp lies inside the
+    /// recording, is finished as typed, and every finished note is sent now, ahead of the Stop
+    /// (the recorder's queue is in order; after the Stop its files are closed).
+    fn flush_notes_for_stop(&mut self) {
+        let open = self.engine.is_recording() && !self.rec_stopping;
+        let mut sh = self.shared.lock();
+        track_rec_span(&self.engine, &sh, &mut self.rec_span);
+        if open {
+            let first = sh.rec_source.as_ref().map(|s| s.first_sample);
+            let now = sh.now_sample();
+            sh.notes.close_for_stop(first, now);
+        }
+        let told = deliver_notes(&self.engine, &mut sh, open, self.rec_span);
+        drop(sh);
+        for m in told {
+            self.toast(m);
+        }
+    }
+
+    /// Stops the recording (after the notes), keeping acquisition.
+    fn stop_recording_now(&mut self) {
+        self.flush_notes_for_stop();
+        self.rec_stopping = self.engine.is_recording();
+        self.engine.stop_recording();
+    }
+
+    /// Stops acquisition, which ends a recording too (after the notes).
+    fn stop_acquisition_now(&mut self) {
+        self.flush_notes_for_stop();
+        self.rec_stopping = self.engine.is_recording();
+        self.engine.stop_acquisition();
     }
 
     fn save_cfg(&mut self) {
@@ -367,7 +408,7 @@ impl App {
                 if recording {
                     self.confirm_stop = true;
                 } else {
-                    self.engine.stop_acquisition();
+                    self.stop_acquisition_now();
                 }
             }
             let rec_btn = if recording {
@@ -382,8 +423,9 @@ impl App {
                 || (rec_ok && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::R)))
             {
                 if recording {
-                    self.engine.stop_recording();
+                    self.stop_recording_now();
                 } else {
+                    self.rec_stopping = false;
                     *self.engine.rec_status.root.lock() = self.cfg.record_root.clone();
                     self.engine.start_recording();
                 }
@@ -724,7 +766,7 @@ impl App {
                 if ui.add_enabled(editable && changed, egui::Button::new(label)).clicked() {
                     if acquiring {
                         // Restarted when the board comes back from the apply (see `ui`).
-                        self.engine.stop_acquisition();
+                        self.stop_acquisition_now();
                         self.autostart = true;
                     }
                     self.cfg.board = self.edit_board.clone();
@@ -1268,6 +1310,53 @@ impl App {
     }
 }
 
+/// Keeps `span` at the first and newest sample of the recording being written.
+fn track_rec_span(engine: &Engine, sh: &ViewsShared, span: &mut Option<(i64, i64)>) {
+    if engine.is_recording()
+        && let (Some(src), Some(now)) = (sh.rec_source.as_ref(), sh.now_sample())
+    {
+        *span = Some((src.first_sample, now.max(src.first_sample)));
+    }
+}
+
+/// Sends the finished notes where `notes::route` says: into the open recording, and every one
+/// into the notes log. Returns the messages for notes that lie inside a recording that has
+/// already ended and so went only to the log.
+fn deliver_notes(engine: &Engine, sh: &mut ViewsShared, open: bool, span: Option<(i64, i64)>) -> Vec<String> {
+    use crate::notes::{Route, route};
+    let mut told = Vec::new();
+    for f in std::mem::take(&mut sh.notes.out) {
+        let r = route(f.note.sample, open, span);
+        let when = sh.note_time(f.note.sample);
+        let dir = engine
+            .rec_status
+            .current_dir
+            .lock()
+            .clone()
+            .filter(|_| r != Route::LogOnly);
+        log::info!(
+            "note at sample {} ({when}){}: {}",
+            f.note.sample,
+            match r {
+                Route::Recorder => "",
+                Route::LogOnly => ", not recording",
+                Route::LostFromRecording => ", after its recording ended",
+            },
+            f.note.text
+        );
+        append_notes_log(f.note.sample, &when, dir.as_deref(), &f.note.text);
+        match r {
+            Route::Recorder => engine.record_message(f.note.sample, f.note.text, f.keys),
+            Route::LogOnly => {}
+            Route::LostFromRecording => told.push(format!(
+                "Note at {when} is inside the recording that ended, so it is only in notes.log: {}",
+                f.note.text
+            )),
+        }
+    }
+    told
+}
+
 /// Every note also goes to `$XDG_STATE_HOME/kalila/notes.log` (default `~/.local/state`) (tab-separated: local time, sample,
 /// time, recording folder or "-", text), so notes typed while not recording are kept too.
 fn append_notes_log(sample: i64, when: &str, dir: Option<&std::path::Path>, text: &str) {
@@ -1312,7 +1401,7 @@ impl eframe::App for App {
                 engine::signals::name()
             );
             self.signal_quit = true;
-            self.engine.stop_recording();
+            self.stop_recording_now();
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
         }
         let was_board = self.engine.has_board();
@@ -1347,6 +1436,12 @@ impl eframe::App for App {
         } else {
             self.sync_outputs(false);
         }
+        if acquiring && !self.was_acquiring {
+            self.rec_span = None;
+        }
+        if !self.engine.is_recording() {
+            self.rec_stopping = false;
+        }
         self.was_acquiring = acquiring;
         self.sync_car();
         self.drain();
@@ -1359,30 +1454,18 @@ impl eframe::App for App {
             if std::mem::take(&mut sh.dirty) || std::mem::take(&mut sh.notes.changed) {
                 self.dirty_cfg = Instant::now();
             }
-            // Finished notes: into the recording (if recording) and always into the notes log.
-            let done = std::mem::take(&mut sh.notes.out);
-            if !done.is_empty() {
-                let recording = self.engine.is_recording();
-                let dir = self.engine.rec_status.current_dir.lock().clone().filter(|_| recording);
-                for f in done {
-                    let when = sh.note_time(f.note.sample);
-                    log::info!(
-                        "note at sample {} ({when}){}: {}",
-                        f.note.sample,
-                        if recording { "" } else { ", not recording" },
-                        f.note.text
-                    );
-                    append_notes_log(f.note.sample, &when, dir.as_deref(), &f.note.text);
-                    if recording {
-                        self.engine.record_message(f.note.sample, f.note.text, f.keys);
-                    }
-                }
-            }
+            // Finished notes: into the recording (decided by the stamp), always into the notes log.
+            let open = self.engine.is_recording() && !self.rec_stopping;
+            track_rec_span(&self.engine, &sh, &mut self.rec_span);
+            let told = deliver_notes(&self.engine, &mut sh, open, self.rec_span);
             let removed = std::mem::take(&mut sh.removed);
             if self.colors_dirty {
                 sh.colors_changed();
             }
             drop(sh);
+            for m in told {
+                self.toast(m);
+            }
             if let Some(g) = self
                 .render_state
                 .renderer
@@ -1499,9 +1582,9 @@ impl eframe::App for App {
                         .button(RichText::new("Stop recording and acquisition").color(Color32::from_rgb(240, 90, 80)))
                         .clicked()
                     {
-                        self.engine.stop_recording();
+                        self.stop_recording_now();
                         std::thread::sleep(Duration::from_millis(50));
-                        self.engine.stop_acquisition();
+                        self.stop_acquisition_now();
                         self.confirm_stop = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1524,7 +1607,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        self.engine.stop_recording();
+        self.stop_recording_now();
         // Let the recorder drain its queue and finalise the files before acquisition stops
         // and the process exits.
         let t0 = Instant::now();

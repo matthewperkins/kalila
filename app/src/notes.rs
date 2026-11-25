@@ -52,6 +52,31 @@ pub struct Notes {
     pub changed: bool,
 }
 
+/// Where a finished note goes (see `route`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// Into the open recording (and the notes log).
+    Recorder,
+    /// Only the notes log: no recording holds its stamp.
+    LogOnly,
+    /// Only the notes log, although a recording that has ended holds its stamp. The recorder
+    /// closes its files at Stop, so the note can no longer be added; the user is told.
+    LostFromRecording,
+}
+
+/// Decides by the note's stamp. `open`: a recording is open and not being stopped. `span`:
+/// the first and newest sample of the current or last recording of this acquisition run.
+/// A note stamped before the open recording's first sample is still written (as always).
+pub fn route(stamp: i64, open: bool, span: Option<(i64, i64)>) -> Route {
+    if open {
+        Route::Recorder
+    } else if span.is_some_and(|(first, last)| stamp >= first && stamp <= last) {
+        Route::LostFromRecording
+    } else {
+        Route::LogOnly
+    }
+}
+
 const PRESET_KEYS: [Key; 9] = [
     Key::Num1,
     Key::Num2,
@@ -90,6 +115,27 @@ impl Notes {
         self.say(format!("Note: {}", note.text));
         self.notes.push(note.clone());
         self.out.push(Finished { note, keys });
+    }
+
+    /// A recording is about to stop: finish the open note if its stamp lies inside the
+    /// recording (`rec_first` = the recording's first sample), as typed so far, so that it
+    /// can still be sent before the stop message. The note box closes; the keystroke log
+    /// ends the note with `<rec-stop>`. A note opened before the recording started stays open
+    /// (its stamp is outside it). Returns whether a note was finished or discarded.
+    pub fn close_for_stop(&mut self, rec_first: Option<i64>, now: Option<i64>) -> bool {
+        let Some(first) = rec_first else { return false };
+        if self.compose.as_ref().is_none_or(|c| c.sample < first) {
+            return false;
+        }
+        let mut c = self.compose.take().unwrap();
+        c.keys.push((now.unwrap_or(c.sample), "<rec-stop>".into()));
+        let text = c.text.trim().to_string();
+        if text.is_empty() {
+            self.say("Empty note discarded".into());
+        } else {
+            self.finish(Note { sample: c.sample, text }, c.keys);
+        }
+        true
     }
 
     /// Handle one window's input for this frame. `typing` = a text box there has focus;
@@ -347,5 +393,81 @@ mod tests {
         assert!(n.compose.is_none());
         n.handle(&mut vec![text("/")], false, None);
         assert!(n.compose.is_none() && n.flash.is_some());
+    }
+
+    #[test]
+    fn route_goes_by_the_stamp() {
+        let span = Some((1000, 5000));
+        // Finished while the recording is open: written, whatever the stamp.
+        assert_eq!(route(3000, true, span), Route::Recorder);
+        assert_eq!(route(500, true, span), Route::Recorder, "opened before the recording");
+        // Opened during the recording, finished after it ended: told, not silent.
+        assert_eq!(route(3000, false, span), Route::LostFromRecording);
+        assert_eq!(route(1000, false, span), Route::LostFromRecording);
+        assert_eq!(route(5000, false, span), Route::LostFromRecording);
+        // Outside the recording, or no recording this run.
+        assert_eq!(route(500, false, span), Route::LogOnly);
+        assert_eq!(route(5001, false, span), Route::LogOnly);
+        assert_eq!(route(3000, false, None), Route::LogOnly);
+    }
+
+    #[test]
+    fn stop_finishes_the_open_note_as_typed() {
+        let mut n = Notes::new(&NotesSettings::default());
+        n.handle(&mut vec![text("/")], false, Some(2000));
+        n.handle(&mut vec![text("drin")], false, Some(2100));
+        assert!(n.close_for_stop(Some(1000), Some(2200)));
+        assert!(n.compose.is_none());
+        let f = &n.out[0];
+        assert_eq!(
+            f.note,
+            Note {
+                sample: 2000,
+                text: "drin".into()
+            }
+        );
+        assert_eq!(f.keys.last(), Some(&(2200, "<rec-stop>".to_string())));
+        assert_eq!(n.notes.len(), 1);
+    }
+
+    #[test]
+    fn stop_discards_an_empty_note_and_spares_one_from_before_the_recording() {
+        let mut n = Notes::new(&NotesSettings::default());
+        n.handle(&mut vec![text("/")], false, Some(2000));
+        assert!(n.close_for_stop(Some(1000), Some(2100)));
+        assert!(n.compose.is_none() && n.out.is_empty());
+        // Opened before the recording's first sample: stays open.
+        n.handle(&mut vec![text("/")], false, Some(500));
+        n.handle(&mut vec![text("x")], false, Some(600));
+        assert!(!n.close_for_stop(Some(1000), Some(2100)));
+        assert!(n.compose.is_some() && n.out.is_empty());
+        // No recording source yet, or no note open: nothing.
+        assert!(!n.close_for_stop(None, Some(2100)));
+        let mut m = Notes::new(&NotesSettings::default());
+        assert!(!m.close_for_stop(Some(0), Some(1)));
+    }
+
+    #[test]
+    fn preset_and_draft_stamps_route_by_their_stamp() {
+        let mut n = Notes::new(&NotesSettings {
+            presets: vec!["drinking".into()],
+            drafts: vec!["laser".into()],
+        });
+        n.handle(&mut vec![text("1")], false, Some(4900));
+        n.handle(&mut vec![text("`")], false, Some(4950));
+        assert_eq!(n.out.len(), 2);
+        let span = Some((1000, 5000));
+        // Waiting in `out` when the recording stops: sent while it is still open.
+        assert!(
+            n.out
+                .iter()
+                .all(|f| route(f.note.sample, true, span) == Route::Recorder)
+        );
+        // Had they been finished after it: told.
+        assert!(
+            n.out
+                .iter()
+                .all(|f| route(f.note.sample, false, span) == Route::LostFromRecording)
+        );
     }
 }
