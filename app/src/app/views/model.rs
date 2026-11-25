@@ -89,8 +89,14 @@ pub(super) fn car_applies(d: &TraceViewSettings, used: &[ViewFilter]) -> bool {
     d.car.enabled && used.contains(&ViewFilter::Band)
 }
 
-/// Set channels' filters (a row chip); if that leaves one filter for every drawn electrode,
-/// it becomes the view's filter again and the per-channel entries go.
+/// Set channels' filters (a row chip, or the palette's "all rows" with every drawn electrode in
+/// `chans`). Only the filters of `chans` change: every other electrode of the layout, drawn or
+/// not, keeps the filter it has now, and entries whose electrode is not in the layout (an
+/// unplugged headstage) are not touched. Within that, the settings are kept as small as
+/// possible: the window default becomes whichever filter leaves fewer per-channel entries
+/// (on a tie, the one the drawn rows all share, else the current one), and an entry equal to
+/// the default is not stored. Nothing reads an entry that equals the default: `filter_of`
+/// gives the same answer without it.
 pub(super) fn set_row_filter(
     l: &StreamLayout,
     d: &mut TraceViewSettings,
@@ -98,15 +104,33 @@ pub(super) fn set_row_filter(
     f: ViewFilter,
     row_ch: &[u32],
 ) {
-    for &c in chans {
-        if let Some(k) = chan_key(l, c) {
-            d.channel_filter.insert(k, f);
-        }
+    let keys = ChanKeys::new(l);
+    let before = chan_filters(l, d);
+    // What every electrode of the layout should be after the edit.
+    let want: Vec<(usize, &str, ViewFilter)> = (0..l.num_channels())
+        .filter_map(|c| {
+            keys.get(c)
+                .map(|k| (c, k, if chans.contains(&c) { f } else { before[c] }))
+        })
+        .collect();
+    let entries_for = |base: ViewFilter| want.iter().filter(|(_, _, w)| *w != base).count();
+    let other = match d.filter {
+        ViewFilter::Raw => ViewFilter::Band,
+        ViewFilter::Band => ViewFilter::Raw,
+    };
+    let mut shown = row_ch
+        .iter()
+        .filter_map(|&c| want.iter().find(|(i, _, _)| *i == c as usize).map(|w| w.2));
+    let drawn = shown.next().filter(|first| shown.all(|w| w == *first));
+    let (keep, flip) = (entries_for(d.filter), entries_for(other));
+    if flip < keep || (flip == keep && drawn == Some(other)) {
+        d.filter = other;
     }
-    let used = used_filters(l, &chan_filters(l, d), row_ch);
-    if let [only] = used[..] {
-        d.filter = only;
-        d.channel_filter.clear();
+    d.channel_filter.retain(|k, _| !want.iter().any(|(_, wk, _)| wk == k));
+    for (_, k, w) in want {
+        if w != d.filter {
+            d.channel_filter.insert(k.to_string(), w);
+        }
     }
 }
 
@@ -728,15 +752,116 @@ mod tests {
         set_row_filter(&l, &mut d, &[0], Band, &[]);
         assert_eq!((d.filter, entries(&d)), (Raw, vec![e("A1:0", Band), e("A1:2", Band)]));
 
-        // DOUBTFUL (pinned, not endorsed): the collapse looks only at the rows drawn. In a
-        // B1-only window, setting all of B1 to Raw makes Raw the window default and wipes every
-        // entry, so A1 channels that are not drawn (Band by the old default or by an entry) turn
-        // Raw too.
+        // A B1-only window: setting all of B1 to Raw must not turn the A1 channels (not drawn,
+        // Band) Raw. The two ways to store this cost 16 entries each; the default follows the
+        // drawn rows (Raw) and A1 gets explicit Band entries, the redundant "A1:0" included.
         let b1: Vec<u32> = (16..32).collect();
+        let b1c: Vec<usize> = (16..32).collect();
         let mut d = with_filters(Band, &[("A1:0", Band)]);
-        set_row_filter(&l, &mut d, &(16..32).collect::<Vec<_>>(), Raw, &b1);
-        assert_eq!((d.filter, entries(&d)), (Raw, vec![]));
-        assert_eq!(chan_filters(&l, &d)[0], Raw);
+        set_row_filter(&l, &mut d, &b1c, Raw, &b1);
+        let mut a1_band: Vec<_> = (0..16).map(|i| e(&format!("A1:{i}"), Band)).collect();
+        a1_band.sort();
+        assert_eq!((d.filter, entries(&d)), (Raw, a1_band));
+        assert!(chan_filters(&l, &d)[..16].iter().all(|f| *f == Band));
+        assert!(chan_filters(&l, &d)[16..32].iter().all(|f| *f == Raw));
+        // And back to Band: everything is Band again, no entries left.
+        set_row_filter(&l, &mut d, &b1c, Band, &b1);
+        assert_eq!((d.filter, entries(&d)), (Band, vec![]));
+
+        // Switch the window to A1: its channels kept their filter (Band), B1's are Raw.
+        let mut d = with_filters(Band, &[]);
+        set_row_filter(&l, &mut d, &b1c, Raw, &b1);
+        let f = chan_filters(&l, &d);
+        assert_eq!((f[0], f[15], f[16], f[31]), (Band, Band, Raw, Raw));
+
+        // A headstage absent from the layout keeps its saved entries, whatever else happens;
+        // an entry equal to the default for a present channel is dropped.
+        let mut d = with_filters(Band, &[("C1:0", Raw), ("C1:5", Band), ("A1:1", Band)]);
+        set_row_filter(
+            &l,
+            &mut d,
+            &all.iter().map(|&c| c as usize).collect::<Vec<_>>(),
+            Raw,
+            &all,
+        );
+        assert_eq!((d.filter, entries(&d)), (Raw, vec![e("C1:0", Raw), e("C1:5", Band)]));
+
+        // One row, on a window that shows only A1: B1 is untouched.
+        let a1: Vec<u32> = (0..16).collect();
+        let mut d = with_filters(Raw, &[("B1:2", Band)]);
+        set_row_filter(&l, &mut d, &[4], Band, &a1);
+        assert_eq!((d.filter, entries(&d)), (Raw, vec![e("A1:4", Band), e("B1:2", Band)]));
+
+        // The palette's "all rows" is this function with every drawn electrode: the A1-only
+        // window set to Raw leaves B1 as it was.
+        let mut d = with_filters(Band, &[]);
+        set_row_filter(&l, &mut d, &(0..16).collect::<Vec<_>>(), Raw, &a1);
+        let f = chan_filters(&l, &d);
+        assert_eq!((f[0], f[16]), (Raw, Band));
+    }
+
+    /// For every edit of a small exhaustive set, the channels not edited keep their effective
+    /// filter (drawn or not), unknown electrodes' entries survive, and no stored entry equals
+    /// the default.
+    #[test]
+    fn set_row_filter_keeps_other_channels() {
+        use ViewFilter::{Band, Raw};
+        let l = rig();
+        let patterns: [&[(&str, ViewFilter)]; 6] = [
+            &[],
+            &[("A1:0", Raw)],
+            &[("A1:0", Band), ("B1:3", Raw)],
+            &[("B1:0", Raw), ("B1:1", Raw), ("A1:5", Band)],
+            &[("C1:0", Raw), ("C1:1", Band)],
+            &[("C1:0", Band), ("A1:15", Raw), ("B1:15", Raw), ("B1:99", Raw)],
+        ];
+        let unknown = |d: &TraceViewSettings| -> Vec<(String, ViewFilter)> {
+            let known: Vec<String> = (0..32).filter_map(|c| chan_key(&l, c)).collect();
+            d.channel_filter
+                .iter()
+                .filter(|(k, _)| !known.contains(k))
+                .map(|(k, f)| (k.clone(), *f))
+                .collect()
+        };
+        let mut cases = 0;
+        for sel in [&[][..], &["A1"], &["B1"]] {
+            for def in [Raw, Band] {
+                for over in patterns {
+                    for edit in 0..6 {
+                        for f in [Raw, Band] {
+                            let mut d = with_filters(def, over);
+                            d.headstages = names(sel);
+                            let (row_ch, _) = view_rows(&l, &d);
+                            let drawn: Vec<usize> = row_ch.iter().map(|&c| c as usize).filter(|&c| c < 32).collect();
+                            let chans: Vec<usize> = match edit {
+                                0 => drawn.clone(),
+                                1 => drawn.iter().take(1).copied().collect(),
+                                2 => drawn.iter().skip(3).take(2).copied().collect(),
+                                3 => vec![33], // AUX: no key
+                                4 => (0..32).collect(),
+                                _ => Vec::new(),
+                            };
+                            let before = chan_filters(&l, &d);
+                            let unknown_before = unknown(&d);
+                            set_row_filter(&l, &mut d, &chans, f, &row_ch);
+                            let after = chan_filters(&l, &d);
+                            let what = format!("{sel:?} {def:?} {over:?} edit {edit} {f:?}");
+                            for c in 0..46 {
+                                let want = if chans.contains(&c) && c < 32 { f } else { before[c] };
+                                assert_eq!(after[c], want, "channel {c}: {what}");
+                            }
+                            assert_eq!(unknown(&d), unknown_before, "{what}");
+                            for (k, v) in &d.channel_filter {
+                                let known = !unknown_before.iter().any(|(u, _)| u == k);
+                                assert!(!known || *v != d.filter, "redundant entry {k}: {what}");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 3 * 2 * 6 * 6 * 2);
     }
 
     fn info(d: &TraceViewSettings) -> Vec<[f32; 4]> {

@@ -700,13 +700,21 @@ impl ViewsShared {
                     ui.label("All channels");
                     for f in ViewFilter::ALL {
                         ui.vertical_centered(|ui| {
-                            let r = ui.selectable_label(!mixed && uniform == f, " all rows ").on_hover_text(format!("{} on every row (clears per-row choices)", d.filter_label(f)));
+                            let r = ui.selectable_label(!mixed && uniform == f, " all rows ").on_hover_text(format!("{} on every row drawn in this window", d.filter_label(f)));
                             if mixed && used.contains(&f) {
                                 hatch(ui.painter(), r.rect.shrink(1.0));
                             }
-                            if r.clicked() {
-                                d.filter = f;
-                                d.channel_filter.clear();
+                            if r.clicked()
+                                && let Some(l) = l.as_ref()
+                            {
+                                // Every drawn electrode; channels this window does not draw keep theirs.
+                                let (row_ch, _) = view_rows(l, d);
+                                let chans: Vec<usize> = row_ch
+                                    .iter()
+                                    .map(|&c| c as usize)
+                                    .filter(|&c| l.channels[c].kind == ChannelKind::Electrode)
+                                    .collect();
+                                set_row_filter(l, d, &chans, f, &row_ch);
                             }
                         });
                     }
