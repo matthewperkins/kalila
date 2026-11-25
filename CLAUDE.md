@@ -406,17 +406,17 @@ had its rig soak, listening check or Apply check yet** (list at the end).
 - **FT600 driver:** tested against a scripted chip behind `usbfs`'s entry points
   (`fake.rs`, golden transcripts of what is sent). A stream that moves nothing for 3 s is
   an error (`DATA_SILENCE`, `CONTROL_SILENCE`, `WRITE_SILENCE`); after a lost register
-  reply, register reads fail until reopen (`replies_lost`). **Still hangs:** liboni's
-  `_oni_pump_signal_type`/`_data` loop on a read error (`pack_size < 1`), so a board silent
-  during open, reset or a register acknowledgement is retried forever; the two-line fix in
-  vendored liboni is not made.
+  reply, register reads fail until reopen (`replies_lost`). liboni's
+  `_oni_pump_signal_type`/`_data` returned to their loop on a read error; a kalila patch
+  in `oni.c` now returns it (untested: nothing here goes through liboni with a fake).
 - **Board settings:** a failed `apply_settings` puts the old settings back and the next
   apply reprograms everything (`apply_plan`); `Board::settings_applied`; the GUI then keeps
   the edits, shows "Apply again" and refuses to acquire. The DAC threshold arithmetic is a
   tested function (it must divide by the f64 0.195, not the f32 constant).
 - **Outputs:** the panel owns TTL output mode, DAC high-pass and noise slicer
-  (`config::with_outputs` overlays them at open and Apply). An Outputs edit made while idle
-  still reaches the board about one frame after Start (`start` takes no settings). The
+  (`config::with_outputs` overlays them at open and Apply). Start with values the idle
+  board does not hold applies them first and starts when the board comes back
+  (`outputs_to_apply_before_start`; checked on the simulator). The
   analysis of why the board-side copy could not simply go is in the plan (3e) and in
   `~/dimna/docs/plans/from-kalila-live-output-settings.md`.
 - **Audio:** the callback owns its ring (no lock); no allocation per block; output

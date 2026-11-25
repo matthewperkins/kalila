@@ -4,6 +4,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+## 0.2.0 — 2026-11-25
+
+Hardening from a review of the whole tree. Tested without a board and on the simulator;
+**not yet run on an acquisition board** (0.1.0 is the release that has been).
+
+### Recording
+- `continuous.dat` is synced to disk every 5 s on Linux, so a power loss costs seconds.
+- SIGTERM and SIGINT (logout, `kill`, Ctrl+C) finalise an open recording, in `kalila` and
+  `kalila-headless`. A second signal kills.
+- A note being typed when a recording is stopped is saved as typed; a note that missed its
+  recording is reported.
+
+### Board
+- The FT600 driver gives up with an error when the board sends nothing for 3 s; it used to
+  retry forever. liboni's signal loops return a failed read instead of retrying.
+- A failed Apply no longer claims the new settings: the edits stay, the button reads
+  "Apply again", and acquisition is refused until an Apply succeeds.
+- The Outputs panel's TTL output mode, DAC high-pass and noise slicer are on the board from
+  open, Apply and Start on; a value edited while idle used to arrive a frame after Start.
+- Fixed: the USB interfaces were released twice when opening failed part way.
+
+### Display
+- Setting the filter of some rows no longer changes channels the window does not draw.
+- The Outputs panel draws the ♪ before a followed channel.
+
+### Audio
+- The output callback takes no lock, and the feed allocates nothing per block. The sound is
+  unchanged (bit-identical in a test).
+
+### Internals
+- `ARCHITECTURE.md`; the tree is formatted (`rustfmt.toml`) and CI checks format and clippy.
+- Tests: the driver against a scripted chip, a golden digest of the register lists, the
+  recorder's message sequences, the trace-window model, the review's decisions.
+
 ## 0.1.0 — 2026-11-25
 
 The first release. The program was called oers until 2026-11-13.
