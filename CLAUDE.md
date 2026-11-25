@@ -388,6 +388,55 @@ they are; platform code sits behind small `cfg` seams.
     user; a release (a `v*` tag on `main`, which `macos-port` is not merged into).
 - Still to do: the board sessions on the Mac.
 
+## Improvement plan, waves 1–3 (2026-11-25; not yet on the rig)
+
+`docs/plans/2026-11-25-improvements.md`, done by sub-agents in worktrees and merged by the
+main session; `ARCHITECTURE.md` is the map (threads, queues, invariants). Everything below
+is tested without a board and, where it draws, looked at on the simulator; **none of it has
+had its rig soak, listening check or Apply check yet** (list at the end).
+- **Tooling:** `rustfmt.toml` (120 columns, the tree is formatted), `rust-toolchain.toml`
+  (1.95.0), `[workspace.lints]`; CI checks format and clippy with warnings as errors.
+- **Recorder:** the acquisition thread parks for room instead of polling (`wait_for_room`;
+  the queue stays unbounded so Start/Stop/notes never block: a bounded channel was weighed
+  and rejected); `Recorder::on` with a message table test; `continuous.dat` is synced every
+  5 s on Linux (`SYNC_EVERY`; 10–21 ms per sync at 46 ch on the dev SSD); no `unsafe` left
+  in `record.rs`.
+- **Signals:** SIGTERM/SIGINT finalise an open recording (`engine::signals`; headless
+  tested, GUI checked on the simulator). A second signal kills.
+- **FT600 driver:** tested against a scripted chip behind `usbfs`'s entry points
+  (`fake.rs`, golden transcripts of what is sent). A stream that moves nothing for 3 s is
+  an error (`DATA_SILENCE`, `CONTROL_SILENCE`, `WRITE_SILENCE`); after a lost register
+  reply, register reads fail until reopen (`replies_lost`). **Still hangs:** liboni's
+  `_oni_pump_signal_type`/`_data` loop on a read error (`pack_size < 1`), so a board silent
+  during open, reset or a register acknowledgement is retried forever; the two-line fix in
+  vendored liboni is not made.
+- **Board settings:** a failed `apply_settings` puts the old settings back and the next
+  apply reprograms everything (`apply_plan`); `Board::settings_applied`; the GUI then keeps
+  the edits, shows "Apply again" and refuses to acquire. The DAC threshold arithmetic is a
+  tested function (it must divide by the f64 0.195, not the f32 constant).
+- **Outputs:** the panel owns TTL output mode, DAC high-pass and noise slicer
+  (`config::with_outputs` overlays them at open and Apply). An Outputs edit made while idle
+  still reaches the board about one frame after Start (`start` takes no settings). The
+  analysis of why the board-side copy could not simply go is in the plan (3e) and in
+  `~/dimna/docs/plans/from-kalila-live-output-settings.md`.
+- **Audio:** the callback owns its ring (no lock); no allocation per block; output
+  bit-identical to before (test).
+- **GUI structure:** one CAR sets editor; `review::plan` (table test; one doubtful append
+  onto a pyramid image pinned, not fixed); `views/model.rs` with table tests; `SpikeGrid`
+  and `Outputs` out of `App`; `plan_outputs` pins the live commands sent.
+- **Fixed on the way:** notes are sent ahead of every Stop (a note typed across a Stop is
+  saved as typed, `<rec-stop>` in the keystroke log); setting some rows' filter no longer
+  changes channels the window does not draw; a double USB interface release on a failed
+  open; the ♪ in the Outputs panel.
+- **Golden register test:** `rhythm::regdump::digest` against `testdata/regdump-digest.txt`
+  (regenerate only after checking against the stock plugin).
+- **Rig checks owed:** soak with recording (watch `bp` for a bump every 5 s); listen to the
+  audio (start, channel switch, mute); Apply in the GUI for rate, bandwidth, 16-ch, USB
+  block; Ctrl+C on a headless recording; each Outputs control, and idle edit → Apply →
+  values on the board before Start; power the board off while acquiring (error within
+  ~6 s, recording readable); unplug USB during Apply, then "Apply again".
+- UI scripts: `window kalila` matches every window; use `window Open Ephys` for the main one.
+
 ## Trace windows (rig, 2026-11-06)
 
 - **Layout.** The main window holds the controls and the spike grid. Traces live in separate

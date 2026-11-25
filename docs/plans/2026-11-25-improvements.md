@@ -11,6 +11,9 @@ The plan is split into packages sized for one sub-agent each. Each package names
 it owns, so packages in the same wave can run in parallel (in separate worktrees) without
 editing the same file.
 
+**Status, 2026-11-25:** waves 1–3 are done and merged (see CLAUDE.md, "Improvement plan,
+waves 1–3"); 3e ended as an analysis and a smaller change. Wave 4 and the rig checks remain.
+
 ## Rules for every sub-agent
 
 - Read `CLAUDE.md` first. Linux first, with a macOS port behind small `cfg` seams: code under
