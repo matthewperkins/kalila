@@ -9,8 +9,13 @@ use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use std::sync::Arc;
 
-/// Biquad sections in a view's filter bank (all presets together).
+/// Biquad sections in a view's filter bank (all filters together).
 pub const MAX_SECTIONS: usize = 8;
+/// Biquad sections one filter may use (the shader keeps two state values per section per
+/// channel). Mirrored by `MAX_FILTER_SECTIONS` in traces.wgsl; keep the two equal.
+const MAX_FILTER_SECTIONS: usize = 4;
+/// Display filters (`ViewFilter`), the length of the shader's `fsec`.
+const FILTERS: usize = crate::config::ViewFilter::ALL.len();
 /// Ring of filtered samples per channel for triggered sweeps (≈1.1 s at 30 kHz).
 pub const RING: u32 = 1 << 15;
 /// Triggers cut per frame at most (uniform array size in traces.wgsl).
@@ -24,14 +29,17 @@ struct IngestU {
     window: u32,
     cols: u32,
     pos0: u32,
-    nsec: u32,
     ring0: u32,
     ring: u32,
     car: u32,
-    _p: [u32; 3],
-    fsec: [u32; 4],
+    fsec: [u32; FILTERS],
+    _p: [u32; 2],
     coef: [[f32; 4]; 16],
 }
+// Sizes of the uniform structs, worked out from their WGSL twins (uniform layout rules).
+const _: () = assert!(size_of::<IngestU>() == 304);
+const _: () = assert!(size_of::<CutU>() == 288);
+const _: () = assert!(size_of::<RenderU>() == 80);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -83,13 +91,13 @@ pub struct TraceConfig {
 }
 
 /// Every display filter of a view in one table, so each channel can use its own
-/// (`chinfo` flag bits 3-4 pick the preset: 0 raw, 1 the view's band).
+/// (`chinfo` flag bit 3 picks the filter: 0 raw, 1 the view's band).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct FilterBank {
     /// b0 b1 b2 a1 a2
     pub sections: Vec<[f32; 5]>,
-    /// Per preset (`ViewFilter::index`): first section | count << 8.
-    pub fsec: [u32; 4],
+    /// Per filter (`ViewFilter::index`): first section | count << 8.
+    pub fsec: [u32; FILTERS],
 }
 
 impl FilterBank {
@@ -102,11 +110,14 @@ impl FilterBank {
                 ViewFilter::Band => band.sections(fs),
             };
             let start = b.sections.len();
-            let secs: Vec<[f32; 5]> = secs
-                .into_iter()
-                .take(4.min(MAX_SECTIONS - start))
-                .map(|q| [q.b0, q.b1, q.b2, q.a1, q.a2])
-                .collect();
+            // The bands are 4th-order Butterworth on each side (`BandSpec::order` is 4 in every
+            // caller): 2 sections a side, 4 at most; the whole bank then holds 4 of its 8.
+            assert!(
+                secs.len() <= MAX_FILTER_SECTIONS && start + secs.len() <= MAX_SECTIONS,
+                "filter needs {} sections, at most {MAX_FILTER_SECTIONS} per filter and {MAX_SECTIONS} per bank",
+                secs.len()
+            );
+            let secs: Vec<[f32; 5]> = secs.into_iter().map(|q| [q.b0, q.b1, q.b2, q.a1, q.a2]).collect();
             b.fsec[f.index()] = start as u32 | (secs.len() as u32) << 8;
             b.sections.extend(secs);
         }
@@ -170,7 +181,7 @@ pub struct TraceFrame {
     pub thickness_px: f32,
     pub colors: Option<Arc<Vec<[f32; 4]>>>,
     pub order: Option<Arc<Vec<u32>>>,
-    /// Per-channel (gain, flags incl. filter preset, units_per_row or 0 for global µV/row, center); see traces.wgsl.
+    /// Per-channel (gain, flags incl. filter, units_per_row or 0 for global µV/row, center); see traces.wgsl.
     pub chinfo: Option<Arc<Vec<[f32; 4]>>>,
     /// Per-row (first index into `order`, channel count).
     pub rowtab: Option<Arc<Vec<[u32; 2]>>>,
@@ -559,7 +570,7 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
             let bytes: &[u8] =
                 bytemuck::cast_slice(&f.upload[f.upload_off..f.upload_off + f.n_new as usize * f.config.nch]);
             // write_buffer requires a 4-byte multiple.
-            if bytes.len() % 4 == 0 {
+            if bytes.len().is_multiple_of(4) {
                 queue.write_buffer(&r.raw, 0, bytes);
             } else {
                 let mut v = bytes.to_vec();
@@ -577,12 +588,11 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
                 window: f.config.window,
                 cols: f.config.cols,
                 pos0: f.pos0,
-                nsec: 0,
                 ring0: f.sweep.ring0,
                 ring: if trig { RING } else { 0 },
                 car: f.car as u32,
-                _p: [0; 3],
                 fsec: f.config.bank.fsec,
+                _p: [0; 2],
                 coef,
             };
             queue.write_buffer(&g.ingest_u, 0, bytemuck::bytes_of(&u));
@@ -693,6 +703,21 @@ mod tests {
         })
     }
 
+    /// Both shaders parse and validate (wgpu would only complain when a window opens).
+    #[test]
+    fn shaders_validate() {
+        use wgpu::naga;
+        for (name, src) in [
+            ("traces.wgsl", include_str!("traces.wgsl")),
+            ("spikes.wgsl", include_str!("spikes.wgsl")),
+        ] {
+            let m = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&m)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
+
     #[test]
     fn filter_bank_holds_the_band() {
         use engine::dsp::BandSpec;
@@ -701,7 +726,10 @@ mod tests {
             assert!(b.sections.len() <= MAX_SECTIONS);
             let v = b.fsec[f.index()];
             let (s0, n) = ((v & 0xff) as usize, (v >> 8) as usize);
-            assert!(n <= 4, "shader keeps 4 sections of state per channel");
+            assert!(
+                n <= MAX_FILTER_SECTIONS,
+                "shader keeps {MAX_FILTER_SECTIONS} sections of state per channel"
+            );
             b.sections[s0..s0 + n].to_vec()
         };
         let b = FilterBank::new(
