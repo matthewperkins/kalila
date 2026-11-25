@@ -121,14 +121,18 @@ impl Location {
 }
 
 fn sysfs(dir: &std::path::Path, attr: &str) -> Option<String> {
-    std::fs::read_to_string(dir.join(attr)).ok().map(|s| s.trim_end().to_string())
+    std::fs::read_to_string(dir.join(attr))
+        .ok()
+        .map(|s| s.trim_end().to_string())
 }
 
 /// Every USB device with this vendor id, one of `products`, and exactly this product string,
 /// in bus then device order (the same from run to run).
 pub fn find(vendor: u16, products: &[u16], product_string: &str) -> Vec<Location> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir("/sys/bus/usb/devices") else { return out };
+    let Ok(rd) = std::fs::read_dir("/sys/bus/usb/devices") else {
+        return out;
+    };
     for e in rd.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
@@ -149,8 +153,14 @@ pub fn find(vendor: u16, products: &[u16], product_string: &str) -> Vec<Location
         if sysfs(&d, "product").as_deref() != Some(product_string) {
             continue;
         }
-        let (Some(bus), Some(dev)) = (dec("busnum"), dec("devnum")) else { continue };
-        out.push(Location { bus, dev, speed: dec("speed").unwrap_or(0) });
+        let (Some(bus), Some(dev)) = (dec("busnum"), dec("devnum")) else {
+            continue;
+        };
+        out.push(Location {
+            bus,
+            dev,
+            speed: dec("speed").unwrap_or(0),
+        });
     }
     out.sort_by_key(|l| (l.bus, l.dev));
     out
@@ -208,11 +218,13 @@ impl Device {
 
     pub fn claim_interface(&self, interface: u32) -> Result<(), UsbError> {
         let mut n = interface;
-        self.ioctl(USBDEVFS_CLAIMINTERFACE, &mut n as *mut u32 as *mut c_void).map(|_| ()).map_err(|e| match e {
-            libc::EBUSY => UsbError::Busy,
-            libc::ENODEV => UsbError::NoDevice,
-            _ => UsbError::Io,
-        })
+        self.ioctl(USBDEVFS_CLAIMINTERFACE, &mut n as *mut u32 as *mut c_void)
+            .map(|_| ())
+            .map_err(|e| match e {
+                libc::EBUSY => UsbError::Busy,
+                libc::ENODEV => UsbError::NoDevice,
+                _ => UsbError::Io,
+            })
     }
 
     pub fn release_interface(&self, interface: u32) {
@@ -222,7 +234,15 @@ impl Device {
 
     /// One control transfer (`request_type` bit 7 set = device to host). Returns bytes moved.
     /// Only `chip::Ft600::control_transfer` may call this, after checking the request.
-    pub fn control(&self, request_type: u8, request: u8, value: u16, index: u16, data: &mut [u8], timeout_ms: u32) -> Result<usize, UsbError> {
+    pub fn control(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<usize, UsbError> {
         let mut ct = CtrlTransfer {
             request_type,
             request,
@@ -285,9 +305,14 @@ impl Device {
                 } else {
                     // Wait first: usbdevfs reports a reapable URB as writable.
                     let left = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as c_int;
-                    let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLOUT, revents: 0 };
+                    let mut pfd = libc::pollfd {
+                        fd: self.fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
                     let pr = unsafe { libc::poll(&mut pfd, 1, left) };
-                    if pr > 0 && pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 && pfd.revents & libc::POLLOUT == 0 {
+                    if pr > 0 && pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 && pfd.revents & libc::POLLOUT == 0
+                    {
                         // The device is gone; its URBs are already given back by the kernel.
                         let mut done: *mut Urb = std::ptr::null_mut();
                         let _ = self.ioctl(USBDEVFS_REAPURBNDELAY, &mut done as *mut *mut Urb as *mut c_void);
@@ -299,7 +324,11 @@ impl Device {
                 }
             }
             let mut done: *mut Urb = std::ptr::null_mut();
-            let req = if cancelled { USBDEVFS_REAPURB } else { USBDEVFS_REAPURBNDELAY };
+            let req = if cancelled {
+                USBDEVFS_REAPURB
+            } else {
+                USBDEVFS_REAPURBNDELAY
+            };
             match self.ioctl(req, &mut done as *mut *mut Urb as *mut c_void) {
                 Ok(_) => {
                     if done == urb_ptr {
@@ -314,9 +343,15 @@ impl Device {
         }
         let actual = urb.actual_length.max(0) as usize;
         match -urb.status {
-            0 => Ok(Transfer { actual, timed_out: false }),
+            0 => Ok(Transfer {
+                actual,
+                timed_out: false,
+            }),
             // Cancelled by us (ENOENT), or the kernel's own unlink (ECONNRESET).
-            libc::ENOENT | libc::ECONNRESET => Ok(Transfer { actual, timed_out: true }),
+            libc::ENOENT | libc::ECONNRESET => Ok(Transfer {
+                actual,
+                timed_out: true,
+            }),
             libc::ENODEV | libc::ESHUTDOWN | libc::EPROTO => Err(UsbError::NoDevice),
             libc::EPIPE => Err(UsbError::Stall),
             e => {

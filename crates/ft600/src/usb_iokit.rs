@@ -72,11 +72,21 @@ type Completion = extern "C" fn(refcon: *mut c_void, result: IoReturn, arg0: *mu
 #[derive(Clone, Copy)]
 struct UuidBytes([u8; 16]);
 
-const USB_DEVICE_USER_CLIENT_TYPE: UuidBytes = UuidBytes([0x9d, 0xc7, 0xb7, 0x80, 0x9e, 0xc0, 0x11, 0xd4, 0xa5, 0x4f, 0x00, 0x0a, 0x27, 0x05, 0x28, 0x61]);
-const USB_INTERFACE_USER_CLIENT_TYPE: UuidBytes = UuidBytes([0x2d, 0x97, 0x86, 0xc6, 0x9e, 0xf3, 0x11, 0xd4, 0xad, 0x51, 0x00, 0x0a, 0x27, 0x05, 0x28, 0x61]);
-const CF_PLUGIN_INTERFACE: UuidBytes = UuidBytes([0xc2, 0x44, 0xe8, 0x58, 0x10, 0x9c, 0x11, 0xd4, 0x91, 0xd4, 0x00, 0x50, 0xe4, 0xc6, 0x42, 0x6f]);
-const USB_DEVICE_INTERFACE_942: UuidBytes = UuidBytes([0x56, 0xad, 0x08, 0x9d, 0x87, 0x8d, 0x4b, 0xea, 0xa1, 0xf5, 0x2c, 0x8d, 0xc4, 0x3e, 0x8a, 0x98]);
-const USB_INTERFACE_INTERFACE_942: UuidBytes = UuidBytes([0x87, 0x52, 0x66, 0x3b, 0xc0, 0x7b, 0x4b, 0xae, 0x95, 0x84, 0x22, 0x03, 0x2f, 0xab, 0x9c, 0x5a]);
+const USB_DEVICE_USER_CLIENT_TYPE: UuidBytes = UuidBytes([
+    0x9d, 0xc7, 0xb7, 0x80, 0x9e, 0xc0, 0x11, 0xd4, 0xa5, 0x4f, 0x00, 0x0a, 0x27, 0x05, 0x28, 0x61,
+]);
+const USB_INTERFACE_USER_CLIENT_TYPE: UuidBytes = UuidBytes([
+    0x2d, 0x97, 0x86, 0xc6, 0x9e, 0xf3, 0x11, 0xd4, 0xad, 0x51, 0x00, 0x0a, 0x27, 0x05, 0x28, 0x61,
+]);
+const CF_PLUGIN_INTERFACE: UuidBytes = UuidBytes([
+    0xc2, 0x44, 0xe8, 0x58, 0x10, 0x9c, 0x11, 0xd4, 0x91, 0xd4, 0x00, 0x50, 0xe4, 0xc6, 0x42, 0x6f,
+]);
+const USB_DEVICE_INTERFACE_942: UuidBytes = UuidBytes([
+    0x56, 0xad, 0x08, 0x9d, 0x87, 0x8d, 0x4b, 0xea, 0xa1, 0xf5, 0x2c, 0x8d, 0xc4, 0x3e, 0x8a, 0x98,
+]);
+const USB_INTERFACE_INTERFACE_942: UuidBytes = UuidBytes([
+    0x87, 0x52, 0x66, 0x3b, 0xc0, 0x7b, 0x4b, 0xae, 0x95, 0x84, 0x22, 0x03, 0x2f, 0xab, 0x9c, 0x5a,
+]);
 
 // Slots (pointer-sized) in the function tables. IUnknown's three come first in every one.
 const QUERY_INTERFACE: usize = 1;
@@ -164,7 +174,25 @@ unsafe extern "C" {
     fn CFNumberGetValue(number: CfRef, kind: isize, out: *mut c_void) -> u8;
     fn CFStringGetCString(s: CfRef, buf: *mut c_char, size: isize, encoding: u32) -> u8;
     #[allow(clippy::too_many_arguments)]
-    fn CFUUIDGetConstantUUIDWithBytes(alloc: CfRef, b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8, b8: u8, b9: u8, b10: u8, b11: u8, b12: u8, b13: u8, b14: u8, b15: u8) -> CfRef;
+    fn CFUUIDGetConstantUUIDWithBytes(
+        alloc: CfRef,
+        b0: u8,
+        b1: u8,
+        b2: u8,
+        b3: u8,
+        b4: u8,
+        b5: u8,
+        b6: u8,
+        b7: u8,
+        b8: u8,
+        b9: u8,
+        b10: u8,
+        b11: u8,
+        b12: u8,
+        b13: u8,
+        b14: u8,
+        b15: u8,
+    ) -> CfRef;
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -177,12 +205,26 @@ unsafe extern "C" {
     fn IOObjectRelease(object: IoObject) -> i32;
     fn IORegistryEntryCreateCFProperty(entry: IoObject, key: CfRef, alloc: CfRef, options: u32) -> CfRef;
     fn IORegistryEntryGetRegistryEntryID(entry: IoObject, entry_id: *mut u64) -> i32;
-    fn IOCreatePlugInInterfaceForService(service: IoObject, plugin_type: CfRef, interface_type: CfRef, interface: *mut Com, score: *mut i32) -> i32;
+    fn IOCreatePlugInInterfaceForService(
+        service: IoObject,
+        plugin_type: CfRef,
+        interface_type: CfRef,
+        interface: *mut Com,
+        score: *mut i32,
+    ) -> i32;
     fn IODispatchCalloutFromMessage(unused: *mut c_void, msg: *mut c_void, reference: *mut c_void);
 }
 
 unsafe extern "C" {
-    fn mach_msg(msg: *mut c_void, option: i32, send_size: u32, rcv_size: u32, rcv_name: u32, timeout: u32, notify: u32) -> i32;
+    fn mach_msg(
+        msg: *mut c_void,
+        option: i32,
+        send_size: u32,
+        rcv_size: u32,
+        rcv_name: u32,
+        timeout: u32,
+        notify: u32,
+    ) -> i32;
 }
 
 /// The function in slot `n` of a COM-style object's table, as the type `F`.
@@ -207,7 +249,27 @@ unsafe fn com_release(obj: Com) {
 fn cf_uuid(u: UuidBytes) -> CfRef {
     let b = u.0;
     // A constant UUID object: owned by CoreFoundation, never released.
-    unsafe { CFUUIDGetConstantUUIDWithBytes(std::ptr::null(), b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]) }
+    unsafe {
+        CFUUIDGetConstantUUIDWithBytes(
+            std::ptr::null(),
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[7],
+            b[8],
+            b[9],
+            b[10],
+            b[11],
+            b[12],
+            b[13],
+            b[14],
+            b[15],
+        )
+    }
 }
 
 /// A CFString for a registry key, released when dropped.
@@ -238,7 +300,8 @@ fn number_property(service: IoObject, key: &CStr) -> Option<u32> {
             return None;
         }
         let mut out: i32 = 0;
-        let ok = CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v, CF_NUMBER_SINT32, (&raw mut out).cast()) != 0;
+        let ok =
+            CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v, CF_NUMBER_SINT32, (&raw mut out).cast()) != 0;
         CFRelease(v);
         ok.then_some(out as u32)
     }
@@ -255,7 +318,8 @@ fn string_property(service: IoObject, key: &CStr) -> Option<String> {
             return None;
         }
         let mut buf = [0 as c_char; 256];
-        let ok = CFGetTypeID(v) == CFStringGetTypeID() && CFStringGetCString(v, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0;
+        let ok = CFGetTypeID(v) == CFStringGetTypeID()
+            && CFStringGetCString(v, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0;
         CFRelease(v);
         ok.then(|| CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
     }
@@ -334,14 +398,27 @@ pub fn find(vendor: u16, products: &[u16], product_string: &str) -> Vec<Location
             }
             let matches = number_property(s, c"idVendor") == Some(vendor as u32)
                 && number_property(s, c"idProduct").is_some_and(|p| products.iter().any(|&q| q as u32 == p))
-                && string_property(s, c"USB Product Name").or_else(|| string_property(s, c"kUSBProductString")).as_deref() == Some(product_string);
+                && string_property(s, c"USB Product Name")
+                    .or_else(|| string_property(s, c"kUSBProductString"))
+                    .as_deref()
+                    == Some(product_string);
             if matches {
                 let mut entry_id = 0u64;
                 IORegistryEntryGetRegistryEntryID(s, &mut entry_id);
                 let location_id = number_property(s, c"locationID").unwrap_or(0);
-                let address = number_property(s, c"USB Address").or_else(|| number_property(s, c"kUSBAddress")).unwrap_or(0);
-                let speed = number_property(s, c"Device Speed").or_else(|| number_property(s, c"USBSpeed")).unwrap_or(u32::MAX);
-                out.push(Location { bus: location_id >> 24, dev: address, speed: speed_mbit(speed), location_id, entry_id });
+                let address = number_property(s, c"USB Address")
+                    .or_else(|| number_property(s, c"kUSBAddress"))
+                    .unwrap_or(0);
+                let speed = number_property(s, c"Device Speed")
+                    .or_else(|| number_property(s, c"USBSpeed"))
+                    .unwrap_or(u32::MAX);
+                out.push(Location {
+                    bus: location_id >> 24,
+                    dev: address,
+                    speed: speed_mbit(speed),
+                    location_id,
+                    entry_id,
+                });
             }
             IOObjectRelease(s);
         }
@@ -364,7 +441,13 @@ unsafe fn plugin_interface(service: IoObject, kind: UuidBytes, iid: UuidBytes) -
     unsafe {
         let mut plugin: Com = std::ptr::null_mut();
         let mut score = 0i32;
-        let r = IOCreatePlugInInterfaceForService(service, cf_uuid(kind), cf_uuid(CF_PLUGIN_INTERFACE), &mut plugin, &mut score);
+        let r = IOCreatePlugInInterfaceForService(
+            service,
+            cf_uuid(kind),
+            cf_uuid(CF_PLUGIN_INTERFACE),
+            &mut plugin,
+            &mut score,
+        );
         if r != SUCCESS {
             return Err(r);
         }
@@ -375,7 +458,11 @@ unsafe fn plugin_interface(service: IoObject, kind: UuidBytes, iid: UuidBytes) -
         let mut out: Com = std::ptr::null_mut();
         let h = query(plugin, iid, &mut out);
         com_release(plugin);
-        if h == 0 && !out.is_null() { Ok(out) } else { Err(UNSUPPORTED) }
+        if h == 0 && !out.is_null() {
+            Ok(out)
+        } else {
+            Err(UNSUPPORTED)
+        }
     }
 }
 
@@ -409,7 +496,15 @@ extern "C" fn completed(refcon: *mut c_void, result: IoReturn, arg0: *mut c_void
 fn pump(port: u32, ms: u32) -> bool {
     let mut msg = [0u64; 128]; // 1024 bytes, aligned for a mach_msg_header_t
     unsafe {
-        let k = mach_msg(msg.as_mut_ptr().cast(), MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, size_of_val(&msg) as u32, port, ms, 0);
+        let k = mach_msg(
+            msg.as_mut_ptr().cast(),
+            MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+            0,
+            size_of_val(&msg) as u32,
+            port,
+            ms,
+            0,
+        );
         if k == MACH_RCV_TIMED_OUT {
             return false;
         }
@@ -452,7 +547,12 @@ unsafe impl Send for Device {}
 /// whether a byte was lost or repeated. Off unless set.
 fn abort_every() -> Option<u32> {
     static N: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("KALILA_USB_TEST_ABORT_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0))
+    *N.get_or_init(|| {
+        std::env::var("KALILA_USB_TEST_ABORT_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+    })
 }
 
 impl Device {
@@ -477,7 +577,14 @@ impl Device {
     }
 
     fn with(dev: Com) -> Device {
-        Device { dev, ifs: RefCell::new(Vec::new()), pipes: RefCell::new([None; 32]), flight: Box::default(), broken: Cell::new(false), reads: Cell::new(0) }
+        Device {
+            dev,
+            ifs: RefCell::new(Vec::new()),
+            pipes: RefCell::new([None; 32]),
+            flight: Box::default(),
+            broken: Cell::new(false),
+            reads: Cell::new(0),
+        }
     }
 
     /// A device on which every call fails (for tests).
@@ -503,9 +610,15 @@ impl Device {
 
     unsafe fn claim(&self, interface: u32) -> Result<(), IoReturn> {
         unsafe {
-            let mut req = FindInterfaceRequest { class: 0xffff, subclass: 0xffff, protocol: 0xffff, alternate: 0xffff };
+            let mut req = FindInterfaceRequest {
+                class: 0xffff,
+                subclass: 0xffff,
+                protocol: 0xffff,
+                alternate: 0xffff,
+            };
             let mut it: IoObject = 0;
-            let create: extern "C" fn(Com, *mut FindInterfaceRequest, *mut IoObject) -> IoReturn = slot(self.dev, DEV_CREATE_INTERFACE_ITERATOR);
+            let create: extern "C" fn(Com, *mut FindInterfaceRequest, *mut IoObject) -> IoReturn =
+                slot(self.dev, DEV_CREATE_INTERFACE_ITERATOR);
             let r = create(self.dev, &mut req, &mut it);
             if r != SUCCESS {
                 return Err(r);
@@ -560,11 +673,21 @@ impl Device {
                 return Err(r);
             }
             // Pipe references run from 1 to the number of endpoints (0 is the control pipe).
-            let properties: extern "C" fn(Com, u8, *mut u8, *mut u8, *mut u8, *mut u16, *mut u8) -> IoReturn = slot(intf, INTF_GET_PIPE_PROPERTIES);
+            let properties: extern "C" fn(Com, u8, *mut u8, *mut u8, *mut u8, *mut u16, *mut u8) -> IoReturn =
+                slot(intf, INTF_GET_PIPE_PROPERTIES);
             let mut pipes = self.pipes.borrow_mut();
             for pipe in 1..=count {
                 let (mut direction, mut number, mut kind, mut interval, mut max_packet) = (0u8, 0u8, 0u8, 0u8, 0u16);
-                if properties(intf, pipe, &mut direction, &mut number, &mut kind, &mut max_packet, &mut interval) != SUCCESS {
+                if properties(
+                    intf,
+                    pipe,
+                    &mut direction,
+                    &mut number,
+                    &mut kind,
+                    &mut max_packet,
+                    &mut interval,
+                ) != SUCCESS
+                {
                     continue;
                 }
                 if direction != USB_IN && direction != USB_OUT {
@@ -573,7 +696,11 @@ impl Device {
                 let e = (number & 0x0f) as usize | if direction == USB_IN { 16 } else { 0 };
                 pipes[e] = Some((interface, pipe));
             }
-            self.ifs.borrow_mut().push(Claimed { intf, number: interface, port });
+            self.ifs.borrow_mut().push(Claimed {
+                intf,
+                number: interface,
+                port,
+            });
             Ok(())
         }
     }
@@ -593,7 +720,15 @@ impl Device {
     /// One control transfer on the default pipe (`request_type` bit 7 set = device to
     /// host). Returns bytes moved. The raw call is IOKit's `DeviceRequestTO`.
     /// Only `chip::Ft600::control_transfer` may call this, after checking the request.
-    pub fn control(&self, request_type: u8, request: u8, value: u16, index: u16, data: &mut [u8], timeout_ms: u32) -> Result<usize, UsbError> {
+    pub fn control(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<usize, UsbError> {
         if self.dev.is_null() {
             return Err(UsbError::Io);
         }
@@ -634,7 +769,9 @@ impl Device {
             return Err(UsbError::Io); // no claimed interface has the endpoint
         };
         let ifs = self.ifs.borrow();
-        let Some(c) = ifs.iter().find(|c| c.number == number) else { return Err(UsbError::Io) };
+        let Some(c) = ifs.iter().find(|c| c.number == number) else {
+            return Err(UsbError::Io);
+        };
         let is_in = endpoint & 0x80 != 0;
 
         let mut wait = Duration::from_millis(timeout_ms as u64);
@@ -652,11 +789,21 @@ impl Device {
         f.done.set(false);
         let refcon = f as *const Flight as *mut c_void;
         let r = unsafe {
-            let start: extern "C" fn(Com, u8, *mut c_void, u32, Completion, *mut c_void) -> IoReturn = slot(c.intf, if is_in { INTF_READ_PIPE_ASYNC } else { INTF_WRITE_PIPE_ASYNC });
+            let start: extern "C" fn(Com, u8, *mut c_void, u32, Completion, *mut c_void) -> IoReturn = slot(
+                c.intf,
+                if is_in {
+                    INTF_READ_PIPE_ASYNC
+                } else {
+                    INTF_WRITE_PIPE_ASYNC
+                },
+            );
             start(c.intf, pipe, buf.cast(), len as u32, completed, refcon)
         };
         if r != SUCCESS {
-            debug!("ep {endpoint:02x} len {len}: starting the transfer failed: {:08x}", r as u32);
+            debug!(
+                "ep {endpoint:02x} len {len}: starting the transfer failed: {:08x}",
+                r as u32
+            );
             return Err(if r == NOT_FOUND { UsbError::Io } else { map_error(r) });
         }
         // From here until the completion arrives the system owns `buf`.
@@ -696,7 +843,10 @@ impl Device {
         let (r, actual) = (f.result.get(), f.bytes.get());
         bulk_result(r, actual, timed_out).inspect_err(|e| {
             if *e == UsbError::Io {
-                debug!("ep {endpoint:02x} transfer failed: {:08x} after {actual} bytes", r as u32);
+                debug!(
+                    "ep {endpoint:02x} transfer failed: {:08x} after {actual} bytes",
+                    r as u32
+                );
             }
         })
     }
@@ -709,12 +859,18 @@ impl Device {
 fn bulk_result(r: IoReturn, actual: u32, timed_out: bool) -> Result<Transfer, UsbError> {
     let actual = actual as usize;
     if r == SUCCESS || r == UNDERRUN {
-        return Ok(Transfer { actual, timed_out: false });
+        return Ok(Transfer {
+            actual,
+            timed_out: false,
+        });
     }
     if timed_out {
         return match map_error(r) {
             e @ (UsbError::NoDevice | UsbError::Stall) => Err(e),
-            _ => Ok(Transfer { actual, timed_out: true }),
+            _ => Ok(Transfer {
+                actual,
+                timed_out: true,
+            }),
         };
     }
     Err(map_error(r))
@@ -757,12 +913,36 @@ mod tests {
 
     #[test]
     fn a_transfer_given_up_reports_its_bytes_and_is_not_an_error() {
-        assert_eq!(bulk_result(ABORTED, 3072, true), Ok(Transfer { actual: 3072, timed_out: true }));
-        assert_eq!(bulk_result(ABORTED, 0, true), Ok(Transfer { actual: 0, timed_out: true }));
+        assert_eq!(
+            bulk_result(ABORTED, 3072, true),
+            Ok(Transfer {
+                actual: 3072,
+                timed_out: true
+            })
+        );
+        assert_eq!(
+            bulk_result(ABORTED, 0, true),
+            Ok(Transfer {
+                actual: 0,
+                timed_out: true
+            })
+        );
         // Completed just as it was given up: complete, not a timeout (`bulk` clears the flag).
-        assert_eq!(bulk_result(SUCCESS, 512, false), Ok(Transfer { actual: 512, timed_out: false }));
+        assert_eq!(
+            bulk_result(SUCCESS, 512, false),
+            Ok(Transfer {
+                actual: 512,
+                timed_out: false
+            })
+        );
         // A short read is a read.
-        assert_eq!(bulk_result(UNDERRUN, 20, false), Ok(Transfer { actual: 20, timed_out: false }));
+        assert_eq!(
+            bulk_result(UNDERRUN, 20, false),
+            Ok(Transfer {
+                actual: 20,
+                timed_out: false
+            })
+        );
         // An abort nobody here asked for is an error; so is a device that went away meanwhile.
         assert_eq!(bulk_result(ABORTED, 100, false), Err(UsbError::Io));
         assert_eq!(bulk_result(NO_DEVICE, 100, true), Err(UsbError::NoDevice));
@@ -771,7 +951,13 @@ mod tests {
 
     #[test]
     fn packet_size_follows_link_speed() {
-        let l = |speed| Location { bus: 1, dev: 1, speed: speed_mbit(speed), location_id: 0, entry_id: 0 };
+        let l = |speed| Location {
+            bus: 1,
+            dev: 1,
+            speed: speed_mbit(speed),
+            location_id: 0,
+            entry_id: 0,
+        };
         assert_eq!(l(3).bulk_packet_size(), 1024);
         assert_eq!(l(4).bulk_packet_size(), 1024);
         assert_eq!(l(2).bulk_packet_size(), 512);

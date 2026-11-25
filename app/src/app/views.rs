@@ -6,14 +6,14 @@ pub(crate) const MOD: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl
 
 use super::*;
 use crate::config::{Slope, TraceViewSettings, TrigAlign, TrigSource, ViewCar};
+use crate::review::{self, Reader, ReviewView};
 use crate::slope::{DEAD_S, SlopeParams, SlopeTrigger};
 use crossbeam_channel::Receiver;
-use engine::{ChannelStats, DspSettings};
 use engine::audio::{AudioSettings, AudioStats};
-use engine::rhythm::Block;
-use parking_lot::Mutex;
-use crate::review::{self, Reader, ReviewView};
 use engine::record::RecSource;
+use engine::rhythm::Block;
+use engine::{ChannelStats, DspSettings};
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 
 /// Trace-view state shared by the main window and the trace windows. Each trace window is a
@@ -219,7 +219,10 @@ const DIRECT_MAX_S: f32 = 60.0;
 
 /// Review spans in samples: at least one sample per column, within the review limits.
 fn review_span_limits(cols: u32, fs: f64) -> (u32, u32) {
-    (cols.max((REVIEW_MIN_S as f64 * fs) as u32), (REVIEW_MAX_S as f64 * fs) as u32)
+    (
+        cols.max((REVIEW_MIN_S as f64 * fs) as u32),
+        (REVIEW_MAX_S as f64 * fs) as u32,
+    )
 }
 
 /// Review navigation from this frame's input over a trace window.
@@ -236,7 +239,10 @@ fn nav_input(ui: &egui::Ui, resp: &egui::Response, plot: egui::Rect) -> Nav {
             n.pan -= i.smooth_scroll_delta.x as f64 / w;
             if i.modifiers.alt && i.smooth_scroll_delta.y != 0.0 {
                 n.zoom = (-(i.smooth_scroll_delta.y as f64) * 0.004).exp();
-                n.zoom_at = i.pointer.hover_pos().map_or(0.5, |p| ((p.x - plot.min.x) as f64 / w).clamp(0.0, 1.0));
+                n.zoom_at = i
+                    .pointer
+                    .hover_pos()
+                    .map_or(0.5, |p| ((p.x - plot.min.x) as f64 / w).clamp(0.0, 1.0));
             }
         }
         if !typing {
@@ -272,18 +278,36 @@ pub(super) fn chan_key(l: &StreamLayout, ch: usize) -> Option<String> {
         return None;
     }
     let hs = c.headstage?;
-    let k = l.channels[..ch].iter().filter(|o| o.kind == ChannelKind::Electrode && o.headstage == Some(hs)).count();
+    let k = l.channels[..ch]
+        .iter()
+        .filter(|o| o.kind == ChannelKind::Electrode && o.headstage == Some(hs))
+        .count();
     Some(format!("{}:{k}", l.headstages.get(hs)?.name))
 }
 
 /// Display filter of every channel (AUX/ADC are always drawn raw).
 pub(super) fn chan_filters(l: &StreamLayout, d: &TraceViewSettings) -> Vec<ViewFilter> {
-    (0..l.num_channels()).map(|i| if l.channels[i].kind == ChannelKind::Electrode { d.filter_of(chan_key(l, i).as_deref()) } else { ViewFilter::Raw }).collect()
+    (0..l.num_channels())
+        .map(|i| {
+            if l.channels[i].kind == ChannelKind::Electrode {
+                d.filter_of(chan_key(l, i).as_deref())
+            } else {
+                ViewFilter::Raw
+            }
+        })
+        .collect()
 }
 
 /// Filters in use among the electrodes drawn in a view (in `ViewFilter::ALL` order).
 fn used_filters(l: &StreamLayout, filters: &[ViewFilter], row_ch: &[u32]) -> Vec<ViewFilter> {
-    ViewFilter::ALL.into_iter().filter(|f| row_ch.iter().any(|&c| l.channels[c as usize].kind == ChannelKind::Electrode && filters[c as usize] == *f)).collect()
+    ViewFilter::ALL
+        .into_iter()
+        .filter(|f| {
+            row_ch
+                .iter()
+                .any(|&c| l.channels[c as usize].kind == ChannelKind::Electrode && filters[c as usize] == *f)
+        })
+        .collect()
 }
 
 /// Display CAR applies to the Band electrodes only (reference and subtraction alike).
@@ -311,9 +335,19 @@ fn uv_text(d: &TraceViewSettings, used: &[ViewFilter]) -> String {
     let base = match used {
         [] => format!("{:.0} µV/row", d.uv(d.filter)),
         [f] => format!("{:.0} µV/row", d.uv(*f)),
-        _ => format!("{} µV/row", used.iter().map(|f| format!("{} {:.0}", f.letter(), d.uv(*f))).collect::<Vec<_>>().join(" ")),
+        _ => format!(
+            "{} µV/row",
+            used.iter()
+                .map(|f| format!("{} {:.0}", f.letter(), d.uv(*f)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
     };
-    if d.channel_uv.is_empty() { base } else { format!("{base} · per-row") }
+    if d.channel_uv.is_empty() {
+        base
+    } else {
+        format!("{base} · per-row")
+    }
 }
 
 /// Per-channel GPU info for a view (see traces.wgsl): gain; flags (bits 3-4 filter preset,
@@ -327,7 +361,9 @@ fn view_chinfo(l: &StreamLayout, d: &TraceViewSettings, filters: &[ViewFilter]) 
             ChannelKind::Electrode => {
                 let f = filters[i];
                 let car = f == ViewFilter::Band;
-                let flags = 8 * f.index() as u32 + 2 * (car && in_set(&d.car.reference, i)) as u32 + 4 * (car && in_set(&d.car.subtract, i)) as u32;
+                let flags = 8 * f.index() as u32
+                    + 2 * (car && in_set(&d.car.reference, i)) as u32
+                    + 4 * (car && in_set(&d.car.subtract, i)) as u32;
                 [c.bit_volts, flags as f32, d.uv_of(chan_key(l, i).as_deref(), f), 0.0]
             }
             ChannelKind::Aux => [c.bit_volts, 0.0, 2.5, 0.0],
@@ -354,7 +390,10 @@ fn hatch(p: &egui::Painter, r: egui::Rect) {
 fn filter_help(f: ViewFilter, d: &TraceViewSettings) -> String {
     match f {
         ViewFilter::Raw => "Raw: unfiltered".into(),
-        ViewFilter::Band => format!("Band: {} (4th-order Butterworth each side; the window's corners; display CAR applies here)", d.band_label()),
+        ViewFilter::Band => format!(
+            "Band: {} (4th-order Butterworth each side; the window's corners; display CAR applies here)",
+            d.band_label()
+        ),
     }
 }
 
@@ -379,16 +418,33 @@ fn band_key(l: &StreamLayout, d: &TraceViewSettings) -> engine::pyramid::BandKey
     let chans = engine::pyramid::band_channels(l, &d.headstages);
     let car = d.car.enabled.then(|| {
         let filters = chan_filters(l, d);
-        let on = |set: &[usize]| set.iter().copied().filter(|&c| chans.contains(&c) && filters.get(c) == Some(&ViewFilter::Band)).collect::<Vec<_>>();
+        let on = |set: &[usize]| {
+            set.iter()
+                .copied()
+                .filter(|&c| chans.contains(&c) && filters.get(c) == Some(&ViewFilter::Band))
+                .collect::<Vec<_>>()
+        };
         (on(&d.car.reference), on(&d.car.subtract))
     });
-    engine::pyramid::BandKey { low_bits: band.low_hz.to_bits(), high_bits: band.high_hz.to_bits(), chans, car }
+    engine::pyramid::BandKey {
+        low_bits: band.low_hz.to_bits(),
+        high_bits: band.high_hz.to_bits(),
+        chans,
+        car,
+    }
 }
 
 /// A review image from the pyramids: the column buffer (`nch × cols`, physical units), one
 /// TTL word per column, and whether every sample on screen (up to the live edge) was covered.
 /// None when the pyramids are not of this recording or the view's band pyramid is missing.
-fn pyramid_columns(st: &engine::pyramid::Store, src: &RecSource, view: u32, l: &StreamLayout, filters: &[ViewFilter], key: &review::Key) -> Option<(Vec<[f32; 2]>, Vec<u16>, bool)> {
+fn pyramid_columns(
+    st: &engine::pyramid::Store,
+    src: &RecSource,
+    view: u32,
+    l: &StreamLayout,
+    filters: &[ViewFilter],
+    key: &review::Key,
+) -> Option<(Vec<[f32; 2]>, Vec<u16>, bool)> {
     let raw = st.raw.as_ref()?;
     if st.src.as_ref().map(|s| &s.dat) != Some(&src.dat) || raw.nch != key.nch {
         return None;
@@ -396,7 +452,11 @@ fn pyramid_columns(st: &engine::pyramid::Store, src: &RecSource, view: u32, l: &
     let nch = key.nch;
     let cols = key.cols as usize;
     let is_band = |i: usize| filters[i] == ViewFilter::Band && l.channels[i].kind == ChannelKind::Electrode;
-    let band = if (0..nch).any(is_band) { Some((st.band(view)?, &st.bands.get(&view)?.0)) } else { None };
+    let band = if (0..nch).any(is_band) {
+        Some((st.band(view)?, &st.bands.get(&view)?.0))
+    } else {
+        None
+    };
     let t0 = key.t0 - src.first_sample;
     let span = key.span as u64;
     // None where the level this span needs was released under the RAM budget: the caller
@@ -410,7 +470,11 @@ fn pyramid_columns(st: &engine::pyramid::Store, src: &RecSource, view: u32, l: &
     let mut out = vec![[1e30f32, -1e30]; nch * cols];
     for i in 0..nch {
         let gain = l.channels[i].bit_volts;
-        let row = if is_band(i) { band.and_then(|(_, k)| k.chans.iter().position(|&c| c == i)) } else { None };
+        let row = if is_band(i) {
+            band.and_then(|(_, k)| k.chans.iter().position(|&c| c == i))
+        } else {
+            None
+        };
         for c in 0..cols {
             let m = match (row, &bc) {
                 (Some(r), Some(bc)) => bc[c * band.unwrap().0.nch + r],
@@ -444,8 +508,21 @@ fn sweep_hash(d: &TraceViewSettings, pre: u32, post: u32, nslots: u32, filters: 
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (pre, post, nslots, cols, filters_hash(filters, band_bits(d))).hash(&mut h);
-    (d.trig_source, d.trig_line, &d.trig_channel, d.trig_slope, d.trig_align, d.trig_window).hash(&mut h);
-    (d.trig_level_uv == 0.0, d.trig_holdoff_ms.to_bits(), d.trig_level2_uv.to_bits()).hash(&mut h);
+    (
+        d.trig_source,
+        d.trig_line,
+        &d.trig_channel,
+        d.trig_slope,
+        d.trig_align,
+        d.trig_window,
+    )
+        .hash(&mut h);
+    (
+        d.trig_level_uv == 0.0,
+        d.trig_holdoff_ms.to_bits(),
+        d.trig_level2_uv.to_bits(),
+    )
+        .hash(&mut h);
     h.finish()
 }
 
@@ -460,17 +537,29 @@ fn trig_window_ms(d: &TraceViewSettings) -> (f32, f32) {
 /// Rows of one view: channel order (electrodes, then AUX/ADC) and per-row (first, count).
 pub(super) fn view_rows(l: &StreamLayout, v: &TraceViewSettings) -> (Vec<u32>, Vec<[u32; 2]>) {
     let k = v.per_row.clamp(1, 8) as usize;
-    let hs_on = |hs: Option<usize>| v.headstages.is_empty() || hs.and_then(|i| l.headstages.get(i)).is_some_and(|h| v.headstages.contains(&h.name));
-    let el: Vec<u32> = (0..l.num_channels() as u32).filter(|&i| {
-        let c = &l.channels[i as usize];
-        c.kind == ChannelKind::Electrode && hs_on(c.headstage)
-    }).collect();
-    let an: Vec<u32> = (0..l.num_channels() as u32).filter(|&i| match l.channels[i as usize].kind {
-        ChannelKind::Aux => v.aux,
-        ChannelKind::Adc => v.adc,
-        ChannelKind::Electrode => false,
-    }).collect();
-    let mut rowtab: Vec<[u32; 2]> = (0..el.len()).step_by(k).map(|s| [s as u32, k.min(el.len() - s) as u32]).collect();
+    let hs_on = |hs: Option<usize>| {
+        v.headstages.is_empty()
+            || hs
+                .and_then(|i| l.headstages.get(i))
+                .is_some_and(|h| v.headstages.contains(&h.name))
+    };
+    let el: Vec<u32> = (0..l.num_channels() as u32)
+        .filter(|&i| {
+            let c = &l.channels[i as usize];
+            c.kind == ChannelKind::Electrode && hs_on(c.headstage)
+        })
+        .collect();
+    let an: Vec<u32> = (0..l.num_channels() as u32)
+        .filter(|&i| match l.channels[i as usize].kind {
+            ChannelKind::Aux => v.aux,
+            ChannelKind::Adc => v.adc,
+            ChannelKind::Electrode => false,
+        })
+        .collect();
+    let mut rowtab: Vec<[u32; 2]> = (0..el.len())
+        .step_by(k)
+        .map(|s| [s as u32, k.min(el.len() - s) as u32])
+        .collect();
     rowtab.extend((el.len()..el.len() + an.len()).map(|i| [i as u32, 1]));
     let mut order = el;
     order.extend(an);
@@ -484,15 +573,27 @@ fn electrode_groups(l: &StreamLayout, only: &[String]) -> Vec<(String, Vec<(usiz
         .enumerate()
         .filter(|(_, h)| only.is_empty() || only.contains(&h.name))
         .map(|(hi, h)| {
-            let chans = l.channels.iter().enumerate().filter(|(_, c)| c.kind == ChannelKind::Electrode && c.headstage == Some(hi)).map(|(i, c)| (i, c.name.clone())).collect();
+            let chans = l
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.kind == ChannelKind::Electrode && c.headstage == Some(hi))
+                .map(|(i, c)| (i, c.name.clone()))
+                .collect();
             (format!("{} {}", h.name, h.chip), chans)
         })
         .collect()
 }
 
-
 impl ViewsShared {
-    pub fn new(settings: Vec<TraceViewSettings>, audio: Arc<Mutex<AudioSettings>>, audio_stats: Arc<AudioStats>, dsp: Arc<Mutex<DspSettings>>, stats: Arc<Mutex<ChannelStats>>, pyramids: Arc<Mutex<engine::pyramid::Store>>) -> Self {
+    pub fn new(
+        settings: Vec<TraceViewSettings>,
+        audio: Arc<Mutex<AudioSettings>>,
+        audio_stats: Arc<AudioStats>,
+        dsp: Arc<Mutex<DspSettings>>,
+        stats: Arc<Mutex<ChannelStats>>,
+        pyramids: Arc<Mutex<engine::pyramid::Store>>,
+    ) -> Self {
         let mut s = Self {
             settings,
             states: Vec::new(),
@@ -593,7 +694,12 @@ impl ViewsShared {
             }
         }
         for r in self.reader.rx.try_iter() {
-            if let Some(rv) = self.states.iter_mut().find(|v| v.id == r.view).and_then(|v| v.review.as_mut()) {
+            if let Some(rv) = self
+                .states
+                .iter_mut()
+                .find(|v| v.id == r.view)
+                .and_then(|v| v.review.as_mut())
+            {
                 rv.accept(r);
             }
         }
@@ -656,7 +762,11 @@ impl ViewsShared {
 
     /// A sample as a time: since the recording started while recording, else since acquisition.
     pub fn note_time(&self, s: i64) -> String {
-        note_time(self.layout.as_ref().map_or(30000.0, |l| l.sample_rate), self.rec_source.as_ref(), s)
+        note_time(
+            self.layout.as_ref().map_or(30000.0, |l| l.sample_rate),
+            self.rec_source.as_ref(),
+            s,
+        )
     }
 
     /// Note keys for this window's frame, and the note bar. Call before any other widget.
@@ -665,14 +775,23 @@ impl ViewsShared {
         let now = self.now_sample();
         ui.ctx().input_mut(|i| self.notes.handle(&mut i.events, typing, now));
         let vp = ui.ctx().viewport_id();
-        let times: Vec<(i64, String)> = self.notes.compose.as_ref().map(|c| vec![(c.sample, self.note_time(c.sample))]).unwrap_or_default();
-        self.notes.draw(ui.ctx(), vp, |s| times.iter().find(|t| t.0 == s).map(|t| t.1.clone()).unwrap_or_default());
+        let times: Vec<(i64, String)> = self
+            .notes
+            .compose
+            .as_ref()
+            .map(|c| vec![(c.sample, self.note_time(c.sample))])
+            .unwrap_or_default();
+        self.notes.draw(ui.ctx(), vp, |s| {
+            times.iter().find(|t| t.0 == s).map(|t| t.1.clone()).unwrap_or_default()
+        });
     }
 
     /// One trace window's whole UI (a deferred viewport callback).
     pub fn window(&mut self, ui: &mut egui::Ui, id: u32) {
         self.drain();
-        let Some(vi) = self.settings.iter().position(|v| v.id == id) else { return };
+        let Some(vi) = self.settings.iter().position(|v| v.id == id) else {
+            return;
+        };
         if vi >= self.states.len() {
             return;
         }
@@ -700,7 +819,11 @@ impl ViewsShared {
         }
         // Pace this window's own frames (continuous while acquiring).
         let period = Duration::from_secs_f32(1.0 / self.max_fps.max(10.0));
-        ui.ctx().request_repaint_after(if self.acquiring { period } else { Duration::from_millis(250) });
+        ui.ctx().request_repaint_after(if self.acquiring {
+            period
+        } else {
+            Duration::from_millis(250)
+        });
     }
 
     /// Click on a channel label: monitor just these channels; Ctrl (or Shift) toggles them in
@@ -717,14 +840,22 @@ impl ViewsShared {
         let l = self.layout.clone();
         let id = self.settings[vi].id;
         let reviewing = self.states[vi].review.is_some();
-        let ttl_seen = self.states[vi].ttl.seen() | self.states[vi].review.as_ref().and_then(|r| r.shown.as_ref()).map_or(0, |s| s.ttl.seen());
+        let ttl_seen = self.states[vi].ttl.seen()
+            | self.states[vi]
+                .review
+                .as_ref()
+                .and_then(|r| r.shown.as_ref())
+                .map_or(0, |s| s.ttl.seen());
         let stats = self.stats.clone();
         let d = &mut self.settings[vi];
         let old = d.clone();
         let mut clear_sweeps = false;
         let mut open_car = false;
         // Filters in use among the drawn electrodes; more than one = per-row filters.
-        let used = l.as_ref().map(|l| used_filters(l, &chan_filters(l, d), &view_rows(l, d).0)).unwrap_or_default();
+        let used = l
+            .as_ref()
+            .map(|l| used_filters(l, &chan_filters(l, d), &view_rows(l, d).0))
+            .unwrap_or_default();
         let mixed = used.len() > 1;
         let uniform = used.first().copied().filter(|_| !mixed).unwrap_or(d.filter);
         ui.horizontal_wrapped(|ui| {
@@ -931,7 +1062,8 @@ impl ViewsShared {
                 }
             });
         }
-        let reset = d.window_s != old.window_s || d.headstages != old.headstages || d.aux != old.aux || d.adc != old.adc;
+        let reset =
+            d.window_s != old.window_s || d.headstages != old.headstages || d.aux != old.aux || d.adc != old.adc;
         let changed = *d != old;
         // In review, a new time window re-reads the same moment (kept centred) at that span.
         if d.window_s != old.window_s
@@ -958,7 +1090,13 @@ impl ViewsShared {
 
     fn trace_view(&mut self, ui: &mut egui::Ui, rect: egui::Rect, vi: usize) {
         let Some(l) = self.layout.as_ref() else {
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "No board", egui::FontId::proportional(18.0), Color32::GRAY);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No board",
+                egui::FontId::proportional(18.0),
+                Color32::GRAY,
+            );
             return;
         };
         let mut f = ViewFrame {
@@ -1025,68 +1163,97 @@ impl ViewsShared {
             self.car_open = None;
             return;
         };
-        let (title, groups, car) = (format!("CAR: {}", v.name), electrode_groups(&l, &v.headstages), &mut v.car);
+        let (title, groups, car) = (
+            format!("CAR: {}", v.name),
+            electrode_groups(&l, &v.headstages),
+            &mut v.car,
+        );
         let (mut spikes, mut audio) = (false, false);
-        egui::Window::new(title).id(egui::Id::unique(("car-window", format!("{target:?}")))).open(&mut open).resizable(false).collapsible(false).default_width(460.0).show(ctx, |ui| {
-            ui.small("Recordings always keep the original signals.");
-            ui.horizontal(|ui| {
-                ui.label("Apply to");
-                match target {
-                    CarTarget::Global => {
-                        changed |= ui.checkbox(&mut spikes, "spike detection").changed();
-                        changed |= ui.checkbox(&mut audio, "audio").changed();
-                    }
-                    CarTarget::View(_) => {
-                        changed |= ui.checkbox(&mut car.enabled, "this window (300–6k view)").changed();
-                    }
-                }
-            });
-            ui.weak(format!("reference {} · subtract {}", car.reference.len(), car.subtract.len()));
-            let mut copy_ref = false;
-            for (title, set) in [("Reference (averaged)", &mut car.reference), ("Subtract from", &mut car.subtract)] {
-                ui.separator();
+        egui::Window::new(title)
+            .id(egui::Id::unique(("car-window", format!("{target:?}"))))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.small("Recordings always keep the original signals.");
                 ui.horizontal(|ui| {
-                    ui.strong(title);
-                    if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
-                        copy_ref = true;
+                    ui.label("Apply to");
+                    match target {
+                        CarTarget::Global => {
+                            changed |= ui.checkbox(&mut spikes, "spike detection").changed();
+                            changed |= ui.checkbox(&mut audio, "audio").changed();
+                        }
+                        CarTarget::View(_) => {
+                            changed |= ui.checkbox(&mut car.enabled, "this window (300–6k view)").changed();
+                        }
                     }
                 });
-                for (gname, chans) in &groups {
+                ui.weak(format!(
+                    "reference {} · subtract {}",
+                    car.reference.len(),
+                    car.subtract.len()
+                ));
+                let mut copy_ref = false;
+                for (title, set) in [
+                    ("Reference (averaged)", &mut car.reference),
+                    ("Subtract from", &mut car.subtract),
+                ] {
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(gname).small());
-                        if ui.small_button("All").clicked() {
-                            set.extend(chans.iter().map(|(i, _)| *i).filter(|i| !set.contains(i)).collect::<Vec<_>>());
-                            changed = true;
-                        }
-                        if ui.small_button("None").clicked() {
-                            set.retain(|x| !chans.iter().any(|(i, _)| i == x));
-                            changed = true;
+                        ui.strong(title);
+                        if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
+                            copy_ref = true;
                         }
                     });
-                    egui::Grid::new((title, gname.as_str())).spacing([2.0, 2.0]).show(ui, |ui| {
-                        for (n, (i, name)) in chans.iter().enumerate() {
-                            let on = set.contains(i);
-                            let b = egui::Button::new(RichText::new(name.trim_start_matches("CH")).monospace().size(11.0)).selected(on).min_size(egui::vec2(26.0, 0.0));
-                            if ui.add(b).on_hover_text(name.as_str()).clicked() {
-                                if on {
-                                    set.retain(|x| x != i);
-                                } else {
-                                    set.push(*i);
-                                }
+                    for (gname, chans) in &groups {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(gname).small());
+                            if ui.small_button("All").clicked() {
+                                set.extend(
+                                    chans
+                                        .iter()
+                                        .map(|(i, _)| *i)
+                                        .filter(|i| !set.contains(i))
+                                        .collect::<Vec<_>>(),
+                                );
                                 changed = true;
                             }
-                            if n % 16 == 15 {
-                                ui.end_row();
+                            if ui.small_button("None").clicked() {
+                                set.retain(|x| !chans.iter().any(|(i, _)| i == x));
+                                changed = true;
                             }
-                        }
-                    });
+                        });
+                        egui::Grid::new((title, gname.as_str()))
+                            .spacing([2.0, 2.0])
+                            .show(ui, |ui| {
+                                for (n, (i, name)) in chans.iter().enumerate() {
+                                    let on = set.contains(i);
+                                    let b = egui::Button::new(
+                                        RichText::new(name.trim_start_matches("CH")).monospace().size(11.0),
+                                    )
+                                    .selected(on)
+                                    .min_size(egui::vec2(26.0, 0.0));
+                                    if ui.add(b).on_hover_text(name.as_str()).clicked() {
+                                        if on {
+                                            set.retain(|x| x != i);
+                                        } else {
+                                            set.push(*i);
+                                        }
+                                        changed = true;
+                                    }
+                                    if n % 16 == 15 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    }
                 }
-            }
-            if copy_ref {
-                car.subtract = car.reference.clone();
-                changed = true;
-            }
-        });
+                if copy_ref {
+                    car.subtract = car.reference.clone();
+                    changed = true;
+                }
+            });
         if changed {
             car.reference.sort_unstable();
             car.subtract.sort_unstable();
@@ -1105,11 +1272,15 @@ impl App {
 
     /// Side panel: the list of trace windows.
     pub(super) fn trace_windows_section(&mut self, ui: &mut egui::Ui) {
-        let ports: Vec<char> = self.engine.layout().map(|l| {
-            let mut p: Vec<char> = l.headstages.iter().filter_map(|h| h.name.chars().next()).collect();
-            p.dedup();
-            p
-        }).unwrap_or_default();
+        let ports: Vec<char> = self
+            .engine
+            .layout()
+            .map(|l| {
+                let mut p: Vec<char> = l.headstages.iter().filter_map(|h| h.name.chars().next()).collect();
+                p.dedup();
+                p
+            })
+            .unwrap_or_default();
         let layout = self.layout();
         let next_id = self.new_view_id();
         egui::CollapsingHeader::new(RichText::new("Trace windows").strong()).id_salt("display_section").default_open(true).show(ui, |ui| {
@@ -1159,14 +1330,28 @@ impl App {
 
     /// Register every open trace view as its own (deferred) native window.
     pub(super) fn trace_windows(&mut self, ctx: &egui::Context) {
-        let open: Vec<(u32, String)> = self.shared.lock().settings.iter().filter(|v| v.open).map(|v| (v.id, v.name.clone())).collect();
+        let open: Vec<(u32, String)> = self
+            .shared
+            .lock()
+            .settings
+            .iter()
+            .filter(|v| v.open)
+            .map(|v| (v.id, v.name.clone()))
+            .collect();
         for (id, name) in open {
-            let mut b = egui::ViewportBuilder::default().with_title(format!("kalila — {name}")).with_app_id("kalila").with_inner_size([1400.0, 900.0]);
+            let mut b = egui::ViewportBuilder::default()
+                .with_title(format!("kalila — {name}"))
+                .with_app_id("kalila")
+                .with_inner_size([1400.0, 900.0]);
             if let Some(icon) = &self.icon {
                 b = b.with_icon(icon.clone());
             }
             let shared = self.shared.clone();
-            ctx.show_viewport_deferred(egui::ViewportId::from_hash_of(("trace-view", id)), b, move |ui, _class| shared.lock().window(ui, id));
+            ctx.show_viewport_deferred(
+                egui::ViewportId::from_hash_of(("trace-view", id)),
+                b,
+                move |ui, _class| shared.lock().window(ui, id),
+            );
         }
     }
 
@@ -1180,73 +1365,106 @@ impl App {
         let mut changed = false;
         // The global sets are edited through a copy (same shape as a view's CAR).
         let g = &self.cfg.display.car;
-        let mut global = ViewCar { enabled: false, reference: g.reference.clone(), subtract: g.subtract.clone() };
+        let mut global = ViewCar {
+            enabled: false,
+            reference: g.reference.clone(),
+            subtract: g.subtract.clone(),
+        };
         let (title, groups, car) = match target {
-            CarTarget::Global => ("CAR: spike detection and audio".to_string(), electrode_groups(&l, &[]), &mut global),
+            CarTarget::Global => (
+                "CAR: spike detection and audio".to_string(),
+                electrode_groups(&l, &[]),
+                &mut global,
+            ),
             // A view's CAR window lives in that view's own window (ViewsShared::car_palette).
             CarTarget::View(_) => return,
         };
         let (mut spikes, mut audio) = (self.cfg.display.car.spikes, self.cfg.display.car.audio);
-        egui::Window::new(title).id(egui::Id::unique(("car-window", format!("{target:?}")))).open(&mut open).resizable(false).collapsible(false).default_width(460.0).show(ctx, |ui| {
-            ui.small("Recordings always keep the original signals.");
-            ui.horizontal(|ui| {
-                ui.label("Apply to");
-                match target {
-                    CarTarget::Global => {
-                        changed |= ui.checkbox(&mut spikes, "spike detection").changed();
-                        changed |= ui.checkbox(&mut audio, "audio").changed();
-                    }
-                    CarTarget::View(_) => {
-                        changed |= ui.checkbox(&mut car.enabled, "this window (300–6k view)").changed();
-                    }
-                }
-            });
-            ui.weak(format!("reference {} · subtract {}", car.reference.len(), car.subtract.len()));
-            let mut copy_ref = false;
-            for (title, set) in [("Reference (averaged)", &mut car.reference), ("Subtract from", &mut car.subtract)] {
-                ui.separator();
+        egui::Window::new(title)
+            .id(egui::Id::unique(("car-window", format!("{target:?}"))))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.small("Recordings always keep the original signals.");
                 ui.horizontal(|ui| {
-                    ui.strong(title);
-                    if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
-                        copy_ref = true;
+                    ui.label("Apply to");
+                    match target {
+                        CarTarget::Global => {
+                            changed |= ui.checkbox(&mut spikes, "spike detection").changed();
+                            changed |= ui.checkbox(&mut audio, "audio").changed();
+                        }
+                        CarTarget::View(_) => {
+                            changed |= ui.checkbox(&mut car.enabled, "this window (300–6k view)").changed();
+                        }
                     }
                 });
-                for (gname, chans) in &groups {
+                ui.weak(format!(
+                    "reference {} · subtract {}",
+                    car.reference.len(),
+                    car.subtract.len()
+                ));
+                let mut copy_ref = false;
+                for (title, set) in [
+                    ("Reference (averaged)", &mut car.reference),
+                    ("Subtract from", &mut car.subtract),
+                ] {
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(gname).small());
-                        if ui.small_button("All").clicked() {
-                            set.extend(chans.iter().map(|(i, _)| *i).filter(|i| !set.contains(i)).collect::<Vec<_>>());
-                            changed = true;
-                        }
-                        if ui.small_button("None").clicked() {
-                            set.retain(|x| !chans.iter().any(|(i, _)| i == x));
-                            changed = true;
+                        ui.strong(title);
+                        if title.starts_with("Subtract") && ui.small_button("same as reference").clicked() {
+                            copy_ref = true;
                         }
                     });
-                    egui::Grid::new((title, gname.as_str())).spacing([2.0, 2.0]).show(ui, |ui| {
-                        for (n, (i, name)) in chans.iter().enumerate() {
-                            let on = set.contains(i);
-                            let b = egui::Button::new(RichText::new(name.trim_start_matches("CH")).monospace().size(11.0)).selected(on).min_size(egui::vec2(26.0, 0.0));
-                            if ui.add(b).on_hover_text(name.as_str()).clicked() {
-                                if on {
-                                    set.retain(|x| x != i);
-                                } else {
-                                    set.push(*i);
-                                }
+                    for (gname, chans) in &groups {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(gname).small());
+                            if ui.small_button("All").clicked() {
+                                set.extend(
+                                    chans
+                                        .iter()
+                                        .map(|(i, _)| *i)
+                                        .filter(|i| !set.contains(i))
+                                        .collect::<Vec<_>>(),
+                                );
                                 changed = true;
                             }
-                            if n % 16 == 15 {
-                                ui.end_row();
+                            if ui.small_button("None").clicked() {
+                                set.retain(|x| !chans.iter().any(|(i, _)| i == x));
+                                changed = true;
                             }
-                        }
-                    });
+                        });
+                        egui::Grid::new((title, gname.as_str()))
+                            .spacing([2.0, 2.0])
+                            .show(ui, |ui| {
+                                for (n, (i, name)) in chans.iter().enumerate() {
+                                    let on = set.contains(i);
+                                    let b = egui::Button::new(
+                                        RichText::new(name.trim_start_matches("CH")).monospace().size(11.0),
+                                    )
+                                    .selected(on)
+                                    .min_size(egui::vec2(26.0, 0.0));
+                                    if ui.add(b).on_hover_text(name.as_str()).clicked() {
+                                        if on {
+                                            set.retain(|x| x != i);
+                                        } else {
+                                            set.push(*i);
+                                        }
+                                        changed = true;
+                                    }
+                                    if n % 16 == 15 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    }
                 }
-            }
-            if copy_ref {
-                car.subtract = car.reference.clone();
-                changed = true;
-            }
-        });
+                if copy_ref {
+                    car.subtract = car.reference.clone();
+                    changed = true;
+                }
+            });
         if changed {
             car.reference.sort_unstable();
             car.subtract.sort_unstable();

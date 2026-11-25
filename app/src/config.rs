@@ -33,7 +33,15 @@ impl ViewFilter {
 
 /// "300–6k", "10 Hz–" (no low-pass) or "–300" (no high-pass); 0 = that corner is off.
 pub fn band_label(low_hz: f32, high_hz: f32) -> String {
-    let hz = |f: f32| if f >= 1000.0 { format!("{}k", (f / 1000.0 * 10.0).round() / 10.0) } else if f >= 10.0 { format!("{f:.0}") } else { format!("{f:.1}") };
+    let hz = |f: f32| {
+        if f >= 1000.0 {
+            format!("{}k", (f / 1000.0 * 10.0).round() / 10.0)
+        } else if f >= 10.0 {
+            format!("{f:.0}")
+        } else {
+            format!("{f:.1}")
+        }
+    };
     match (low_hz > 0.0, high_hz > 0.0) {
         (true, true) => format!("{}–{}", hz(low_hz), hz(high_hz)),
         (true, false) => format!("{} Hz–", hz(low_hz)),
@@ -72,7 +80,14 @@ pub struct CarSettings {
 
 impl Default for DisplaySettings {
     fn default() -> Self {
-        Self { spike_uv_range: 250.0, spike_tau_s: 3.0, spike_grid_cols: 8, spike_first_row: 0, max_fps: 144.0, car: CarSettings::default() }
+        Self {
+            spike_uv_range: 250.0,
+            spike_tau_s: 3.0,
+            spike_grid_cols: 8,
+            spike_first_row: 0,
+            max_fps: 144.0,
+            car: CarSettings::default(),
+        }
     }
 }
 
@@ -236,15 +251,31 @@ impl TraceViewSettings {
     /// µV/row of the electrode with key `key` drawn with filter `f`: its own override, else
     /// the filter's scale.
     pub fn uv_of(&self, key: Option<&str>, f: ViewFilter) -> f32 {
-        key.and_then(|k| self.channel_uv.get(k)).copied().unwrap_or_else(|| self.uv(f))
+        key.and_then(|k| self.channel_uv.get(k))
+            .copied()
+            .unwrap_or_else(|| self.uv(f))
     }
     /// Filter of the electrode with key `key` (see `channel_filter`).
     pub fn filter_of(&self, key: Option<&str>) -> ViewFilter {
-        key.and_then(|k| self.channel_filter.get(k)).copied().unwrap_or(self.filter)
+        key.and_then(|k| self.channel_filter.get(k))
+            .copied()
+            .unwrap_or(self.filter)
     }
     /// The Band filter as a `BandSpec` (corners clamped to what the GPU bank handles).
     pub fn band(&self) -> engine::dsp::BandSpec {
-        engine::dsp::BandSpec { low_hz: if self.band_low_hz > 0.0 { self.band_low_hz.clamp(0.1, 5000.0) as f64 } else { 0.0 }, high_hz: if self.band_high_hz > 0.0 { self.band_high_hz.clamp(10.0, 15000.0) as f64 } else { 0.0 }, order: 4 }
+        engine::dsp::BandSpec {
+            low_hz: if self.band_low_hz > 0.0 {
+                self.band_low_hz.clamp(0.1, 5000.0) as f64
+            } else {
+                0.0
+            },
+            high_hz: if self.band_high_hz > 0.0 {
+                self.band_high_hz.clamp(10.0, 15000.0) as f64
+            } else {
+                0.0
+            },
+            order: 4,
+        }
     }
     pub fn band_label(&self) -> String {
         band_label(self.band_low_hz, self.band_high_hz)
@@ -264,7 +295,11 @@ impl TraceViewSettings {
 fn migrate_view_presets(view: &mut serde_json::Value) {
     use serde_json::{Value, json};
     let Some(o) = view.as_object_mut() else { return };
-    let preset = |v: &Value| v.as_str().filter(|s| ["Spikes", "Lfp", "Hp"].contains(s)).map(str::to_string);
+    let preset = |v: &Value| {
+        v.as_str()
+            .filter(|s| ["Spikes", "Lfp", "Hp"].contains(s))
+            .map(str::to_string)
+    };
     let mut votes: Vec<(String, usize)> = Vec::new();
     let mut vote = |p: Option<String>, w: usize| {
         if let Some(p) = p {
@@ -334,7 +369,14 @@ pub struct OutputSettings {
 
 impl Default for OutputSettings {
     fn default() -> Self {
-        Self { dacs: [DacOut::default(); 8], dac1_follows_audio: false, ttl_threshold_mode: false, dac_hpf_enabled: false, dac_hpf_hz: 300.0, noise_slicer: 0 }
+        Self {
+            dacs: [DacOut::default(); 8],
+            dac1_follows_audio: false,
+            ttl_threshold_mode: false,
+            dac_hpf_enabled: false,
+            dac_hpf_hz: 300.0,
+            noise_slicer: 0,
+        }
     }
 }
 
@@ -410,7 +452,11 @@ pub struct ElectrodeMap {
 impl ElectrodeMap {
     pub fn new(old: &[String], new: &[String]) -> Self {
         let to = old.iter().map(|k| new.iter().position(|n| n == k)).collect();
-        Self { to, moved: 0, dropped: 0 }
+        Self {
+            to,
+            moved: 0,
+            dropped: 0,
+        }
     }
     /// Old index → new index; None if that electrode is gone (or `i` was out of range).
     pub fn one(&mut self, i: usize) -> Option<usize> {
@@ -437,7 +483,9 @@ impl ElectrodeMap {
 
 impl Default for Config {
     fn default() -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         Self {
             board: BoardSettings::default(),
             notes: NotesSettings::default(),
@@ -461,7 +509,10 @@ impl Default for Config {
 
 impl Config {
     fn config_dir() -> PathBuf {
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))).unwrap_or_else(|| PathBuf::from("."))
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .unwrap_or_else(|| PathBuf::from("."))
     }
     pub fn path() -> PathBuf {
         Self::config_dir().join("kalila").join("config.json")
@@ -473,8 +524,17 @@ impl Config {
         if new.exists() || !old.exists() {
             return;
         }
-        match new.parent().map(std::fs::create_dir_all).transpose().and_then(|_| std::fs::copy(&old, &new)) {
-            Ok(_) => log::info!("copied the settings from {} (the program's former name) to {}", old.display(), new.display()),
+        match new
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| std::fs::copy(&old, &new))
+        {
+            Ok(_) => log::info!(
+                "copied the settings from {} (the program's former name) to {}",
+                old.display(),
+                new.display()
+            ),
             Err(e) => log::warn!("could not copy the settings from {}: {e}", old.display()),
         }
     }
@@ -509,7 +569,12 @@ impl Config {
         }
         let mut cfg: Self = serde_json::from_value(v.clone())?;
         if v.get("views").is_none() {
-            let mut view: TraceViewSettings = v.get("display").cloned().map(serde_json::from_value).transpose()?.unwrap_or_default();
+            let mut view: TraceViewSettings = v
+                .get("display")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
             view.id = 0;
             view.name = "Traces".into();
             view.open = true;
@@ -524,7 +589,10 @@ impl Config {
         if rev < 1 && cfg.board.usb_block_bytes == 24 * 1024 {
             // 24 KiB was the untouched default until now; another value was chosen and stays.
             cfg.board.usb_block_bytes = 8 * 1024;
-            cfg.load_notice = Some("USB block set to the new default, 8 KiB (was 24 KiB): about 0.75 ms delivery delay instead of 2 ms".into());
+            cfg.load_notice = Some(
+                "USB block set to the new default, 8 KiB (was 24 KiB): about 0.75 ms delivery delay instead of 2 ms"
+                    .into(),
+            );
         }
         cfg.defaults_rev = DEFAULTS_REV;
         Ok(cfg)
@@ -595,7 +663,10 @@ mod tests {
 
     #[test]
     fn per_filter_scale_and_channel_filter() {
-        let mut v = TraceViewSettings { uv_per_row: 300.0, ..Default::default() };
+        let mut v = TraceViewSettings {
+            uv_per_row: 300.0,
+            ..Default::default()
+        };
         assert_eq!(v.uv(ViewFilter::Raw), 300.0, "unset scales fall back to uv_per_row");
         v.set_uv(ViewFilter::Raw, 1200.0);
         assert_eq!((v.uv(ViewFilter::Raw), v.uv(ViewFilter::Band)), (1200.0, 300.0));
@@ -606,7 +677,13 @@ mod tests {
         assert_eq!(v.filter_of(None), ViewFilter::Raw);
         // A per-row override beats the filter's scale, for that channel only.
         v.channel_uv.insert("B1:3".into(), 80.0);
-        assert_eq!((v.uv_of(Some("B1:3"), ViewFilter::Band), v.uv_of(Some("B1:4"), ViewFilter::Band)), (80.0, 300.0));
+        assert_eq!(
+            (
+                v.uv_of(Some("B1:3"), ViewFilter::Band),
+                v.uv_of(Some("B1:4"), ViewFilter::Band)
+            ),
+            (80.0, 300.0)
+        );
         v.ttl_hidden = 0b1;
         let back: TraceViewSettings = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
         assert_eq!(back, v);
@@ -632,7 +709,10 @@ mod tests {
         assert_eq!(v.filter_of(Some("A2:0")), ViewFilter::Band);
         assert_eq!(v.filter_of(Some("B1:8")), ViewFilter::Raw);
         let v = &c.views[1];
-        assert_eq!((v.filter, v.band_low_hz, v.band_high_hz, v.uv(ViewFilter::Band)), (ViewFilter::Band, 300.0, 6000.0, 200.0));
+        assert_eq!(
+            (v.filter, v.band_low_hz, v.band_high_hz, v.uv(ViewFilter::Band)),
+            (ViewFilter::Band, 300.0, 6000.0, 200.0)
+        );
         assert_eq!(v.band_label(), "300–6k");
     }
     use super::*;
@@ -645,9 +725,19 @@ mod tests {
         let c = Config::parse(old).unwrap();
         assert_eq!(c.views.len(), 1);
         let v = &c.views[0];
-        assert_eq!((v.filter, v.window_s, v.uv_per_row, v.per_row), (ViewFilter::Band, 7.0, 800.0, 4));
+        assert_eq!(
+            (v.filter, v.window_s, v.uv_per_row, v.per_row),
+            (ViewFilter::Band, 7.0, 800.0, 4)
+        );
         assert_eq!((v.band_low_hz, v.band_high_hz), (1.0, 300.0));
-        assert_eq!(v.car, ViewCar { enabled: true, reference: vec![1, 2], subtract: vec![2] });
+        assert_eq!(
+            v.car,
+            ViewCar {
+                enabled: true,
+                reference: vec![1, 2],
+                subtract: vec![2]
+            }
+        );
         // The global (spikes/audio) CAR keeps its switches and sets.
         assert!(c.display.car.spikes && !c.display.car.audio);
         assert_eq!(c.display.car.reference, vec![1, 2]);
@@ -657,7 +747,12 @@ mod tests {
     #[test]
     fn new_configs_keep_their_views() {
         let mut c = Config::default();
-        c.views.push(TraceViewSettings { id: 1, name: "Port B".into(), headstages: vec!["B1".into()], ..Default::default() });
+        c.views.push(TraceViewSettings {
+            id: 1,
+            name: "Port B".into(),
+            headstages: vec!["B1".into()],
+            ..Default::default()
+        });
         let back = Config::parse(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.views, c.views);
     }

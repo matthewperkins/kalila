@@ -36,15 +36,25 @@ pub(super) struct RowSet {
 pub(super) enum Edit {
     FirstRow(usize),
     /// New µV/row for whole filters and for single channels (by `chan_key`).
-    Uv { filters: Vec<(ViewFilter, f32)>, channels: Vec<(String, f32)> },
+    Uv {
+        filters: Vec<(ViewFilter, f32)>,
+        channels: Vec<(String, f32)>,
+    },
     WindowS(f32),
     /// Back from review: bring the time base into the live range.
     LiveWindow,
     TrigLevel(f32),
     /// Alt+click on a row label: slope trigger on this electrode.
     TrigChannel(String),
-    RowFilter { chans: Vec<usize>, filter: ViewFilter, row_ch: Vec<u32> },
-    Monitor { chans: Vec<usize>, add: bool },
+    RowFilter {
+        chans: Vec<usize>,
+        filter: ViewFilter,
+        row_ch: Vec<u32>,
+    },
+    Monitor {
+        chans: Vec<usize>,
+        add: bool,
+    },
 }
 
 pub(super) struct ViewFrame<'a> {
@@ -100,9 +110,19 @@ impl ViewFrame<'_> {
         }
         let (row_ch, rowtab) = view_rows(l, d);
         let filters = chan_filters(l, d);
-        let rs = RowSet { row_ch, rowtab, filters };
+        let rs = RowSet {
+            row_ch,
+            rowtab,
+            filters,
+        };
         if rs.rowtab.is_empty() {
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "No channels selected", egui::FontId::proportional(16.0), Color32::GRAY);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No channels selected",
+                egui::FontId::proportional(16.0),
+                Color32::GRAY,
+            );
             // Nothing to draw: drop the staged samples and count the window as drawn.
             self.vs.reset();
             self.vs.last_drawn = Instant::now();
@@ -121,22 +141,58 @@ impl ViewFrame<'_> {
         // Free-running: TTL lanes under the traces (lines seen live or in the review image).
         // Triggered: a time axis instead. Review adds a time axis and the recording strip.
         let ttl_lines: Vec<usize> = if d.ttl_overlay && !trig {
-            let seen = self.vs.ttl.seen() | self.vs.review.as_ref().and_then(|r| r.shown.as_ref()).map_or(0, |s| s.ttl.seen());
-            (0..l.ttl_lines.min(16)).filter(|&i| seen & (1 << i) != 0 && d.ttl_hidden & (1 << i) == 0).collect()
+            let seen = self.vs.ttl.seen()
+                | self
+                    .vs
+                    .review
+                    .as_ref()
+                    .and_then(|r| r.shown.as_ref())
+                    .map_or(0, |s| s.ttl.seen());
+            (0..l.ttl_lines.min(16))
+                .filter(|&i| seen & (1 << i) != 0 && d.ttl_hidden & (1 << i) == 0)
+                .collect()
         } else {
             Vec::new()
         };
-        let ttl_h = if ttl_lines.is_empty() { 0.0 } else { 7.0 * ttl_lines.len() as f32 + 2.0 };
-        let strip_h = if trig { 14.0 } else if reviewing { ttl_h + 26.0 } else { ttl_h };
-        let plot = egui::Rect::from_min_max(egui::pos2(rect.min.x + label_w, rect.min.y), egui::pos2(rect.max.x, rect.max.y - strip_h));
+        let ttl_h = if ttl_lines.is_empty() {
+            0.0
+        } else {
+            7.0 * ttl_lines.len() as f32 + 2.0
+        };
+        let strip_h = if trig {
+            14.0
+        } else if reviewing {
+            ttl_h + 26.0
+        } else {
+            ttl_h
+        };
+        let plot = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + label_w, rect.min.y),
+            egui::pos2(rect.max.x, rect.max.y - strip_h),
+        );
         let strip = egui::Rect::from_min_max(egui::pos2(plot.min.x, plot.max.y + 2.0), rect.max);
         let rows = d.rows.clamp(1, nrows_all);
         let first = d.first_row.min(nrows_all - rows);
         // Interaction: wheel scrolls rows, Ctrl+wheel scales; scroll-back review with a drag,
         // Shift+wheel or a sideways swipe, Alt+wheel to zoom, arrows, Home and End.
-        let resp = ui.interact(rect, ui.scope_id().with(("traces", d.id)), egui::Sense::click_and_drag());
+        let resp = ui.interact(
+            rect,
+            ui.scope_id().with(("traces", d.id)),
+            egui::Sense::click_and_drag(),
+        );
         let cols = (plot.width() * ppp).floor().max(1.0) as u32;
-        let g = PlotGeom { rect, plot, strip, ttl_h, label_w, cols, rows, first, k, ppp };
+        let g = PlotGeom {
+            rect,
+            plot,
+            strip,
+            ttl_h,
+            label_w,
+            cols,
+            rows,
+            first,
+            k,
+            ppp,
+        };
         if resp.hovered() {
             self.wheel(ui, &resp, &g, &rs, &used);
         }
@@ -159,12 +215,24 @@ impl ViewFrame<'_> {
     fn wheel(&mut self, ui: &egui::Ui, resp: &egui::Response, g: &PlotGeom, rs: &RowSet, used: &[ViewFilter]) {
         let (d, l) = (self.d, self.l);
         let PlotGeom { plot, rows, first, .. } = *g;
-        let RowSet { row_ch, rowtab, filters } = rs;
+        let RowSet {
+            row_ch,
+            rowtab,
+            filters,
+        } = rs;
         let nrows_all = rowtab.len();
         // egui turns Ctrl+wheel (Cmd+wheel on macOS: `command` is whichever the platform
         // uses) into a zoom factor (and no scroll delta): > 1 for wheel up. On macOS a
         // trackpad pinch arrives as the same factor with no key held, and scales too.
-        let (scroll, ctrl, alt, shift, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.command, i.modifiers.alt, i.modifiers.shift, i.zoom_delta()));
+        let (scroll, ctrl, alt, shift, zoom) = ui.input(|i| {
+            (
+                i.smooth_scroll_delta.y,
+                i.modifiers.command,
+                i.modifiers.alt,
+                i.modifiers.shift,
+                i.zoom_delta(),
+            )
+        });
         let ctrl = ctrl || (cfg!(target_os = "macos") && zoom != 1.0);
         if !(scroll != 0.0 || (ctrl && zoom != 1.0)) || alt {
             return;
@@ -177,27 +245,53 @@ impl ViewFrame<'_> {
             }
             return;
         }
-        let over = resp.hover_pos().filter(|p| plot.contains(*p)).map(|p| first + (((p.y - plot.min.y) / plot.height() * rows as f32) as usize).min(rows - 1));
+        let over = resp
+            .hover_pos()
+            .filter(|p| plot.contains(*p))
+            .map(|p| first + (((p.y - plot.min.y) / plot.height() * rows as f32) as usize).min(rows - 1));
         // The electrodes of the row under the pointer (all those overlaid in it).
         let row_chans: Vec<usize> = over
             .map(|r| {
                 let [s0, n] = rowtab[r];
-                (s0..s0 + n).map(|i| row_ch[i as usize] as usize).filter(|&c| l.channels[c].kind == ChannelKind::Electrode).collect()
+                (s0..s0 + n)
+                    .map(|i| row_ch[i as usize] as usize)
+                    .filter(|&c| l.channels[c].kind == ChannelKind::Electrode)
+                    .collect()
             })
             .unwrap_or_default();
         // Wheel up: fewer µV per row, so the traces grow.
         let scale = 1.0 / zoom.clamp(0.5, 2.0);
         let edit = if !row_chans.is_empty() && !shift {
             // Ctrl+wheel over a row: that row alone.
-            let channels = row_chans.iter().filter_map(|&c| chan_key(l, c).map(|k| (d.uv_of(Some(&k), filters[c]) * scale, k))).map(|(uv, k)| (k, uv.clamp(10.0, 5000.0))).collect();
-            Edit::Uv { filters: Vec::new(), channels }
+            let channels = row_chans
+                .iter()
+                .filter_map(|&c| chan_key(l, c).map(|k| (d.uv_of(Some(&k), filters[c]) * scale, k)))
+                .map(|(uv, k)| (k, uv.clamp(10.0, 5000.0)))
+                .collect();
+            Edit::Uv {
+                filters: Vec::new(),
+                channels,
+            }
         } else {
             // Ctrl+Shift+wheel over a row: its whole filter; off the rows: every filter in
             // use. Per-row overrides on those filters scale along.
-            let fs: Vec<ViewFilter> = if row_chans.is_empty() { if used.is_empty() { vec![d.filter] } else { used.to_vec() } } else { row_chans.iter().map(|&c| filters[c]).collect() };
+            let fs: Vec<ViewFilter> = if row_chans.is_empty() {
+                if used.is_empty() { vec![d.filter] } else { used.to_vec() }
+            } else {
+                row_chans.iter().map(|&c| filters[c]).collect()
+            };
             Edit::Uv {
-                filters: ViewFilter::ALL.into_iter().filter(|f| fs.contains(f)).map(|f| (f, d.uv(f) * scale)).collect(),
-                channels: d.channel_uv.iter().filter(|(k, _)| fs.contains(&d.filter_of(Some(k)))).map(|(k, uv)| (k.clone(), (uv * scale).clamp(10.0, 5000.0))).collect(),
+                filters: ViewFilter::ALL
+                    .into_iter()
+                    .filter(|f| fs.contains(f))
+                    .map(|f| (f, d.uv(f) * scale))
+                    .collect(),
+                channels: d
+                    .channel_uv
+                    .iter()
+                    .filter(|(k, _)| fs.contains(&d.filter_of(Some(k))))
+                    .map(|(k, uv)| (k.clone(), (uv * scale).clamp(10.0, 5000.0)))
+                    .collect(),
             }
         };
         self.edits.push(edit);
@@ -229,7 +323,13 @@ impl ViewFrame<'_> {
         };
         if src.nch != self.nch {
             if nav.goes_back() {
-                note(vs, format!("The last recording has {} channels; the board now sends {}", src.nch, self.nch));
+                note(
+                    vs,
+                    format!(
+                        "The last recording has {} channels; the board now sends {}",
+                        src.nch, self.nch
+                    ),
+                );
             }
             return;
         }
@@ -271,10 +371,32 @@ impl ViewFrame<'_> {
     }
 
     /// A live frame: upload the new samples, find triggers, draw the traces and overlays.
-    fn live(&mut self, ui: &mut egui::Ui, resp: &egui::Response, g: &PlotGeom, bank: FilterBank, rs: &RowSet, ttl_lines: &[usize]) {
+    fn live(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        g: &PlotGeom,
+        bank: FilterBank,
+        rs: &RowSet,
+        ttl_lines: &[usize],
+    ) {
         let (d, l) = (self.d, self.l);
-        let PlotGeom { rect, plot, strip, cols, rows, first, k, ppp, .. } = *g;
-        let RowSet { row_ch, rowtab, filters } = rs;
+        let PlotGeom {
+            rect,
+            plot,
+            strip,
+            cols,
+            rows,
+            first,
+            k,
+            ppp,
+            ..
+        } = *g;
+        let RowSet {
+            row_ch,
+            rowtab,
+            filters,
+        } = rs;
         let used = &used_filters(l, filters, row_ch)[..];
         let nch = l.num_channels();
         let fs = l.sample_rate;
@@ -289,11 +411,26 @@ impl ViewFrame<'_> {
         let slope_trig = trig && d.trig_source == TrigSource::Spike;
         let tc = slope_trig.then(|| trig_channel(l, d)).flatten();
         let nslots = if trig { d.trig_sweeps.clamp(1, 50) } else { 0 };
-        let config = TraceConfig { nch, cols, window, bank, nslots };
+        let config = TraceConfig {
+            nch,
+            cols,
+            window,
+            bank,
+            nslots,
+        };
         vs.last_drawn = Instant::now();
         if vs.last_cfg.as_ref() != Some(&config) {
-            if let Some(c) = vs.last_cfg.as_ref().filter(|c| c.cols != config.cols || c.window != config.window || c.nch != config.nch || c.nslots != config.nslots) {
-                log::info!("trace window '{}': {} → {} columns, window {} → {} samples; GPU state rebuilt", d.name, c.cols, config.cols, c.window, config.window);
+            if let Some(c) = vs.last_cfg.as_ref().filter(|c| {
+                c.cols != config.cols || c.window != config.window || c.nch != config.nch || c.nslots != config.nslots
+            }) {
+                log::info!(
+                    "trace window '{}': {} → {} columns, window {} → {} samples; GPU state rebuilt",
+                    d.name,
+                    c.cols,
+                    config.cols,
+                    c.window,
+                    config.window
+                );
                 vs.reset = true;
             }
             vs.last_cfg = Some(config.clone());
@@ -324,7 +461,10 @@ impl ViewFrame<'_> {
         if vs.reset {
             vs.ttl.clear_cols();
         }
-        let words: Vec<u16> = vs.pending_ttl.drain(..(n_new as usize).min(vs.pending_ttl.len())).collect();
+        let words: Vec<u16> = vs
+            .pending_ttl
+            .drain(..(n_new as usize).min(vs.pending_ttl.len()))
+            .collect();
         let words = &words[..];
         vs.ttl.ingest(words, pos0, window, cols);
         if Arc::get_mut(&mut vs.upload).is_none() {
@@ -336,7 +476,11 @@ impl ViewFrame<'_> {
         let upload = vs.upload.clone();
         // The crossing level: the detector's threshold (sign per slope) or the fixed one.
         let level_uv = tc.map(|c| {
-            let mag = if d.trig_level_uv > 0.0 { d.trig_level_uv } else { self.stats.lock().threshold_uv.get(c).copied().unwrap_or(0.0).abs() };
+            let mag = if d.trig_level_uv > 0.0 {
+                d.trig_level_uv
+            } else {
+                self.stats.lock().threshold_uv.get(c).copied().unwrap_or(0.0).abs()
+            };
             if d.trig_slope == Slope::Neg { -mag } else { mag }
         });
         let sweep = if trig {
@@ -355,7 +499,13 @@ impl ViewFrame<'_> {
                         slope: d.trig_slope,
                         align: d.trig_align,
                         holdoff: ((DEAD_S + d.trig_holdoff_ms as f64 * 1e-3) * fs) as u32,
-                        window: d.trig_window.then(|| if d.trig_slope == Slope::Neg { -d.trig_level2_uv.abs() } else { d.trig_level2_uv.abs() }),
+                        window: d.trig_window.then(|| {
+                            if d.trig_slope == Slope::Neg {
+                                -d.trig_level2_uv.abs()
+                            } else {
+                                d.trig_level2_uv.abs()
+                            }
+                        }),
                     };
                     let mut found = Vec::new();
                     for i in 0..n_new as usize {
@@ -371,7 +521,13 @@ impl ViewFrame<'_> {
                 _ => {}
             }
             let cuts = vs.sweeps.take_ready(vs.counter, pre, post, nslots, RING, MAX_CUTS);
-            SweepFrame { ring0: (start % RING as u64) as u32, span, cuts, newest: vs.sweeps.newest_slot(nslots), filled: vs.sweeps.filled(nslots) }
+            SweepFrame {
+                ring0: (start % RING as u64) as u32,
+                span,
+                cuts,
+                newest: vs.sweeps.newest_slot(nslots),
+                filled: vs.sweeps.filled(nslots),
+            }
         } else {
             SweepFrame::default()
         };
@@ -433,11 +589,24 @@ impl ViewFrame<'_> {
         let t_to_x = |t_ms: f32| plot.min.x + (t_ms + pre_ms) / span_ms.max(1e-3) * plot.width();
         if trig && !slope_trig && vs.sweeps.count() > 0 {
             // Laser-on shading under the traces: newest sweep's TTL high time.
-            let w_ms = vs.sweeps.newest_width().map(|w| w as f32 * 1e3 / fs as f32).unwrap_or(post_ms).min(post_ms);
+            let w_ms = vs
+                .sweeps
+                .newest_width()
+                .map(|w| w as f32 * 1e3 / fs as f32)
+                .unwrap_or(post_ms)
+                .min(post_ms);
             let c = crate::ttl::line_color(d.trig_line);
-            p.rect_filled(egui::Rect::from_min_max(egui::pos2(t_to_x(0.0), plot.min.y), egui::pos2(t_to_x(w_ms).max(t_to_x(0.0) + 1.0), plot.max.y)), 0.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 34));
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(t_to_x(0.0), plot.min.y),
+                    egui::pos2(t_to_x(w_ms).max(t_to_x(0.0) + 1.0), plot.max.y),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 34),
+            );
         }
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(frame)));
+        ui.painter()
+            .add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(frame)));
         // Overlay: labels, separators, cursor / time axis.
         let analog_visible = self.row_labels(ui, &p, g, rs, resp);
         let vs = &*self.vs;
@@ -445,25 +614,61 @@ impl ViewFrame<'_> {
         if let Some((until, msg)) = &vs.note
             && Instant::now() < *until
         {
-            p.text(plot.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(15.0), Color32::from_rgb(230, 200, 120));
+            p.text(
+                plot.center(),
+                egui::Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(15.0),
+                Color32::from_rgb(230, 200, 120),
+            );
         }
         if trig {
             // t = 0 line and a time axis in ms.
             let x0 = t_to_x(0.0);
-            p.line_segment([egui::pos2(x0, plot.min.y), egui::pos2(x0, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)));
-            let step = [0.1f32, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0].into_iter().find(|s| span_ms / s <= 12.0).unwrap_or(500.0);
+            p.line_segment(
+                [egui::pos2(x0, plot.min.y), egui::pos2(x0, plot.max.y)],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)),
+            );
+            let step = [0.1f32, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+                .into_iter()
+                .find(|s| span_ms / s <= 12.0)
+                .unwrap_or(500.0);
             let decimals = if step < 1.0 { 1 } else { 0 };
             let mut t = -(pre_ms / step).floor() * step;
             while t <= post_ms + 1e-3 {
                 let x = t_to_x(t);
-                p.line_segment([egui::pos2(x, plot.max.y), egui::pos2(x, plot.max.y + 4.0)], Stroke::new(1.0, dim));
+                p.line_segment(
+                    [egui::pos2(x, plot.max.y), egui::pos2(x, plot.max.y + 4.0)],
+                    Stroke::new(1.0, dim),
+                );
                 tick_label(&p, x, rect.max.y - 1.0, false, format!("{t:.decimals$}"), plot, dim);
                 t += step;
             }
-            p.text(egui::pos2(rect.min.x + 4.0, rect.max.y - 1.0), egui::Align2::LEFT_BOTTOM, "ms", egui::FontId::monospace(10.0), dim);
+            p.text(
+                egui::pos2(rect.min.x + 4.0, rect.max.y - 1.0),
+                egui::Align2::LEFT_BOTTOM,
+                "ms",
+                egui::FontId::monospace(10.0),
+                dim,
+            );
             let source = if slope_trig {
                 match (tc, level_uv) {
-                    (Some(c), Some(level)) if level != 0.0 => format!("{} {} {:+.0} µV{} · t0 {}", l.channels[c].name, if d.trig_slope == Slope::Neg { "falling through" } else { "rising through" }, level, if d.trig_level_uv > 0.0 { "" } else { " (detector)" }, if d.trig_align == TrigAlign::Trough { "trough" } else { "crossing" }),
+                    (Some(c), Some(level)) if level != 0.0 => format!(
+                        "{} {} {:+.0} µV{} · t0 {}",
+                        l.channels[c].name,
+                        if d.trig_slope == Slope::Neg {
+                            "falling through"
+                        } else {
+                            "rising through"
+                        },
+                        level,
+                        if d.trig_level_uv > 0.0 { "" } else { " (detector)" },
+                        if d.trig_align == TrigAlign::Trough {
+                            "trough"
+                        } else {
+                            "crossing"
+                        }
+                    ),
                     (Some(c), _) => format!("{} · waiting for the noise estimate", l.channels[c].name),
                     _ => "slope trigger · pick a channel (Alt+click a row label)".into(),
                 }
@@ -472,13 +677,22 @@ impl ViewFrame<'_> {
             };
             let waiting = match (vs.sweeps.count(), slope_trig) {
                 (0, false) => format!(" · waiting for TTL{}", d.trig_line + 1),
-                (0, true) if tc.is_some() && level_uv.is_some_and(|l| l != 0.0) => " · waiting for a crossing".to_string(),
+                (0, true) if tc.is_some() && level_uv.is_some_and(|l| l != 0.0) => {
+                    " · waiting for a crossing".to_string()
+                }
                 _ => String::new(),
             };
             p.text(
                 egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0),
                 egui::Align2::RIGHT_BOTTOM,
-                format!("{source} · {} / {} sweeps · {}{}{}", vs.sweeps.filled(nslots), nslots, uv_text(d, used), if car_on { " · CAR" } else { "" }, waiting),
+                format!(
+                    "{source} · {} / {} sweeps · {}{}{}",
+                    vs.sweeps.filled(nslots),
+                    nslots,
+                    uv_text(d, used),
+                    if car_on { " · CAR" } else { "" },
+                    waiting
+                ),
                 egui::FontId::monospace(11.0),
                 dim,
             );
@@ -495,7 +709,12 @@ impl ViewFrame<'_> {
                 let y = (yc - level * rh / uv).clamp(plot.min.y, plot.max.y);
                 let col = Color32::from_rgb(255, 170, 60);
                 let handle = egui::Rect::from_min_max(egui::pos2(plot.min.x, y - 4.0), egui::pos2(plot.max.x, y + 4.0));
-                let hr = ui.interact(handle, ui.scope_id().with(("triglevel", d.id)), egui::Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text(format!("Trigger level {level:+.0} µV · drag to set a fixed level for this window"));
+                let hr = ui
+                    .interact(handle, ui.scope_id().with(("triglevel", d.id)), egui::Sense::drag())
+                    .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                    .on_hover_text(format!(
+                        "Trigger level {level:+.0} µV · drag to set a fixed level for this window"
+                    ));
                 if hr.dragged()
                     && let Some(pos) = hr.interact_pointer_pos()
                 {
@@ -506,39 +725,102 @@ impl ViewFrame<'_> {
                         self.edits.push(Edit::TrigLevel(mag));
                     }
                 }
-                let dash = if hr.hovered() || hr.dragged() { Stroke::new(1.5, col) } else { Stroke::new(1.0, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 170)) };
+                let dash = if hr.hovered() || hr.dragged() {
+                    Stroke::new(1.5, col)
+                } else {
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 170))
+                };
                 let mut x = plot.min.x;
                 while x < plot.max.x {
                     p.line_segment([egui::pos2(x, y), egui::pos2((x + 6.0).min(plot.max.x), y)], dash);
                     x += 10.0;
                 }
-                p.text(egui::pos2(plot.min.x + 3.0, y - 2.0), egui::Align2::LEFT_BOTTOM, format!("{level:+.0} µV"), egui::FontId::monospace(10.0), col);
+                p.text(
+                    egui::pos2(plot.min.x + 3.0, y - 2.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{level:+.0} µV"),
+                    egui::FontId::monospace(10.0),
+                    col,
+                );
                 if level == 0.0 {
-                    p.text(egui::pos2(plot.min.x + 3.0, y - 12.0), egui::Align2::LEFT_BOTTOM, "no threshold yet", egui::FontId::monospace(10.0), col);
+                    p.text(
+                        egui::pos2(plot.min.x + 3.0, y - 12.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        "no threshold yet",
+                        egui::FontId::monospace(10.0),
+                        col,
+                    );
                 }
             }
         } else {
-            vs.ttl.draw(&p, &TtlGeom::live(plot, strip, rect.min.x + 4.0, ppp, cursor_col, None), ttl_lines);
+            vs.ttl.draw(
+                &p,
+                &TtlGeom::live(plot, strip, rect.min.x + 4.0, ppp, cursor_col, None),
+                ttl_lines,
+            );
             // Notes: absolute sample → position in the sweep (window position = counter % window).
             let base = self.newest_sample - (vs.pending.len() / nch) as i64 - vs.counter as i64;
             let (counter, w64) = (vs.counter as i64, window as i64);
             self.draw_note_markers(&p, plot, ui, |s| {
                 let c = s - base;
-                (c <= counter && c > counter - w64).then(|| plot.min.x + (c.rem_euclid(w64) as f64 * cols as f64 / w64 as f64) as f32 / ppp)
+                (c <= counter && c > counter - w64)
+                    .then(|| plot.min.x + (c.rem_euclid(w64) as f64 * cols as f64 / w64 as f64) as f32 / ppp)
             });
             let x = plot.min.x + cursor_col as f32 / ppp;
-            p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)));
-            p.text(egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0), egui::Align2::RIGHT_BOTTOM, format!("{:.2} s · {}{}{}", d.window_s, uv_text(d, used), if car_on { " · CAR" } else { "" }, if analog_visible { format!(" · ADC {:.2} V/row · AUX 2.5 V/row", d.adc_v_per_row) } else { String::new() }), egui::FontId::monospace(11.0), dim);
+            p.line_segment(
+                [egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+            );
+            p.text(
+                egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!(
+                    "{:.2} s · {}{}{}",
+                    d.window_s,
+                    uv_text(d, used),
+                    if car_on { " · CAR" } else { "" },
+                    if analog_visible {
+                        format!(" · ADC {:.2} V/row · AUX 2.5 V/row", d.adc_v_per_row)
+                    } else {
+                        String::new()
+                    }
+                ),
+                egui::FontId::monospace(11.0),
+                dim,
+            );
         }
     }
 
     /// One frame of a window in review: read and filter the stretch on screen (double
     /// buffered on the GPU), then draw it with labels, TTL lanes, a time axis, a "behind live"
     /// badge and a strip for the whole recording (click or drag to jump).
-    fn review(&mut self, ui: &mut egui::Ui, resp: &egui::Response, g: &PlotGeom, bank: FilterBank, rs: &RowSet, ttl_lines: &[usize]) {
+    fn review(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        g: &PlotGeom,
+        bank: FilterBank,
+        rs: &RowSet,
+        ttl_lines: &[usize],
+    ) {
         let (d, l) = (self.d, self.l);
-        let PlotGeom { rect, plot, strip, ttl_h, cols, rows, first, k, ppp, .. } = *g;
-        let RowSet { row_ch, rowtab, filters } = rs;
+        let PlotGeom {
+            rect,
+            plot,
+            strip,
+            ttl_h,
+            cols,
+            rows,
+            first,
+            k,
+            ppp,
+            ..
+        } = *g;
+        let RowSet {
+            row_ch,
+            rowtab,
+            filters,
+        } = rs;
         let fs = l.sample_rate;
         let nch = l.num_channels();
         let Some(src) = self.rec_source.filter(|s| s.nch == nch) else {
@@ -563,9 +845,24 @@ impl ViewFrame<'_> {
         vs.last_data = Instant::now();
         let Some(rv) = vs.review.as_mut() else { return };
         rv.clamp(src.first_sample, end, min_span, max_span);
-        let key = review::Key { t0: rv.t0, span: rv.span, cols, nch, filters: filters.clone(), band: band_bits(d), car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())) };
+        let key = review::Key {
+            t0: rv.t0,
+            span: rv.span,
+            cols,
+            nch,
+            filters: filters.clone(),
+            band: band_bits(d),
+            car: car_on.then(|| (d.car.reference.clone(), d.car.subtract.clone())),
+        };
         let row_h_px = plot.height() * ppp / rows as f32;
-        let frame = |view: u32, config: TraceConfig, reset: bool, (upload, upload_off): (Arc<Vec<i16>>, usize), n_new: u32, pos0: u32, paint: bool, xf: (f32, f32, u32)| TraceFrame {
+        let frame = |view: u32,
+                     config: TraceConfig,
+                     reset: bool,
+                     (upload, upload_off): (Arc<Vec<i16>>, usize),
+                     n_new: u32,
+                     pos0: u32,
+                     paint: bool,
+                     xf: (f32, f32, u32)| TraceFrame {
             view,
             config,
             reset,
@@ -601,17 +898,44 @@ impl ViewFrame<'_> {
         let mut served = false;
         if use_pyr && rv.filling.is_none() {
             let stale = rv.shown.as_ref().is_none_or(|s| s.key != key);
-            let refresh = rv.shown.as_ref().is_some_and(|s| s.key == key && s.pyramid.is_some_and(|(at, complete)| !complete && at.elapsed() > Duration::from_millis(300)));
+            let refresh = rv.shown.as_ref().is_some_and(|s| {
+                s.key == key
+                    && s.pyramid
+                        .is_some_and(|(at, complete)| !complete && at.elapsed() > Duration::from_millis(300))
+            });
             if stale || refresh {
                 let st = self.pyramids.lock();
                 if let Some((columns, words, complete)) = pyramid_columns(&st, src, id, l, filters, &key) {
                     drop(st);
                     let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
-                    let config = TraceConfig { nch, cols, window: rv.span.max(1), bank: bank.clone(), nslots: 0 };
-                    let mut fr = frame(review_key(id, buf), config.clone(), true, (Arc::new(Vec::new()), 0), 0, 0, false, (0.0, 1.0, 0));
+                    let config = TraceConfig {
+                        nch,
+                        cols,
+                        window: rv.span.max(1),
+                        bank: bank.clone(),
+                        nslots: 0,
+                    };
+                    let mut fr = frame(
+                        review_key(id, buf),
+                        config.clone(),
+                        true,
+                        (Arc::new(Vec::new()), 0),
+                        0,
+                        0,
+                        false,
+                        (0.0, 1.0, 0),
+                    );
                     fr.columns = Some(Arc::new(columns));
-                    ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
-                    rv.shown = Some(review::Shown { key: key.clone(), buf, config, ttl: TtlOverlay::from_columns(&words), pos_t0: 0, pyramid: Some((Instant::now(), complete)) });
+                    ui.painter()
+                        .add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
+                    rv.shown = Some(review::Shown {
+                        key: key.clone(),
+                        buf,
+                        config,
+                        ttl: TtlOverlay::from_columns(&words),
+                        pos_t0: 0,
+                        pyramid: Some((Instant::now(), complete)),
+                    });
                     if !complete {
                         ui.ctx().request_repaint_after(Duration::from_millis(300));
                     }
@@ -630,21 +954,58 @@ impl ViewFrame<'_> {
             // filter state continues from its end, with no lead-in and no refiltering.
             let append = rv.shown.as_ref().filter(|s| {
                 let d = key.t0 - s.key.t0;
-                d > 0 && d < s.key.span as i64 && review::Key { t0: s.key.t0, ..key.clone() } == s.key
+                d > 0
+                    && d < s.key.span as i64
+                    && review::Key {
+                        t0: s.key.t0,
+                        ..key.clone()
+                    } == s.key
             });
             let (req, buf, append) = match append {
                 Some(s) => {
                     let from = s.key.t0 + s.key.span as i64;
                     let n = (key.t0 - s.key.t0) as usize;
-                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from, n, words_from: from, words_n: n }, s.buf, true)
+                    (
+                        review::Req {
+                            view: id,
+                            generation: rv.generation,
+                            src: src.clone(),
+                            from,
+                            n,
+                            words_from: from,
+                            words_n: n,
+                        },
+                        s.buf,
+                        true,
+                    )
                 }
                 None => {
                     let buf = rv.shown.as_ref().map_or(0, |s| 1 - s.buf);
-                    (review::Req { view: id, generation: rv.generation, src: src.clone(), from: rv.t0 - lead, n: (lead + rv.span as i64) as usize, words_from: rv.t0, words_n: rv.span as usize }, buf, false)
+                    (
+                        review::Req {
+                            view: id,
+                            generation: rv.generation,
+                            src: src.clone(),
+                            from: rv.t0 - lead,
+                            n: (lead + rv.span as i64) as usize,
+                            words_from: rv.t0,
+                            words_n: rv.span as usize,
+                        },
+                        buf,
+                        false,
+                    )
                 }
             };
             let _ = self.reader.tx.send(req);
-            rv.filling = Some(review::Filling { key: key.clone(), generation: rv.generation, buf, append, loaded: None, started: Instant::now(), loaded_at: None });
+            rv.filling = Some(review::Filling {
+                key: key.clone(),
+                generation: rv.generation,
+                buf,
+                append,
+                loaded: None,
+                started: Instant::now(),
+                loaded_at: None,
+            });
         }
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         // Feed the back buffer (in chunks small enough for the GPU's binding limit).
@@ -655,12 +1016,30 @@ impl ViewFrame<'_> {
             let total = ld.data.len() / nch.max(1);
             let chunk = ((8usize << 20) / nch.max(1)).max(1).min(total - ld.fed);
             let span = f.key.span.max(1);
-            let config = TraceConfig { nch, cols: f.key.cols, window: span, bank: bank.clone(), nslots: 0 };
+            let config = TraceConfig {
+                nch,
+                cols: f.key.cols,
+                window: span,
+                bank: bank.clone(),
+                nslots: 0,
+            };
             let upload = (ld.data.clone(), ld.fed * nch);
             let pos0 = ((ld.pos0 as u64 + ld.fed as u64) % span as u64) as u32;
-            let fr = frame(review_key(id, f.buf), config, ld.fed == 0 && !f.append, upload, chunk as u32, pos0, false, (0.0, 1.0, 0));
-            ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
-            if f.append && let Some(sh) = rv.shown.as_mut() {
+            let fr = frame(
+                review_key(id, f.buf),
+                config,
+                ld.fed == 0 && !f.append,
+                upload,
+                chunk as u32,
+                pos0,
+                false,
+                (0.0, 1.0, 0),
+            );
+            ui.painter()
+                .add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
+            if f.append
+                && let Some(sh) = rv.shown.as_mut()
+            {
                 // Ingests run before this frame's draw, so the shown image advances with each
                 // chunk (the stretch may be shorter than asked if the recorder hadn't flushed
                 // that far; the rest comes with the next request).
@@ -680,15 +1059,35 @@ impl ViewFrame<'_> {
             let ld = f.loaded.expect("complete implies loaded");
             let span = f.key.span.max(1);
             let read_ms = f.loaded_at.map_or(0.0, |t| (t - f.started).as_secs_f32() * 1e3);
-            log::debug!("review '{}': {} {} samples in {:.1} ms (read {:.1} ms)", d.name, if f.append { "appended" } else { "filled" }, ld.data.len() / nch.max(1), f.started.elapsed().as_secs_f32() * 1e3, read_ms);
+            log::debug!(
+                "review '{}': {} {} samples in {:.1} ms (read {:.1} ms)",
+                d.name,
+                if f.append { "appended" } else { "filled" },
+                ld.data.len() / nch.max(1),
+                f.started.elapsed().as_secs_f32() * 1e3,
+                read_ms
+            );
             if !f.append {
                 let mut ttl = TtlOverlay::default();
                 ttl.reset();
                 if !ld.words.is_empty() {
                     ttl.ingest(&ld.words, 0, span, f.key.cols);
                 }
-                let config = TraceConfig { nch, cols: f.key.cols, window: span, bank: bank.clone(), nslots: 0 };
-                rv.shown = Some(review::Shown { key: f.key, buf: f.buf, config, ttl, pos_t0: 0, pyramid: None });
+                let config = TraceConfig {
+                    nch,
+                    cols: f.key.cols,
+                    window: span,
+                    bank: bank.clone(),
+                    nslots: 0,
+                };
+                rv.shown = Some(review::Shown {
+                    key: f.key,
+                    buf: f.buf,
+                    config,
+                    ttl,
+                    pos_t0: 0,
+                    pyramid: None,
+                });
             }
         }
         // Draw the shown image where its stretch falls in the current one.
@@ -698,8 +1097,18 @@ impl ViewFrame<'_> {
             (x_shift as f32, x_scale, sh.rot())
         });
         if let Some(sh) = rv.shown.as_ref() {
-            let fr = frame(review_key(id, sh.buf), sh.config.clone(), false, (Arc::new(Vec::new()), 0), 0, 0, true, xf);
-            ui.painter().add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
+            let fr = frame(
+                review_key(id, sh.buf),
+                sh.config.clone(),
+                false,
+                (Arc::new(Vec::new()), 0),
+                0,
+                0,
+                true,
+                xf,
+            );
+            ui.painter()
+                .add(egui_wgpu::Callback::new_paint_callback(plot, TraceCallback(fr)));
         }
         // Overlay.
         let p = ui.painter_at(rect);
@@ -710,33 +1119,82 @@ impl ViewFrame<'_> {
         let ttl_strip = egui::Rect::from_min_max(strip.min, egui::pos2(strip.max.x, strip.min.y + ttl_h));
         let mut review_notes: Option<(i64, i64)> = None;
         if let Some(sh) = rv.shown.as_ref() {
-            sh.ttl.draw(&p, &TtlGeom { plot, strip: ttl_strip, label_x: rect.min.x + 4.0, ppp, cursor: 0, gap: Some(0), rot: xf.2, x_shift: xf.0, x_scale: xf.1 }, ttl_lines);
+            sh.ttl.draw(
+                &p,
+                &TtlGeom {
+                    plot,
+                    strip: ttl_strip,
+                    label_x: rect.min.x + 4.0,
+                    ppp,
+                    cursor: 0,
+                    gap: Some(0),
+                    rot: xf.2,
+                    x_shift: xf.0,
+                    x_scale: xf.1,
+                },
+                ttl_lines,
+            );
             let (st0, sspan) = (sh.key.t0, sh.key.span as i64);
             review_notes = Some((st0, sspan));
         } else {
-            let msg = if use_pyr && !direct_ok { "Building the overview of the recording…" } else { "Reading the recording…" };
-            p.text(plot.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(15.0), dim);
+            let msg = if use_pyr && !direct_ok {
+                "Building the overview of the recording…"
+            } else {
+                "Reading the recording…"
+            };
+            p.text(
+                plot.center(),
+                egui::Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(15.0),
+                dim,
+            );
         }
         // Time axis (time since the recording started).
         let axis_y = strip.min.y + ttl_h + 1.0;
         let span_s = span as f64 / fs;
-        let step = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0].into_iter().find(|s| span_s / s <= 8.0).unwrap_or(3600.0);
+        let step = [
+            0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
+            600.0, 1200.0, 1800.0,
+        ]
+        .into_iter()
+        .find(|s| span_s / s <= 8.0)
+        .unwrap_or(3600.0);
         let x_of = |s: i64| plot.min.x + ((s - t0) as f64 / span.max(1) as f64) as f32 * plot.width();
         let mut t = (rel(t0) / step).ceil() * step;
         while t <= rel(t0 + span) + 1e-9 {
             let x = x_of(src.first_sample + (t * fs).round() as i64);
-            p.line_segment([egui::pos2(x, axis_y), egui::pos2(x, axis_y + 4.0)], Stroke::new(1.0, dim));
+            p.line_segment(
+                [egui::pos2(x, axis_y), egui::pos2(x, axis_y + 4.0)],
+                Stroke::new(1.0, dim),
+            );
             tick_label(&p, x, axis_y + 4.0, true, review::fmt_time(t, step < 0.1), plot, dim);
             t += step;
         }
         // The whole recording so far, with the stretch on screen.
-        let ov = egui::Rect::from_min_max(egui::pos2(plot.min.x, rect.max.y - 7.0), egui::pos2(plot.max.x, rect.max.y - 1.0));
+        let ov = egui::Rect::from_min_max(
+            egui::pos2(plot.min.x, rect.max.y - 7.0),
+            egui::pos2(plot.max.x, rect.max.y - 1.0),
+        );
         let total = (end - src.first_sample).max(1) as f64;
         let ox = |s: i64| ov.min.x + ((s - src.first_sample) as f64 / total).clamp(0.0, 1.0) as f32 * ov.width();
         p.rect_filled(ov, 2.0, Color32::from_gray(38));
         let (bx0, bx1) = (ox(t0), ox(t0 + span));
-        p.rect_filled(egui::Rect::from_min_max(egui::pos2(bx0, ov.min.y - 1.0), egui::pos2(bx1.max(bx0 + 3.0), ov.max.y + 1.0)), 1.0, accent);
-        let or = ui.interact(ov.expand2(egui::vec2(0.0, 3.0)), ui.scope_id().with(("overview", id)), egui::Sense::click_and_drag()).on_hover_text("The whole recording: click or drag to jump");
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(bx0, ov.min.y - 1.0),
+                egui::pos2(bx1.max(bx0 + 3.0), ov.max.y + 1.0),
+            ),
+            1.0,
+            accent,
+        );
+        let or = ui
+            .interact(
+                ov.expand2(egui::vec2(0.0, 3.0)),
+                ui.scope_id().with(("overview", id)),
+                egui::Sense::click_and_drag(),
+            )
+            .on_hover_text("The whole recording: click or drag to jump");
         if (or.clicked() || or.dragged())
             && let Some(pos) = or.interact_pointer_pos()
         {
@@ -747,28 +1205,64 @@ impl ViewFrame<'_> {
         let behind = (newest - (t0 + span)).max(0) as f64 / fs;
         let loading = if rv.filling.is_some() {
             " · reading"
-        } else if rv.shown.as_ref().is_some_and(|s| s.pyramid.is_some_and(|(_, complete)| !complete)) {
+        } else if rv
+            .shown
+            .as_ref()
+            .is_some_and(|s| s.pyramid.is_some_and(|(_, complete)| !complete))
+        {
             " · building the overview"
         } else {
             ""
         };
         let err = rv.error.clone();
-        let badge = format!("REVIEW  {} – {}  ·  {} behind live{loading}", review::fmt_time(rel(t0), span_s < 1.0), review::fmt_time(rel(t0 + span), span_s < 1.0), review::fmt_time(behind, false));
+        let badge = format!(
+            "REVIEW  {} – {}  ·  {} behind live{loading}",
+            review::fmt_time(rel(t0), span_s < 1.0),
+            review::fmt_time(rel(t0 + span), span_s < 1.0),
+            review::fmt_time(behind, false)
+        );
         let live_r = egui::Rect::from_min_size(egui::pos2(plot.max.x - 74.0, plot.min.y + 4.0), egui::vec2(70.0, 20.0));
-        p.text(egui::pos2(live_r.min.x - 8.0, live_r.center().y), egui::Align2::RIGHT_CENTER, badge, egui::FontId::monospace(11.0), accent);
-        let go_live = ui.put(live_r, egui::Button::new("LIVE >")).on_hover_text("Back to live (End)").clicked();
+        p.text(
+            egui::pos2(live_r.min.x - 8.0, live_r.center().y),
+            egui::Align2::RIGHT_CENTER,
+            badge,
+            egui::FontId::monospace(11.0),
+            accent,
+        );
+        let go_live = ui
+            .put(live_r, egui::Button::new("LIVE >"))
+            .on_hover_text("Back to live (End)")
+            .clicked();
         if let Some(e) = err {
-            p.text(plot.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(13.0), Color32::from_rgb(240, 120, 100));
+            p.text(
+                plot.center(),
+                egui::Align2::CENTER_CENTER,
+                e,
+                egui::FontId::proportional(13.0),
+                Color32::from_rgb(240, 120, 100),
+            );
         }
         p.text(
             egui::pos2(plot.max.x - 4.0, plot.max.y - 4.0),
             egui::Align2::RIGHT_BOTTOM,
-            format!("{} · {}{}", if span_s < 1.0 { format!("{:.0} ms", span_s * 1e3) } else { format!("{span_s:.2} s") }, uv_text(d, &used), if car_on { " · CAR" } else { "" }),
+            format!(
+                "{} · {}{}",
+                if span_s < 1.0 {
+                    format!("{:.0} ms", span_s * 1e3)
+                } else {
+                    format!("{span_s:.2} s")
+                },
+                uv_text(d, &used),
+                if car_on { " · CAR" } else { "" }
+            ),
             egui::FontId::monospace(11.0),
             dim,
         );
         if let Some((st0, sspan)) = review_notes {
-            self.draw_note_markers(&p, plot, ui, |s| (s >= st0 && s < st0 + sspan).then(|| plot.min.x + ((s - st0) as f64 / sspan.max(1) as f64) as f32 * plot.width()));
+            self.draw_note_markers(&p, plot, ui, |s| {
+                (s >= st0 && s < st0 + sspan)
+                    .then(|| plot.min.x + ((s - st0) as f64 / sspan.max(1) as f64) as f32 * plot.width())
+            });
         }
         let _ = self.row_labels(ui, &p, g, rs, resp);
         if go_live {
@@ -778,10 +1272,28 @@ impl ViewFrame<'_> {
 
     /// Channel labels down the left edge of a trace plot; clicking one monitors it on audio
     /// (Ctrl/Shift adds or removes it). Returns whether an AUX/ADC row is visible.
-    fn row_labels(&mut self, ui: &egui::Ui, p: &egui::Painter, g: &PlotGeom, rs: &RowSet, resp: &egui::Response) -> bool {
+    fn row_labels(
+        &mut self,
+        ui: &egui::Ui,
+        p: &egui::Painter,
+        g: &PlotGeom,
+        rs: &RowSet,
+        resp: &egui::Response,
+    ) -> bool {
         let (d, l) = (self.d, self.l);
-        let PlotGeom { rect, plot, rows, first, label_w, .. } = *g;
-        let RowSet { row_ch, rowtab, filters } = rs;
+        let PlotGeom {
+            rect,
+            plot,
+            rows,
+            first,
+            label_w,
+            ..
+        } = *g;
+        let RowSet {
+            row_ch,
+            rowtab,
+            filters,
+        } = rs;
         let rh = plot.height() / rows as f32;
         let mon = self.audio.lock().channels.clone();
         let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
@@ -800,27 +1312,71 @@ impl ViewFrame<'_> {
             let lab = egui::Rect::from_min_size(egui::pos2(rect.min.x, y - rh / 2.0), egui::vec2(label_w, rh));
             let monitored = chans.iter().any(|c| mon.contains(c));
             if rh >= 9.0 {
-                let name = if chans.len() == 1 { l.channels[ch].name.clone() } else { format!("{}–{}", l.channels[ch].name, l.channels[*chans.last().unwrap()].name.trim_start_matches("CH")) };
+                let name = if chans.len() == 1 {
+                    l.channels[ch].name.clone()
+                } else {
+                    format!(
+                        "{}–{}",
+                        l.channels[ch].name,
+                        l.channels[*chans.last().unwrap()].name.trim_start_matches("CH")
+                    )
+                };
                 let txt = format!("{name}{}", if monitored { " ♪" } else { "" });
-                let col = chans.iter().find_map(|&c| monitor_color32(&mon, c)).unwrap_or(Color32::from_gray(150));
-                p.text(egui::pos2(rect.min.x + 4.0, y), egui::Align2::LEFT_CENTER, txt, egui::FontId::monospace((rh * 0.6).clamp(8.0, 13.0)), col);
+                let col = chans
+                    .iter()
+                    .find_map(|&c| monitor_color32(&mon, c))
+                    .unwrap_or(Color32::from_gray(150));
+                p.text(
+                    egui::pos2(rect.min.x + 4.0, y),
+                    egui::Align2::LEFT_CENTER,
+                    txt,
+                    egui::FontId::monospace((rh * 0.6).clamp(8.0, 13.0)),
+                    col,
+                );
                 // Filter chip: one segment per preset; a row overlaying channels with
                 // different filters shows each of them hatched.
                 if is_electrode {
                     let h = (rh - 2.0).clamp(8.0, 14.0);
-                    let chip = egui::Rect::from_min_size(egui::pos2(rect.min.x + label_w - CHIP_W - 3.0, y - h / 2.0), egui::vec2(CHIP_W, h));
-                    let here: Vec<ViewFilter> = ViewFilter::ALL.into_iter().filter(|f| chans.iter().any(|&c| filters[c] == *f)).collect();
+                    let chip = egui::Rect::from_min_size(
+                        egui::pos2(rect.min.x + label_w - CHIP_W - 3.0, y - h / 2.0),
+                        egui::vec2(CHIP_W, h),
+                    );
+                    let here: Vec<ViewFilter> = ViewFilter::ALL
+                        .into_iter()
+                        .filter(|f| chans.iter().any(|&c| filters[c] == *f))
+                        .collect();
                     let seg_w = CHIP_W / ViewFilter::ALL.len() as f32;
                     for (j, f) in ViewFilter::ALL.into_iter().enumerate() {
-                        let seg = egui::Rect::from_min_size(egui::pos2(chip.min.x + j as f32 * seg_w, chip.min.y), egui::vec2(seg_w, h));
-                        let sr = ui.interact(seg, ui.scope_id().with(("rowfilt", d.id, first + r, j)), egui::Sense::click()).on_hover_text(filter_help(f, d));
+                        let seg = egui::Rect::from_min_size(
+                            egui::pos2(chip.min.x + j as f32 * seg_w, chip.min.y),
+                            egui::vec2(seg_w, h),
+                        );
+                        let sr = ui
+                            .interact(
+                                seg,
+                                ui.scope_id().with(("rowfilt", d.id, first + r, j)),
+                                egui::Sense::click(),
+                            )
+                            .on_hover_text(filter_help(f, d));
                         let on = here.contains(&f);
-                        let fill = if on { ui.visuals().selection.bg_fill } else if sr.hovered() { Color32::from_gray(60) } else { Color32::from_gray(34) };
+                        let fill = if on {
+                            ui.visuals().selection.bg_fill
+                        } else if sr.hovered() {
+                            Color32::from_gray(60)
+                        } else {
+                            Color32::from_gray(34)
+                        };
                         p.rect_filled(seg.shrink(0.5), 2.0, fill);
                         if on && here.len() > 1 {
                             hatch(p, seg.shrink(0.5));
                         }
-                        p.text(seg.center(), egui::Align2::CENTER_CENTER, f.letter(), egui::FontId::monospace((h * 0.8).min(10.0)), if on { Color32::WHITE } else { Color32::from_gray(140) });
+                        p.text(
+                            seg.center(),
+                            egui::Align2::CENTER_CENTER,
+                            f.letter(),
+                            egui::FontId::monospace((h * 0.8).min(10.0)),
+                            if on { Color32::WHITE } else { Color32::from_gray(140) },
+                        );
                         if sr.clicked() {
                             set_filter = Some((chans.clone(), f));
                         }
@@ -847,10 +1403,17 @@ impl ViewFrame<'_> {
         if let (Some(ch), Some(key)) = (trig_pick, trig_pick.and_then(|c| chan_key(l, c))) {
             self.edits.push(Edit::TrigChannel(key));
             self.vs.review = None;
-            self.vs.note = Some((Instant::now() + Duration::from_secs(2), format!("Slope trigger on {}", l.channels[ch].name)));
+            self.vs.note = Some((
+                Instant::now() + Duration::from_secs(2),
+                format!("Slope trigger on {}", l.channels[ch].name),
+            ));
         }
         if let Some((chans, filter)) = set_filter {
-            self.edits.push(Edit::RowFilter { chans, filter, row_ch: row_ch.clone() });
+            self.edits.push(Edit::RowFilter {
+                chans,
+                filter,
+                row_ch: row_ch.clone(),
+            });
         }
         analog_visible
     }
@@ -861,15 +1424,32 @@ impl ViewFrame<'_> {
         let hover = ui.input(|i| i.pointer.hover_pos());
         for n in &self.notes.notes {
             let Some(x) = x_of(n.sample) else { continue };
-            p.line_segment([egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 200, 90, 110)));
+            p.line_segment(
+                [egui::pos2(x, plot.min.y), egui::pos2(x, plot.max.y)],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 200, 90, 110)),
+            );
             let short: String = n.text.chars().take(32).collect();
             let more = if n.text.chars().count() > 32 { "…" } else { "" };
-            let r = p.text(egui::pos2(x + 3.0, plot.min.y + 2.0), egui::Align2::LEFT_TOP, format!("{short}{more}"), egui::FontId::proportional(12.0), col);
+            let r = p.text(
+                egui::pos2(x + 3.0, plot.min.y + 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("{short}{more}"),
+                egui::FontId::proportional(12.0),
+                col,
+            );
             if hover.is_some_and(|h| r.expand(3.0).contains(h) || ((h.x - x).abs() < 3.0 && plot.contains(h))) {
-                let full = format!("{}  {}", note_time(self.l.sample_rate, self.rec_source, n.sample), n.text);
+                let full = format!(
+                    "{}  {}",
+                    note_time(self.l.sample_rate, self.rec_source, n.sample),
+                    n.text
+                );
                 let g = p.layout(full, egui::FontId::proportional(13.0), Color32::WHITE, 420.0);
                 let at = egui::pos2(x + 6.0, plot.min.y + 20.0);
-                p.rect_filled(egui::Rect::from_min_size(at, g.size()).expand(5.0), 4.0, Color32::from_rgba_unmultiplied(20, 20, 24, 235));
+                p.rect_filled(
+                    egui::Rect::from_min_size(at, g.size()).expand(5.0),
+                    4.0,
+                    Color32::from_rgba_unmultiplied(20, 20, 24, 235),
+                );
                 p.galley(at, g, Color32::WHITE);
             }
         }

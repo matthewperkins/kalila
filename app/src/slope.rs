@@ -42,7 +42,14 @@ pub const DEAD_S: f64 = 1.0e-3;
 
 impl SlopeTrigger {
     pub fn new(fs: f64) -> Self {
-        Self { bank: FilterBank::new(BandSpec::SPIKES.sections(fs), 1), fs, prev: 0.0, hold: 0, pend: None, warm: 0 }
+        Self {
+            bank: FilterBank::new(BandSpec::SPIKES.sections(fs), 1),
+            fs,
+            prev: 0.0,
+            hold: 0,
+            pend: None,
+            warm: 0,
+        }
     }
 
     /// Start afresh (channel or data continuity changed).
@@ -93,7 +100,11 @@ impl SlopeTrigger {
             }
             return;
         }
-        let crossed = if neg { prev >= p.level && x < p.level && p.level < 0.0 } else { prev <= p.level && x > p.level && p.level > 0.0 };
+        let crossed = if neg {
+            prev >= p.level && x < p.level && p.level < 0.0
+        } else {
+            prev <= p.level && x > p.level && p.level > 0.0
+        };
         if crossed && self.hold == 0 {
             self.pend = Some((a, a, x, self.align_window()));
             self.hold = p.holdoff.max(1);
@@ -129,33 +140,67 @@ mod tests {
 
     #[test]
     fn negative_slope_aligns_on_trough_or_crossing() {
-        let p = SlopeParams { level: -50.0, slope: Slope::Neg, align: TrigAlign::Trough, holdoff: 30, window: None };
+        let p = SlopeParams {
+            level: -50.0,
+            slope: Slope::Neg,
+            align: TrigAlign::Trough,
+            holdoff: 30,
+            window: None,
+        };
         let out = run(&p, |a| spike(a, 10000, -120.0), 12000);
         assert_eq!(out, vec![10000 + LAG]);
-        let p = SlopeParams { align: TrigAlign::Crossing, ..p };
+        let p = SlopeParams {
+            align: TrigAlign::Crossing,
+            ..p
+        };
         let out = run(&p, |a| spike(a, 10000, -120.0), 12000);
-        assert_eq!(out, vec![10000 + LAG - 1], "the crossing is on the shoulder before the trough");
+        assert_eq!(
+            out,
+            vec![10000 + LAG - 1],
+            "the crossing is on the shoulder before the trough"
+        );
     }
 
     #[test]
     fn holdoff_window_and_positive_slope() {
         // Two spikes 20 samples apart: the second is inside a 1 ms holdoff.
-        let p = SlopeParams { level: -50.0, slope: Slope::Neg, align: TrigAlign::Trough, holdoff: 30, window: None };
+        let p = SlopeParams {
+            level: -50.0,
+            slope: Slope::Neg,
+            align: TrigAlign::Trough,
+            holdoff: 30,
+            window: None,
+        };
         let w = |a| spike(a, 10000, -120.0) + spike(a, 10020, -120.0) + spike(a, 10100, -120.0);
         assert_eq!(run(&p, w, 12000), vec![10000 + LAG, 10100 + LAG]);
         // Window discriminator: a −400 µV spike goes beyond −200 and is rejected.
-        let p = SlopeParams { window: Some(-200.0), ..p };
+        let p = SlopeParams {
+            window: Some(-200.0),
+            ..p
+        };
         let w = |a| spike(a, 10000, -120.0) + spike(a, 10100, -400.0);
         assert_eq!(run(&p, w, 12000), vec![10000 + LAG]);
         // Positive slope ignores a negative spike (whose band-passed rebound stays under the level).
-        let p = SlopeParams { level: 50.0, slope: Slope::Pos, align: TrigAlign::Trough, holdoff: 30, window: None };
+        let p = SlopeParams {
+            level: 50.0,
+            slope: Slope::Pos,
+            align: TrigAlign::Trough,
+            holdoff: 30,
+            window: None,
+        };
         let w = |a| spike(a, 10000, -60.0) + spike(a, 10100, 120.0);
         assert_eq!(run(&p, w, 12000), vec![10100 + LAG]);
     }
 
     #[test]
     fn no_trigger_while_warming_up_or_at_a_zero_level() {
-        let p = SlopeParams { level: -50.0, slope: Slope::Neg, align: TrigAlign::Trough, holdoff: 30, window: None };
+        let p = SlopeParams {
+            level: -50.0,
+            slope: Slope::Neg,
+            align: TrigAlign::Trough,
+            holdoff: 30,
+            window: None,
+        };
         let mut t = SlopeTrigger::new(30000.0);
         t.reset();
         let mut out = Vec::new();
@@ -164,6 +209,9 @@ mod tests {
         }
         assert!(out.is_empty(), "a spike during the filter's settling time is ignored");
         let p = SlopeParams { level: 0.0, ..p };
-        assert!(run(&p, |a| spike(a, 10000, -120.0), 12000).is_empty(), "no level yet (noise estimate pending)");
+        assert!(
+            run(&p, |a| spike(a, 10000, -120.0), 12000).is_empty(),
+            "no level yet (noise estimate pending)"
+        );
     }
 }

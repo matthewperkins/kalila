@@ -78,7 +78,14 @@ pub fn available(src: &RecSource) -> i64 {
 }
 
 fn serve(r: &Req, files: &mut HashMap<PathBuf, File>, ttl: &mut TtlEdges) -> Resp {
-    let mut resp = Resp { view: r.view, generation: r.generation, from: r.from, data: Vec::new(), words: Vec::new(), error: None };
+    let mut resp = Resp {
+        view: r.view,
+        generation: r.generation,
+        from: r.from,
+        data: Vec::new(),
+        words: Vec::new(),
+        error: None,
+    };
     let nch = r.src.nch.max(1);
     let mut read = || -> std::io::Result<(i64, Vec<i16>)> {
         let f = match files.get(&r.src.dat) {
@@ -122,10 +129,18 @@ struct TtlEdges {
 impl TtlEdges {
     fn refresh(&mut self, dir: &Path) {
         if self.dir != dir {
-            *self = TtlEdges { dir: dir.to_owned(), ..Default::default() };
+            *self = TtlEdges {
+                dir: dir.to_owned(),
+                ..Default::default()
+            };
         }
         let have = self.samples.len();
-        let (Some(s), Some(w)) = (read_npy_8(&dir.join("sample_numbers.npy"), have), read_npy_8(&dir.join("full_words.npy"), have)) else { return };
+        let (Some(s), Some(w)) = (
+            read_npy_8(&dir.join("sample_numbers.npy"), have),
+            read_npy_8(&dir.join("full_words.npy"), have),
+        ) else {
+            return;
+        };
         // The two files are flushed separately: keep only edges present in both.
         let n = s.len().min(w.len());
         self.samples.extend(s[..n].iter().map(|b| i64::from_le_bytes(*b)));
@@ -265,7 +280,14 @@ pub struct ReviewView {
 
 impl ReviewView {
     pub fn new(t0: i64, span: u32) -> Self {
-        Self { t0, span, generation: 0, shown: None, filling: None, error: None }
+        Self {
+            t0,
+            span,
+            generation: 0,
+            shown: None,
+            filling: None,
+            error: None,
+        }
     }
 
     /// Keep the span within limits and the stretch inside the recording `[first, end)`.
@@ -308,7 +330,12 @@ impl ReviewView {
             let lead = (f.key.t0 - r.from).max(0);
             ((span - lead % span) % span) as u32
         };
-        f.loaded = Some(Loaded { data: std::sync::Arc::new(r.data), fed: 0, pos0, words: r.words });
+        f.loaded = Some(Loaded {
+            data: std::sync::Arc::new(r.data),
+            fed: 0,
+            pos0,
+            words: r.words,
+        });
         f.loaded_at = Some(std::time::Instant::now());
     }
 }
@@ -336,23 +363,57 @@ mod tests {
 
     #[test]
     fn lead_in_ends_at_window_position_zero() {
-        let key = Key { t0: 1000, span: 300, cols: 100, nch: 1, filters: vec![crate::config::ViewFilter::Band], band: (0, 0), car: None };
+        let key = Key {
+            t0: 1000,
+            span: 300,
+            cols: 100,
+            nch: 1,
+            filters: vec![crate::config::ViewFilter::Band],
+            band: (0, 0),
+            car: None,
+        };
         let mut v = ReviewView::new(1000, 300);
-        v.filling = Some(Filling { key, generation: 3, buf: 0, append: false, loaded: None, started: std::time::Instant::now(), loaded_at: None });
+        v.filling = Some(Filling {
+            key,
+            generation: 3,
+            buf: 0,
+            append: false,
+            loaded: None,
+            started: std::time::Instant::now(),
+            loaded_at: None,
+        });
         // Read from 950: 50 lead-in samples, so the first one goes to position 250.
-        v.accept(Resp { view: 0, generation: 3, from: 950, data: vec![0; 350], words: vec![], error: None });
+        v.accept(Resp {
+            view: 0,
+            generation: 3,
+            from: 950,
+            data: vec![0; 350],
+            words: vec![],
+            error: None,
+        });
         let l = v.filling.as_ref().unwrap().loaded.as_ref().unwrap();
         assert_eq!(l.pos0, 250);
         assert_eq!((l.pos0 as usize + 50) % 300, 0);
         // A stale response is ignored.
         v.filling.as_mut().unwrap().loaded = None;
-        v.accept(Resp { view: 0, generation: 2, from: 950, data: vec![0; 350], words: vec![], error: None });
+        v.accept(Resp {
+            view: 0,
+            generation: 2,
+            from: 950,
+            data: vec![0; 350],
+            words: vec![],
+            error: None,
+        });
         assert!(v.filling.as_ref().unwrap().loaded.is_none());
     }
 
     #[test]
     fn ttl_words_follow_the_edges() {
-        let t = TtlEdges { dir: PathBuf::new(), samples: vec![100, 105, 110], words: vec![1, 3, 2] };
+        let t = TtlEdges {
+            dir: PathBuf::new(),
+            samples: vec![100, 105, 110],
+            words: vec![1, 3, 2],
+        };
         assert_eq!(t.words(98, 4), vec![0, 0, 1, 1]);
         assert_eq!(t.words(104, 8), vec![1, 3, 3, 3, 3, 3, 2, 2]);
         assert_eq!(t.words(200, 2), vec![2, 2]);
@@ -364,17 +425,50 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dat = dir.join("continuous.dat");
         // 3 channels, 10 samples: value = 100 * sample + channel.
-        let v: Vec<u8> = (0..10i16).flat_map(|s| (0..3i16).flat_map(move |c| (100 * s + c).to_le_bytes())).collect();
+        let v: Vec<u8> = (0..10i16)
+            .flat_map(|s| (0..3i16).flat_map(move |c| (100 * s + c).to_le_bytes()))
+            .collect();
         std::fs::write(&dat, &v).unwrap();
-        let src = RecSource { dat, ttl_dir: dir.clone(), nch: 3, first_sample: 1000, sample_rate: 30000.0, gaps: Default::default() };
+        let src = RecSource {
+            dat,
+            ttl_dir: dir.clone(),
+            nch: 3,
+            first_sample: 1000,
+            sample_rate: 30000.0,
+            gaps: Default::default(),
+        };
         assert_eq!(available(&src), 10);
         let (mut files, mut ttl) = (HashMap::new(), TtlEdges::default());
         // Asks for 1005..1020: only 1005..1010 exist.
-        let r = serve(&Req { view: 1, generation: 7, src: src.clone(), from: 1005, n: 15, words_from: 0, words_n: 0 }, &mut files, &mut ttl);
+        let r = serve(
+            &Req {
+                view: 1,
+                generation: 7,
+                src: src.clone(),
+                from: 1005,
+                n: 15,
+                words_from: 0,
+                words_n: 0,
+            },
+            &mut files,
+            &mut ttl,
+        );
         assert_eq!((r.generation, r.from, r.data.len()), (7, 1005, 15));
         assert_eq!(&r.data[..4], &[500, 501, 502, 600]);
         // Straddling the first sample: clamped to it.
-        let r = serve(&Req { view: 1, generation: 8, src, from: 998, n: 4, words_from: 0, words_n: 0 }, &mut files, &mut ttl);
+        let r = serve(
+            &Req {
+                view: 1,
+                generation: 8,
+                src,
+                from: 998,
+                n: 4,
+                words_from: 0,
+                words_n: 0,
+            },
+            &mut files,
+            &mut ttl,
+        );
         assert_eq!((r.from, r.data.len()), (1000, 6));
         std::fs::remove_dir_all(&dir).ok();
     }

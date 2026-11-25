@@ -32,7 +32,13 @@ type NextDrawable = unsafe extern "C-unwind" fn(*mut AnyObject, Sel) -> *mut Any
 static ORIGINAL: OnceLock<Imp> = OnceLock::new();
 /// When the newest sample in the frame about to be shown was acquired.
 static PENDING: Mutex<Option<Instant>> = Mutex::new(None);
-static STATS: Mutex<Stats> = Mutex::new(Stats { mean_ms: 0.0, max_ms: 0.0, frames: 0, dropped: 0, since: None });
+static STATS: Mutex<Stats> = Mutex::new(Stats {
+    mean_ms: 0.0,
+    max_ms: 0.0,
+    frames: 0,
+    dropped: 0,
+    since: None,
+});
 
 struct Stats {
     mean_ms: f32,
@@ -62,7 +68,9 @@ pub fn install() {
 unsafe extern "C-unwind" fn next_drawable(layer: *mut AnyObject, cmd: Sel) -> *mut AnyObject {
     let original: NextDrawable = unsafe { std::mem::transmute::<Imp, NextDrawable>(*ORIGINAL.get().unwrap()) };
     let drawable = unsafe { original(layer, cmd) };
-    let Some(acquired) = PENDING.lock().take() else { return drawable };
+    let Some(acquired) = PENDING.lock().take() else {
+        return drawable;
+    };
     if drawable.is_null() {
         return drawable;
     }
@@ -76,7 +84,11 @@ unsafe extern "C-unwind" fn next_drawable(layer: *mut AnyObject, cmd: Sel) -> *m
         // The handler runs some time after the frame was shown: take that time off.
         let since_shown = (unsafe { CACurrentMediaTime() } - presented).max(0.0);
         let ms = (acquired.elapsed().as_secs_f64() - since_shown).max(0.0) as f32 * 1e3;
-        st.mean_ms = if st.frames == 0 { ms } else { 0.9 * st.mean_ms + 0.1 * ms };
+        st.mean_ms = if st.frames == 0 {
+            ms
+        } else {
+            0.9 * st.mean_ms + 0.1 * ms
+        };
         st.max_ms = st.max_ms.max(ms);
         st.frames += 1;
     });
@@ -102,7 +114,12 @@ pub fn latency() -> Option<(f32, f32)> {
     let out = (st.mean_ms, st.max_ms);
     let since = *st.since.get_or_insert_with(Instant::now);
     if since.elapsed() > Duration::from_secs(2) {
-        log::debug!("to screen: mean {:.1} ms, worst {:.1} ms, {} frames not shown", st.mean_ms, st.max_ms, st.dropped);
+        log::debug!(
+            "to screen: mean {:.1} ms, worst {:.1} ms, {} frames not shown",
+            st.mean_ms,
+            st.max_ms,
+            st.dropped
+        );
         st.since = Some(Instant::now());
         st.max_ms = 0.0;
         st.dropped = 0;

@@ -192,7 +192,9 @@ impl Ft600 {
             ft.firmware & 0xff
         );
         // As D3XX does on open: both IN pipes start from a known state.
-        let r = ft.command(Channel::Data.pipe_in(), CMD_ABORT, 0).and_then(|_| ft.command(Channel::Control.pipe_in(), CMD_ABORT, 0));
+        let r = ft
+            .command(Channel::Data.pipe_in(), CMD_ABORT, 0)
+            .and_then(|_| ft.command(Channel::Control.pipe_in(), CMD_ABORT, 0));
         if let Err(e) = r {
             ft.release();
             return Err(e);
@@ -224,12 +226,22 @@ impl Ft600 {
 
     /// The one place this driver makes a control transfer. Requests not in
     /// `ALLOWED_REQUESTS` are refused before anything reaches the kernel.
-    fn control_transfer(&self, request_type: u8, request: u8, value: u16, index: u16, data: &mut [u8], timeout_ms: u32) -> Result<usize, Error> {
+    fn control_transfer(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<usize, Error> {
         if !allowed(request_type, request) {
             info!("refused control request {request_type:02x} {request:02x}");
             return Err(Error::ForbiddenRequest);
         }
-        Ok(self.dev.control(request_type, request, value, index, data, timeout_ms)?)
+        Ok(self
+            .dev
+            .control(request_type, request, value, index, data, timeout_ms)?)
     }
 
     fn gpio_request(&self, what: u16, value: u16) -> Result<(), Error> {
@@ -312,7 +324,9 @@ impl Ft600 {
     pub fn write(&self, ch: Channel, data: &[u8], timeout_ms: u32) -> Result<usize, Error> {
         self.command(ch.pipe_out(), CMD_TRANSFER, data.len() as u32)?;
         // The kernel only reads from an OUT buffer.
-        let t = self.dev.bulk(ch.pipe_out(), data.as_ptr() as *mut u8, data.len(), timeout_ms)?;
+        let t = self
+            .dev
+            .bulk(ch.pipe_out(), data.as_ptr() as *mut u8, data.len(), timeout_ms)?;
         trace!(
             "write {:02x} {} -> {}{} {}",
             ch.pipe_out(),
@@ -334,7 +348,10 @@ impl Ft600 {
             let i = ((pipe & 0x7f) - 2) as usize;
             if self.outstanding[i] != 0 {
                 let t = self.dev.bulk(pipe, self.drain.as_mut_ptr(), self.drain.len(), 200)?;
-                trace!("drain {pipe:02x} -> {} bytes (announced {})", t.actual, self.outstanding[i]);
+                trace!(
+                    "drain {pipe:02x} -> {} bytes (announced {})",
+                    t.actual, self.outstanding[i]
+                );
                 self.outstanding[i] = 0;
             }
         }
@@ -391,8 +408,14 @@ mod tests {
             data_bytes: 0,
         };
         let mut b = [0u8; 152];
-        assert_eq!(ft.control_transfer(0x40, 0xcf, 1, 0, &mut b, 1000), Err(Error::ForbiddenRequest));
-        assert_eq!(ft.control_transfer(0xc0, 0xcf, 1, 0, &mut b, 1000), Err(Error::Usb(UsbError::Io)));
+        assert_eq!(
+            ft.control_transfer(0x40, 0xcf, 1, 0, &mut b, 1000),
+            Err(Error::ForbiddenRequest)
+        );
+        assert_eq!(
+            ft.control_transfer(0xc0, 0xcf, 1, 0, &mut b, 1000),
+            Err(Error::Usb(UsbError::Io))
+        );
         std::mem::forget(ft); // nothing to release on fd -1
     }
 
@@ -458,6 +481,10 @@ mod tests {
             }
         }
         assert!(files > 30, "walked only {files} files");
-        assert!(bad.is_empty(), "control transfers outside the FT600 layer:\n{}", bad.join("\n"));
+        assert!(
+            bad.is_empty(),
+            "control transfers outside the FT600 layer:\n{}",
+            bad.join("\n")
+        );
     }
 }

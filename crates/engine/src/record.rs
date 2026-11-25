@@ -49,7 +49,11 @@ struct NpyFile {
 
 /// A new file; never truncates one that exists (an earlier recording's).
 fn create_new(path: &Path) -> Result<File> {
-    fs::OpenOptions::new().write(true).create_new(true).open(path).with_context(|| format!("creating {}", path.display()))
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))
 }
 
 /// Writes `path` whole or not at all (a temporary file, then a rename): a disk filling up
@@ -79,7 +83,13 @@ fn keep_first(first: &mut Option<anyhow::Error>, r: Result<()>) {
 impl NpyFile {
     fn create(path: &Path, descr: &'static str) -> Result<Self> {
         let f = create_new(path)?;
-        let mut n = Self { w: BufWriter::with_capacity(1 << 16, f), descr, count: 0, header_len: 0, path: path.to_owned() };
+        let mut n = Self {
+            w: BufWriter::with_capacity(1 << 16, f),
+            descr,
+            count: 0,
+            header_len: 0,
+            path: path.to_owned(),
+        };
         let h = n.header();
         n.header_len = h.len() as u64;
         n.w.write_all(&h)?;
@@ -90,7 +100,10 @@ impl NpyFile {
     }
     fn header_for(&self, count: u64) -> Vec<u8> {
         // Shape field is padded so the header length never changes as the count grows.
-        let dict = format!("{{'descr': '{}', 'fortran_order': False, 'shape': ({},), }}", self.descr, count);
+        let dict = format!(
+            "{{'descr': '{}', 'fortran_order': False, 'shape': ({},), }}",
+            self.descr, count
+        );
         let mut dict = format!("{dict:<width$}", width = dict.len() + (24 - count.to_string().len()));
         let base = 10; // magic(6) + version(2) + len(2)
         let total = (base + dict.len() + 1).div_ceil(64) * 64;
@@ -210,7 +223,14 @@ struct Recording {
 impl Recording {
     /// Read-back description, once the first sample is known.
     fn source(&self) -> Option<RecSource> {
-        Some(RecSource { dat: self.dat_path.clone(), ttl_dir: self.ttl_dir.clone(), nch: self.main.channels, first_sample: self.first_sample?, sample_rate: self.layout.sample_rate, gaps: Arc::new(self.gaps.clone()) })
+        Some(RecSource {
+            dat: self.dat_path.clone(),
+            ttl_dir: self.ttl_dir.clone(),
+            nch: self.main.channels,
+            first_sample: self.first_sample?,
+            sample_rate: self.layout.sample_rate,
+            gaps: Arc::new(self.gaps.clone()),
+        })
     }
 }
 
@@ -233,7 +253,11 @@ impl Recording {
             })
         };
         let main = mk_stream(&layout.name, layout.num_channels())?;
-        let side = layout.side_streams.iter().map(|s| mk_stream(&s.name, s.channel_names.len())).collect::<Result<Vec<_>>>()?;
+        let side = layout
+            .side_streams
+            .iter()
+            .map(|s| mk_stream(&s.name, s.channel_names.len()))
+            .collect::<Result<Vec<_>>>()?;
         let ed = dir.join("events").join(stream_folder(&layout.name)).join("TTL");
         let dat_path = cont.join(stream_folder(&layout.name)).join("continuous.dat");
         fs::create_dir_all(&ed)?;
@@ -253,9 +277,29 @@ impl Recording {
             timestamps: NpyFile::create(&md.join("timestamps.npy"), "<f8")?,
             keys: None,
         };
-        let mut r = Self { dir: dir.to_owned(), layout: layout.clone(), main, side, side_tmp: Vec::new(), ttl, messages, clock: None, first_sample: None, written: 0, next: None, gaps: Vec::new(), last_header_update: Instant::now(), oebin: json!({}), dat_path, ttl_dir: ed };
+        let mut r = Self {
+            dir: dir.to_owned(),
+            layout: layout.clone(),
+            main,
+            side,
+            side_tmp: Vec::new(),
+            ttl,
+            messages,
+            clock: None,
+            first_sample: None,
+            written: 0,
+            next: None,
+            gaps: Vec::new(),
+            last_header_update: Instant::now(),
+            oebin: json!({}),
+            dat_path,
+            ttl_dir: ed,
+        };
         r.oebin = r.build_oebin();
-        write_replace(&dir.join("structure.oebin"), serde_json::to_string_pretty(&r.oebin)?.as_bytes())?;
+        write_replace(
+            &dir.join("structure.oebin"),
+            serde_json::to_string_pretty(&r.oebin)?.as_bytes(),
+        )?;
         Ok(r)
     }
 
@@ -312,23 +356,40 @@ impl Recording {
 
     fn write_block(&mut self, b: &Block) -> Result<()> {
         if b.num_channels != self.main.channels {
-            bail!("channel count changed during recording ({} -> {})", self.main.channels, b.num_channels);
+            bail!(
+                "channel count changed during recording ({} -> {})",
+                self.main.channels,
+                b.num_channels
+            );
         }
         // A malformed block would shift every channel of continuous.dat from here on, and a
         // block behind the last would make sample_numbers.npy go backwards: stop recording
         // (loudly, with every file finished) rather than write either.
         if b.data.len() != b.len() * b.num_channels || b.ttl.len() != b.len() {
-            bail!("malformed block at sample {}: {} samples, {} values for {} channels, {} TTL words", b.first_sample, b.len(), b.data.len(), b.num_channels, b.ttl.len());
+            bail!(
+                "malformed block at sample {}: {} samples, {} values for {} channels, {} TTL words",
+                b.first_sample,
+                b.len(),
+                b.data.len(),
+                b.num_channels,
+                b.ttl.len()
+            );
         }
         if let Some(n) = self.next
             && b.first_sample < n
         {
-            bail!("block at sample {} is behind the last one written (next was {n})", b.first_sample);
+            bail!(
+                "block at sample {} is behind the last one written (next was {n})",
+                b.first_sample
+            );
         }
         if !b.is_empty() {
             if self.first_sample.is_none() {
                 self.first_sample = Some(b.first_sample);
-                let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
                 let txt = format!(
                     "Software Time (milliseconds since midnight Jan 1st 1970 UTC): {ms}\r\nStart Time for {SOURCE_NAME} ({SOURCE_ID}) - {} @ {} Hz: {}\r\n",
                     self.layout.name, self.layout.sample_rate, b.first_sample
@@ -382,8 +443,14 @@ impl Recording {
             let Some(f) = self.side.get_mut(s.stream) else { continue };
             let bv = &self.layout.side_streams[s.stream].bit_volts;
             self.side_tmp.clear();
-            self.side_tmp.extend(s.values.iter().zip(bv).map(|(v, b)| (v / b).round().clamp(-32768.0, 32767.0) as i16));
-            let bytes = unsafe { std::slice::from_raw_parts(self.side_tmp.as_ptr() as *const u8, self.side_tmp.len() * 2) };
+            self.side_tmp.extend(
+                s.values
+                    .iter()
+                    .zip(bv)
+                    .map(|(v, b)| (v / b).round().clamp(-32768.0, 32767.0) as i16),
+            );
+            let bytes =
+                unsafe { std::slice::from_raw_parts(self.side_tmp.as_ptr() as *const u8, self.side_tmp.len() * 2) };
             f.dat.write_all(bytes)?;
             f.samples.write(&[s.sample_number])?;
             f.timestamps.write(&[s.timestamp])?;
@@ -417,7 +484,11 @@ impl Recording {
             w.flush()?;
         }
         // Headers now: notes are rare and should survive a crash right away.
-        for n in [&mut self.messages.text, &mut self.messages.samples, &mut self.messages.timestamps] {
+        for n in [
+            &mut self.messages.text,
+            &mut self.messages.samples,
+            &mut self.messages.timestamps,
+        ] {
             n.update_header()?;
         }
         Ok(())
@@ -430,7 +501,12 @@ impl Recording {
             f.samples.update_header()?;
             f.timestamps.update_header()?;
         }
-        for n in [&mut self.ttl.states, &mut self.ttl.samples, &mut self.ttl.timestamps, &mut self.ttl.words] {
+        for n in [
+            &mut self.ttl.states,
+            &mut self.ttl.samples,
+            &mut self.ttl.timestamps,
+            &mut self.ttl.words,
+        ] {
             n.update_header()?;
         }
         Ok(())
@@ -462,7 +538,12 @@ impl Recording {
         if let Some(mut k) = m.keys {
             keep_first(&mut first, k.flush().map_err(Into::into));
         }
-        keep_first(&mut first, serde_json::to_string_pretty(&oebin).map_err(Into::into).and_then(|j| write_replace(&oebin_path, j.as_bytes())));
+        keep_first(
+            &mut first,
+            serde_json::to_string_pretty(&oebin)
+                .map_err(Into::into)
+                .and_then(|j| write_replace(&oebin_path, j.as_bytes())),
+        );
         first.map_or(Ok(()), Err)
     }
 }
@@ -475,7 +556,11 @@ pub enum RecMsg {
     Start,
     Stop,
     /// A typed note for the open recording (ignored when not recording).
-    Message { sample: i64, text: String, keys: Vec<(i64, String)> },
+    Message {
+        sample: i64,
+        text: String,
+        keys: Vec<(i64, String)>,
+    },
     Shutdown,
 }
 
@@ -516,7 +601,9 @@ impl RecSource {
     /// Contiguous stretches: (first sample number, file index, length in samples), for a
     /// file holding `file_len` samples.
     fn runs(&self, file_len: u64) -> impl Iterator<Item = (i64, u64, u64)> + '_ {
-        let starts: Vec<(i64, u64)> = std::iter::once((self.first_sample, 0)).chain(self.gaps.iter().copied().filter(|&(_, f)| f < file_len)).collect();
+        let starts: Vec<(i64, u64)> = std::iter::once((self.first_sample, 0))
+            .chain(self.gaps.iter().copied().filter(|&(_, f)| f < file_len))
+            .collect();
         (0..starts.len()).map(move |k| {
             let (s, f) = starts[k];
             let to = starts.get(k + 1).map_or(file_len, |&(_, f1)| f1);
@@ -526,13 +613,17 @@ impl RecSource {
 
     /// One past the last sample number in a file holding `file_len` samples.
     pub fn end_sample(&self, file_len: u64) -> i64 {
-        self.runs(file_len).last().map_or(self.first_sample, |(s, _, n)| s + n as i64)
+        self.runs(file_len)
+            .last()
+            .map_or(self.first_sample, |(s, _, n)| s + n as i64)
     }
 
     /// Samples in the file now, as a span of sample numbers from `first_sample` (dropped
     /// samples included, so it lines up with sample numbers).
     pub fn available(&self) -> u64 {
-        let len = fs::metadata(&self.dat).map(|m| m.len() / (2 * self.nch.max(1) as u64)).unwrap_or(0);
+        let len = fs::metadata(&self.dat)
+            .map(|m| m.len() / (2 * self.nch.max(1) as u64))
+            .unwrap_or(0);
         (self.end_sample(len) - self.first_sample) as u64
     }
 
@@ -608,7 +699,12 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                         fail(&status, e);
                         abandon(rec.take());
                     } else {
-                        if status.source.lock().as_ref().is_none_or(|s| s.dat != r.dat_path || s.gaps.len() != r.gaps.len()) {
+                        if status
+                            .source
+                            .lock()
+                            .as_ref()
+                            .is_none_or(|s| s.dat != r.dat_path || s.gaps.len() != r.gaps.len())
+                        {
                             *status.source.lock() = r.source();
                         }
                         status.bytes.fetch_add(b.data.len() as u64 * 2, Ordering::Relaxed);
@@ -644,7 +740,10 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                 if needs_new_session(session_date, now.date_naive(), forced) || session_root.as_ref() != Some(&root) {
                     // Never reuse a session folder (two sessions within one second).
                     let stem = now.format("%Y-%m-%d_%H-%M-%S").to_string();
-                    let name = (1..).map(|k| if k == 1 { stem.clone() } else { format!("{stem}_{k}") }).find(|n| !root.join(n).exists()).unwrap();
+                    let name = (1..)
+                        .map(|k| if k == 1 { stem.clone() } else { format!("{stem}_{k}") })
+                        .find(|n| !root.join(n).exists())
+                        .unwrap();
                     session_date = Some(now.date_naive());
                     session = Some(root.join(name).join(format!("Record Node {RECORD_NODE_ID}")));
                     session_root = Some(root);
@@ -657,13 +756,22 @@ pub fn run_recorder(rx: Receiver<RecMsg>, status: Arc<RecStatus>) {
                     acq_run_seen = false;
                 }
                 recording_idx += 1;
-                let rec_dir = |i: u32| session.as_ref().unwrap().join(format!("experiment{experiment}")).join(format!("recording{i}"));
+                let rec_dir = |i: u32| {
+                    session
+                        .as_ref()
+                        .unwrap()
+                        .join(format!("experiment{experiment}"))
+                        .join(format!("recording{i}"))
+                };
                 // Never into an existing recording folder (its files would be refused anyway).
                 while rec_dir(recording_idx).exists() {
                     recording_idx += 1;
                 }
                 let dir = rec_dir(recording_idx);
-                match fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| Recording::open(&dir, &l)) {
+                match fs::create_dir_all(&dir)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|_| Recording::open(&dir, &l))
+                {
                     Ok(r) => {
                         info!("recording to {}", dir.display());
                         *status.error.lock() = None;
@@ -725,7 +833,10 @@ mod tests {
         assert_eq!(&b[..8], b"\x93NUMPY\x01\x00");
         let hl = u16::from_le_bytes([b[8], b[9]]) as usize;
         assert_eq!((10 + hl) % 64, 0);
-        (String::from_utf8(b[10..10 + hl].to_vec()).unwrap(), b[10 + hl..].to_vec())
+        (
+            String::from_utf8(b[10..10 + hl].to_vec()).unwrap(),
+            b[10 + hl..].to_vec(),
+        )
     }
 
     #[test]
@@ -746,7 +857,15 @@ mod tests {
         let layout = StreamLayout {
             name: "acquisition_board".into(),
             sample_rate: 30000.0,
-            channels: (0..2).map(|i| ChannelInfo { name: format!("CH{}", i + 1), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }).collect(),
+            channels: (0..2)
+                .map(|i| ChannelInfo {
+                    name: format!("CH{}", i + 1),
+                    kind: ChannelKind::Electrode,
+                    bit_volts: 0.195,
+                    units: "uV".into(),
+                    headstage: Some(0),
+                })
+                .collect(),
             headstages: vec![],
             ttl_lines: 8,
             side_streams: vec![],
@@ -793,7 +912,15 @@ mod tests {
         let layout = StreamLayout {
             name: "acquisition_board".into(),
             sample_rate: 30000.0,
-            channels: (0..2).map(|i| ChannelInfo { name: format!("CH{}", i + 1), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }).collect(),
+            channels: (0..2)
+                .map(|i| ChannelInfo {
+                    name: format!("CH{}", i + 1),
+                    kind: ChannelKind::Electrode,
+                    bit_volts: 0.195,
+                    units: "uV".into(),
+                    headstage: Some(0),
+                })
+                .collect(),
             headstages: vec![],
             ttl_lines: 8,
             side_streams: vec![],
@@ -824,11 +951,23 @@ mod tests {
         tx.send(RecMsg::Data(block(64, false))).unwrap();
         tx.send(RecMsg::Shutdown).unwrap();
         h.join().unwrap();
-        assert!(st.error.lock().as_deref().is_some_and(|e| e.contains("malformed block at sample 32")), "{:?}", st.error.lock());
+        assert!(
+            st.error
+                .lock()
+                .as_deref()
+                .is_some_and(|e| e.contains("malformed block at sample 32")),
+            "{:?}",
+            st.error.lock()
+        );
         assert!(!st.recording.load(Ordering::SeqCst));
         // Finished up to the good block: the npy header says 32 samples, the file holds them.
         let dir = st.current_dir.lock().clone().unwrap();
-        let cont = fs::read_dir(dir.join("continuous")).unwrap().next().unwrap().unwrap().path();
+        let cont = fs::read_dir(dir.join("continuous"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         assert_eq!(fs::metadata(cont.join("continuous.dat")).unwrap().len(), 32 * 2 * 2);
         let (hdr, body) = read_npy(&cont.join("sample_numbers.npy"));
         assert!(hdr.contains("(32,)"), "{hdr}");
@@ -840,7 +979,21 @@ mod tests {
     fn a_second_session_in_the_same_second_never_reuses_a_folder() {
         let root = std::env::temp_dir().join(format!("kalila-rec-collide-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let layout = StreamLayout { name: "acquisition_board".into(), sample_rate: 30000.0, channels: vec![ChannelInfo { name: "CH1".into(), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }], headstages: vec![], ttl_lines: 8, side_streams: vec![], hw_clock_hz: 0.0 };
+        let layout = StreamLayout {
+            name: "acquisition_board".into(),
+            sample_rate: 30000.0,
+            channels: vec![ChannelInfo {
+                name: "CH1".into(),
+                kind: ChannelKind::Electrode,
+                bit_volts: 0.195,
+                units: "uV".into(),
+                headstage: Some(0),
+            }],
+            headstages: vec![],
+            ttl_lines: 8,
+            side_streams: vec![],
+            hw_clock_hz: 0.0,
+        };
         let (tx, rx) = crossbeam_channel::unbounded();
         let st = Arc::new(RecStatus::default());
         *st.root.lock() = root.clone();
@@ -890,10 +1043,24 @@ mod tests {
         let layout = StreamLayout {
             name: "acquisition_board".into(),
             sample_rate: 30000.0,
-            channels: (0..4).map(|i| ChannelInfo { name: format!("CH{}", i + 1), kind: ChannelKind::Electrode, bit_volts: 0.195, units: "uV".into(), headstage: Some(0) }).collect(),
+            channels: (0..4)
+                .map(|i| ChannelInfo {
+                    name: format!("CH{}", i + 1),
+                    kind: ChannelKind::Electrode,
+                    bit_volts: 0.195,
+                    units: "uV".into(),
+                    headstage: Some(0),
+                })
+                .collect(),
             headstages: vec![],
             ttl_lines: 8,
-            side_streams: vec![SideStreamInfo { name: "memory_usage".into(), sample_rate: 100.0, channel_names: vec!["MEM".into()], units: vec!["%".into()], bit_volts: vec![1.0] }],
+            side_streams: vec![SideStreamInfo {
+                name: "memory_usage".into(),
+                sample_rate: 100.0,
+                channel_names: vec!["MEM".into()],
+                units: vec!["%".into()],
+                bit_volts: vec![1.0],
+            }],
             hw_clock_hz: 250e6,
         };
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -911,12 +1078,26 @@ mod tests {
                     b.data.push((c * 100 + s) as i16);
                 }
                 b.timestamps.push((1000 + 32 * k + s as i64) as f64 / 30000.0);
-                b.ttl.push(if (k * 32 + s as i64) >= 50 && (k * 32 + s as i64) < 100 { 0b101 } else { 0 });
+                b.ttl.push(if (k * 32 + s as i64) >= 50 && (k * 32 + s as i64) < 100 {
+                    0b101
+                } else {
+                    0
+                });
             }
-            b.side.push(rhythm::SideSample { stream: 0, sample_number: k, timestamp: 0.0, values: vec![12.4] });
+            b.side.push(rhythm::SideSample {
+                stream: 0,
+                sample_number: k,
+                timestamp: 0.0,
+                values: vec![12.4],
+            });
             tx.send(RecMsg::Data(Arc::new(b))).unwrap();
         }
-        tx.send(RecMsg::Message { sample: 1100, text: "drinking ☕".into(), keys: vec![(1100, "/".into()), (1130, "d".into())] }).unwrap();
+        tx.send(RecMsg::Message {
+            sample: 1100,
+            text: "drinking ☕".into(),
+            keys: vec![(1100, "/".into()), (1130, "d".into())],
+        })
+        .unwrap();
         tx.send(RecMsg::Stop).unwrap();
         tx.send(RecMsg::Shutdown).unwrap();
         h.join().unwrap();
@@ -924,9 +1105,13 @@ mod tests {
 
         let dir = st.current_dir.lock().clone().unwrap();
         assert!(dir.ends_with("Record Node 101/experiment1/recording1"));
-        let oebin: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("structure.oebin")).unwrap()).unwrap();
+        let oebin: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("structure.oebin")).unwrap()).unwrap();
         assert_eq!(oebin["continuous"][0]["num_channels"], 4);
-        assert_eq!(oebin["continuous"][0]["folder_name"], "Acquisition_Board-100.acquisition_board/");
+        assert_eq!(
+            oebin["continuous"][0]["folder_name"],
+            "Acquisition_Board-100.acquisition_board/"
+        );
         let cd = dir.join("continuous/Acquisition_Board-100.acquisition_board");
         let dat = fs::read(cd.join("continuous.dat")).unwrap();
         assert_eq!(dat.len(), 320 * 4 * 2);
@@ -943,7 +1128,11 @@ mod tests {
         assert_eq!(i64::from_le_bytes(d[..8].try_into().unwrap()), 1050);
         let (h, _) = read_npy(&dir.join("continuous/Acquisition_Board-100.memory_usage/timestamps.npy"));
         assert!(h.contains("'shape': (10,)"));
-        assert!(fs::read_to_string(dir.join("sync_messages.txt")).unwrap().contains("@ 30000 Hz: 1000"));
+        assert!(
+            fs::read_to_string(dir.join("sync_messages.txt"))
+                .unwrap()
+                .contains("@ 30000 Hz: 1000")
+        );
         // Typed note: stock MessageCenter layout, main-stream sample number and seconds.
         assert_eq!(oebin["events"][1]["folder_name"], "MessageCenter/");
         let md = dir.join("events/MessageCenter");

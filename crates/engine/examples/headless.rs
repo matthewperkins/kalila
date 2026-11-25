@@ -42,13 +42,21 @@ fn main() -> anyhow::Result<()> {
         const SLOTS: [&str; 8] = ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"];
         for name in list.split(',') {
             let slot = SLOTS.iter().position(|s| s.eq_ignore_ascii_case(name.trim()));
-            settings.rhd2132_16ch[slot.ok_or_else(|| anyhow::anyhow!("--16ch: unknown headstage slot {name:?} (use A1..D2)"))?] = true;
+            settings.rhd2132_16ch
+                [slot.ok_or_else(|| anyhow::anyhow!("--16ch: unknown headstage slot {name:?} (use A1..D2)"))?] = true;
         }
     }
     let mut e = Engine::new(root.clone().unwrap_or_else(std::env::temp_dir));
     e.audio_settings.lock().enabled = !flag("--no-audio");
     e.audio_settings.lock().mute = flag("--mute");
-    e.open_board(if flag("--hw") { BoardChoice::Hardware } else { BoardChoice::Simulated(vec![32, 32]) }, settings);
+    e.open_board(
+        if flag("--hw") {
+            BoardChoice::Hardware
+        } else {
+            BoardChoice::Simulated(vec![32, 32])
+        },
+        settings,
+    );
     while e.is_busy() {
         e.poll();
         std::thread::sleep(Duration::from_millis(20));
@@ -59,11 +67,22 @@ fn main() -> anyhow::Result<()> {
     let l = e.layout().unwrap().clone();
     if flag("--car") {
         let all: Vec<usize> = (0..l.num_electrodes()).collect();
-        let car = std::sync::Arc::new(engine::dsp::Car { reference: all.clone(), subtract: all });
+        let car = std::sync::Arc::new(engine::dsp::Car {
+            reference: all.clone(),
+            subtract: all,
+        });
         e.dsp_settings.lock().car = Some(car.clone());
         e.audio_settings.lock().car = Some(car);
     }
-    println!("{} channels @ {} Hz; headstages: {:?}", l.num_channels(), l.sample_rate, l.headstages.iter().map(|h| format!("{} {} {}ch", h.name, h.chip, h.num_channels)).collect::<Vec<_>>());
+    println!(
+        "{} channels @ {} Hz; headstages: {:?}",
+        l.num_channels(),
+        l.sample_rate,
+        l.headstages
+            .iter()
+            .map(|h| format!("{} {} {}ch", h.name, h.chip, h.num_channels))
+            .collect::<Vec<_>>()
+    );
     e.start_acquisition()?;
     println!("real-time priority: {}", e.rt_priority());
     std::thread::sleep(Duration::from_millis(200));
@@ -105,12 +124,27 @@ fn main() -> anyhow::Result<()> {
             let a = &e.audio_stats;
             println!(
                 "t={:5.1}s samples={} dropped={} gaps={} bad={} hwbuf={:.1}% | drops disp/dsp/aud={}/{}/{} recQ={} bp={}ms | spikes={} | audio {}Hz lat={:.1}ms underruns={} overruns={} cb={}/{}fr ppm={} | disp lat max={:.2}ms | rec {} MB",
-                t0.elapsed().as_secs_f64(), h.samples, h.dropped_samples, h.discontinuities, h.bad_frames, h.hw_buffer_pct,
-                p.display_dropped.load(Ordering::Relaxed), p.dsp_dropped.load(Ordering::Relaxed), p.audio_dropped.load(Ordering::Relaxed),
-                p.rec_queue.load(Ordering::Relaxed), p.rec_backpressure_us.load(Ordering::Relaxed) / 1000, spikes,
-                a.device_rate.load(Ordering::Relaxed), a.latency_us.load(Ordering::Relaxed) as f64 / 1000.0, a.underruns.load(Ordering::Relaxed),
-                a.overruns.load(Ordering::Relaxed), a.cb_frames.load(Ordering::Relaxed), a.cb_frames_max.load(Ordering::Relaxed), a.ratio_ppm.load(Ordering::Relaxed) as i32,
-                lat_max.as_secs_f64() * 1e3, e.rec_status.bytes.load(Ordering::Relaxed) / 1_000_000
+                t0.elapsed().as_secs_f64(),
+                h.samples,
+                h.dropped_samples,
+                h.discontinuities,
+                h.bad_frames,
+                h.hw_buffer_pct,
+                p.display_dropped.load(Ordering::Relaxed),
+                p.dsp_dropped.load(Ordering::Relaxed),
+                p.audio_dropped.load(Ordering::Relaxed),
+                p.rec_queue.load(Ordering::Relaxed),
+                p.rec_backpressure_us.load(Ordering::Relaxed) / 1000,
+                spikes,
+                a.device_rate.load(Ordering::Relaxed),
+                a.latency_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                a.underruns.load(Ordering::Relaxed),
+                a.overruns.load(Ordering::Relaxed),
+                a.cb_frames.load(Ordering::Relaxed),
+                a.cb_frames_max.load(Ordering::Relaxed),
+                a.ratio_ppm.load(Ordering::Relaxed) as i32,
+                lat_max.as_secs_f64() * 1e3,
+                e.rec_status.bytes.load(Ordering::Relaxed) / 1_000_000
             );
             lat_max = Duration::ZERO;
         }
@@ -140,8 +174,15 @@ fn report_latency(arrivals: &[(i64, f64)], dropped: u64) {
         *m = m.min(x);
     }
     // Skip the first and last second (partly filled; the start includes the pipeline warming up).
-    let (lo, hi) = (min.keys().min().copied().unwrap_or(0), min.keys().max().copied().unwrap_or(0));
-    let mut d: Vec<f64> = arrivals.iter().filter(|(s, _)| *s > lo && *s < hi).map(|(s, x)| (x - min[s]) * 1e3).collect();
+    let (lo, hi) = (
+        min.keys().min().copied().unwrap_or(0),
+        min.keys().max().copied().unwrap_or(0),
+    );
+    let mut d: Vec<f64> = arrivals
+        .iter()
+        .filter(|(s, _)| *s > lo && *s < hi)
+        .map(|(s, x)| (x - min[s]) * 1e3)
+        .collect();
     if d.is_empty() {
         println!("latency: no blocks measured");
         return;
@@ -151,6 +192,12 @@ fn report_latency(arrivals: &[(i64, f64)], dropped: u64) {
     let mean = d.iter().sum::<f64>() / d.len() as f64;
     println!(
         "latency (ms, newest sample of each block vs the quickest of its second; {} blocks, {} not seen): mean {:.3} median {:.3} p99 {:.3} p99.9 {:.3} max {:.3}",
-        d.len(), dropped, mean, q(0.5), q(0.99), q(0.999), d[d.len() - 1]
+        d.len(),
+        dropped,
+        mean,
+        q(0.5),
+        q(0.99),
+        q(0.999),
+        d[d.len() - 1]
     );
 }

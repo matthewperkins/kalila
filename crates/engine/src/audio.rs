@@ -89,7 +89,11 @@ impl Default for AudioSettings {
             expansion: 0.375,
             gate_sigma: 3.0,
             presence_db: 3.0,
-            band: BandSpec { low_hz: 300.0, high_hz: 7000.0, order: 4 },
+            band: BandSpec {
+                low_hz: 300.0,
+                high_hz: 7000.0,
+                order: 4,
+            },
             mute: false,
             device_buffer: 128,
             margin_ms: 1.5,
@@ -171,14 +175,23 @@ struct Dyn {
 impl Dyn {
     fn new(fs: f64) -> Self {
         let k = |tau: f64| (1.0 - (-1.0 / (fs * tau)).exp()) as f32;
-        Self { attack: 1.0, release: k(4.0e-3), gain_up: k(0.15e-3), gain_down: k(3.0e-3) }
+        Self {
+            attack: 1.0,
+            release: k(4.0e-3),
+            gain_up: k(0.15e-3),
+            gain_down: k(3.0e-3),
+        }
     }
 }
 
 /// Stereo position (-1 = left … +1 = right) of the `i`th of `n` monitored channels, in the
 /// order they were added. The GUI colours monitored traces by this too.
 pub fn pan_position(i: usize, n: usize) -> f32 {
-    if n <= 1 { 0.0 } else { -0.8 + 1.6 * i as f32 / (n - 1) as f32 }
+    if n <= 1 {
+        0.0
+    } else {
+        -0.8 + 1.6 * i as f32 / (n - 1) as f32
+    }
 }
 
 /// The DSP part of the monitor, independent of any audio device (unit-testable).
@@ -192,7 +205,13 @@ pub struct MonitorDsp {
 
 impl MonitorDsp {
     pub fn new(fs: f64) -> Self {
-        Self { fs, chains: Vec::new(), key: (Vec::new(), BandSpec::SPIKES, 0, None), dynamics: Dyn::new(fs), samples_since_cal: 0 }
+        Self {
+            fs,
+            chains: Vec::new(),
+            key: (Vec::new(), BandSpec::SPIKES, 0, None),
+            dynamics: Dyn::new(fs),
+            samples_since_cal: 0,
+        }
     }
 
     pub fn recalibrate(&mut self) {
@@ -323,7 +342,9 @@ impl AudioMonitor {
     fn open_device(&mut self, s: &AudioSettings) -> Result<()> {
         let host = cpal::default_host();
         info!("audio host: {:?}", host.id());
-        let dev = host.default_output_device().ok_or_else(|| anyhow!("no output device"))?;
+        let dev = host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no output device"))?;
         let def = dev.default_output_config().context("default output config")?;
         let fs_out = def.sample_rate();
         let channels = def.channels().max(1);
@@ -335,7 +356,11 @@ impl AudioMonitor {
             let est = self.stats.clone();
             let cons = cons.clone();
             dev.build_output_stream::<f32, _, _>(
-                cpal::StreamConfig { channels, sample_rate: fs_out, buffer_size },
+                cpal::StreamConfig {
+                    channels,
+                    sample_rate: fs_out,
+                    buffer_size,
+                },
                 move |out: &mut [f32], _| {
                     let Some(mut cons) = cons.try_lock() else {
                         out.fill(0.0);
@@ -348,7 +373,8 @@ impl AudioMonitor {
                     // The servo regulates what is left *after* this callback: that is the
                     // headroom against late input (measuring before it, the servo steered the
                     // fill to margin < one callback, so every trough was an underrun).
-                    st.min_fill.fetch_min(avail.saturating_sub(frames) as u32, Ordering::Relaxed);
+                    st.min_fill
+                        .fetch_min(avail.saturating_sub(frames) as u32, Ordering::Relaxed);
                     st.fill_frames.store(avail as u32, Ordering::Relaxed);
                     let n = frames.min(avail);
                     if n < frames && st.active.load(Ordering::Relaxed) {
@@ -381,7 +407,10 @@ impl AudioMonitor {
         let stream = match build(cpal::BufferSize::Fixed(s.device_buffer)) {
             Ok(st) => st,
             Err(e) => {
-                warn!("fixed buffer of {} frames rejected ({e}); using device default", s.device_buffer);
+                warn!(
+                    "fixed buffer of {} frames rejected ({e}); using device default",
+                    s.device_buffer
+                );
                 build(cpal::BufferSize::Default)?
             }
         };
@@ -399,7 +428,9 @@ impl AudioMonitor {
     /// Process one acquisition block (audio feeder thread).
     pub fn process(&mut self, blk: &Block) {
         let s = self.settings.lock().clone();
-        self.stats.active.store(s.enabled && self.producer.is_some(), Ordering::Relaxed);
+        self.stats
+            .active
+            .store(s.enabled && self.producer.is_some(), Ordering::Relaxed);
         if self.producer.is_none() || !s.enabled {
             return;
         }
@@ -408,7 +439,10 @@ impl AudioMonitor {
         }
         self.tmp.clear();
         self.dsp.process(&s, blk, &mut self.tmp);
-        self.stats.held_sigma_cuv.store(self.dsp.held_sigma(0).map(|v| (v * 100.0) as u32).unwrap_or(0), Ordering::Relaxed);
+        self.stats.held_sigma_cuv.store(
+            self.dsp.held_sigma(0).map(|v| (v * 100.0) as u32).unwrap_or(0),
+            Ordering::Relaxed,
+        );
 
         // Clock-drift servo on the minimum fill seen by the callback (every 100 ms).
         let st = &self.stats;
@@ -422,7 +456,8 @@ impl AudioMonitor {
                 st.ratio_ppm.store(((adj * 1e6) as i32) as u32, Ordering::Relaxed);
             }
             let fill = st.fill_frames.load(Ordering::Relaxed) as f64;
-            let lat = (fill + s.device_buffer as f64) / self.fs_out + SincResampler::DELAY_IN as f64 / self.fs_in + 0.6e-3;
+            let lat =
+                (fill + s.device_buffer as f64) / self.fs_out + SincResampler::DELAY_IN as f64 / self.fs_in + 0.6e-3;
             st.latency_us.store((lat * 1e6) as u32, Ordering::Relaxed);
         }
         let out = self.resamp.process(&self.tmp, self.fs_out / self.fs_in);
@@ -526,7 +561,11 @@ impl SincResampler {
             let mut row: Vec<f64> = (0..Self::TAPS)
                 .map(|k| {
                     let x = k as f64 - (t / 2.0 - 1.0) - frac; // centre between taps 15 and 16
-                    let sinc = if x.abs() < 1e-9 { 1.0 } else { (std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * cutoff * x) };
+                    let sinc = if x.abs() < 1e-9 {
+                        1.0
+                    } else {
+                        (std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * cutoff * x)
+                    };
                     let w = (x / (t / 2.0)).clamp(-1.0, 1.0);
                     sinc * cutoff * i0(beta * (1.0 - w * w).max(0.0).sqrt()) / i0(beta)
                 })
@@ -535,7 +574,14 @@ impl SincResampler {
             row.iter_mut().for_each(|v| *v /= sum);
             table.extend(row.into_iter().map(|v| v as f32));
         }
-        Self { table, hist: vec![[0.0; 2]; 2 * Self::TAPS], pos: 0, frac: 0.0, adjust: 0.0, out: Vec::new() }
+        Self {
+            table,
+            hist: vec![[0.0; 2]; 2 * Self::TAPS],
+            pos: 0,
+            frac: 0.0,
+            adjust: 0.0,
+            out: Vec::new(),
+        }
     }
 
     pub fn process(&mut self, inp: &[f32], ratio: f64) -> &[f32] {
@@ -601,13 +647,25 @@ mod tests {
         for drift in [0.0, 300e-6, -300e-6] {
             let fills = run_servo(16e-3, margin, drift, 120.0);
             let low = fills.iter().cloned().fold(f64::MAX, f64::min);
-            assert!(low > 0.5 * margin, "drift {drift}: the fill fell to {:.2} ms", low * 1e3);
+            assert!(
+                low > 0.5 * margin,
+                "drift {drift}: the fill fell to {:.2} ms",
+                low * 1e3
+            );
             // Back near the margin within 15 s, and it stays there.
             for f in &fills[150..] {
-                assert!((f - margin).abs() < 0.5 * margin, "drift {drift}: fill {:.2} ms after 15 s", f * 1e3);
+                assert!(
+                    (f - margin).abs() < 0.5 * margin,
+                    "drift {drift}: fill {:.2} ms after 15 s",
+                    f * 1e3
+                );
             }
             // The steady difference between the clocks is left to the integral.
-            assert!((fills.last().unwrap() - margin).abs() < 0.05 * margin, "drift {drift}: ends at {:.3} ms", fills.last().unwrap() * 1e3);
+            assert!(
+                (fills.last().unwrap() - margin).abs() < 0.05 * margin,
+                "drift {drift}: ends at {:.3} ms",
+                fills.last().unwrap() * 1e3
+            );
         }
     }
 
@@ -615,17 +673,23 @@ mod tests {
     fn the_servo_recovers_from_an_empty_ring() {
         let margin = 1.5e-3;
         let fills = run_servo(0.0, margin, -200e-6, 60.0);
-        assert!((fills.last().unwrap() - margin).abs() < 0.05 * margin, "ends at {:.3} ms", fills.last().unwrap() * 1e3);
+        assert!(
+            (fills.last().unwrap() - margin).abs() < 0.05 * margin,
+            "ends at {:.3} ms",
+            fills.last().unwrap() * 1e3
+        );
     }
     use std::f64::consts::PI;
 
     fn tone_gain(f: f64) -> f64 {
         let mut r = SincResampler::new();
         let fs = 30000.0;
-        let inp: Vec<f32> = (0..30000).flat_map(|i| {
-            let v = (2.0 * PI * f * i as f64 / fs).sin() as f32;
-            [v, v]
-        }).collect();
+        let inp: Vec<f32> = (0..30000)
+            .flat_map(|i| {
+                let v = (2.0 * PI * f * i as f64 / fs).sin() as f32;
+                [v, v]
+            })
+            .collect();
         let out = r.process(&inp, 48000.0 / 30000.0).to_vec();
         let tail: Vec<f64> = out[out.len() / 2..].iter().step_by(2).map(|&v| v as f64).collect();
         (2.0 * tail.iter().map(|v| v * v).sum::<f64>() / tail.len() as f64).sqrt()
@@ -732,11 +796,18 @@ mod tests {
         // near-threshold amplitudes slightly (that is what an expander does), but the
         // loudness ratio must stay within 15 % of the linear reference chain's.
         let fs = 30000.0;
-        let d = AudioSettings { volume_db: -12.0, ..Default::default() };
-        let r = AudioSettings { reference: true, ..d.clone() };
+        let d = AudioSettings {
+            volume_db: -12.0,
+            ..Default::default()
+        };
+        let r = AudioSettings {
+            reference: true,
+            ..d.clone()
+        };
         let small = synth(fs, 8.0, 5.0, &[(10.0, 40.0)], 1);
         let big = synth(fs, 8.0, 5.0, &[(10.0, 80.0)], 1);
-        let ratio = |s: &AudioSettings| spike_peaks(&run(s, &big), fs, 10.0, 3.5) / spike_peaks(&run(s, &small), fs, 10.0, 3.5);
+        let ratio =
+            |s: &AudioSettings| spike_peaks(&run(s, &big), fs, 10.0, 3.5) / spike_peaks(&run(s, &small), fs, 10.0, 3.5);
         let (rd, rr) = (ratio(&d), ratio(&r));
         assert!((rd / rr - 1.0).abs() < 0.15, "default {rd} vs reference {rr}");
         assert!((rr - 2.0).abs() < 0.2, "reference ratio {rr}");
@@ -748,7 +819,10 @@ mod tests {
         // After calibration the per-spike loudness must be the same (no AGC flattening),
         // so rate differences remain audible as density, not as level changes.
         let fs = 30000.0;
-        let s = AudioSettings { volume_db: 0.0, ..Default::default() };
+        let s = AudioSettings {
+            volume_db: 0.0,
+            ..Default::default()
+        };
         let sparse = run(&s, &synth(fs, 6.0, 10.0, &[(5.0, 100.0)], 7));
         let dense = run(&s, &synth(fs, 6.0, 10.0, &[(80.0, 100.0)], 7));
         let ps = spike_peaks(&sparse, fs, 5.0, 4.0);
@@ -760,8 +834,14 @@ mod tests {
     fn hash_remains_audible_at_default_depth() {
         // Sub-threshold activity (2σ) must not be gated away by default.
         let fs = 30000.0;
-        let s = AudioSettings { volume_db: 0.0, ..Default::default() };
-        let r = AudioSettings { reference: true, ..s.clone() };
+        let s = AudioSettings {
+            volume_db: 0.0,
+            ..Default::default()
+        };
+        let r = AudioSettings {
+            reference: true,
+            ..s.clone()
+        };
         let b = synth(fs, 5.0, 10.0, &[(200.0, 20.0)], 3);
         let rms = |x: &[f32]| (x[100_000..].iter().map(|v| v * v).sum::<f32>() / (x.len() - 100_000) as f32).sqrt();
         let ratio_db = 20.0 * (rms(&run(&s, &b)) / rms(&run(&r, &b))).log10();
@@ -771,7 +851,12 @@ mod tests {
     #[test]
     fn reference_mode_is_linear() {
         let fs = 30000.0;
-        let s = AudioSettings { reference: true, gain_mode: GainMode::Absolute, volume_db: 0.0, ..Default::default() };
+        let s = AudioSettings {
+            reference: true,
+            gain_mode: GainMode::Absolute,
+            volume_db: 0.0,
+            ..Default::default()
+        };
         let b1 = synth(fs, 1.0, 10.0, &[(20.0, 80.0)], 5);
         let mut b2 = b1.clone();
         b2.data.iter_mut().for_each(|v| *v /= 2);
@@ -795,13 +880,25 @@ mod tests {
             b.timestamps.push(common.timestamps[t]);
             b.ttl.push(0);
         }
-        let mut s = AudioSettings { reference: true, gain_mode: GainMode::Absolute, volume_db: 0.0, channels: vec![1], ..Default::default() };
+        let mut s = AudioSettings {
+            reference: true,
+            gain_mode: GainMode::Absolute,
+            volume_db: 0.0,
+            channels: vec![1],
+            ..Default::default()
+        };
         let plain = peak_after(&run(&s, &b), 3000);
-        s.car = Some(std::sync::Arc::new(crate::dsp::Car { reference: vec![0, 1, 2, 3], subtract: vec![1] }));
+        s.car = Some(std::sync::Arc::new(crate::dsp::Car {
+            reference: vec![0, 1, 2, 3],
+            subtract: vec![1],
+        }));
         let car = peak_after(&run(&s, &b), 3000);
         assert!(car < 0.1 * plain, "CAR {car} vs plain {plain}");
         // Not in the subtract set: unchanged.
-        s.car = Some(std::sync::Arc::new(crate::dsp::Car { reference: vec![0, 1, 2, 3], subtract: vec![0] }));
+        s.car = Some(std::sync::Arc::new(crate::dsp::Car {
+            reference: vec![0, 1, 2, 3],
+            subtract: vec![0],
+        }));
         assert_eq!(peak_after(&run(&s, &b), 3000), plain);
     }
 }

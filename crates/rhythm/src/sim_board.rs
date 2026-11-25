@@ -99,13 +99,22 @@ impl SimBoard {
     /// Channels of simulated headstage `i`, honouring the RHD2132 16-channel option.
     fn hs_channels(&self, i: usize) -> usize {
         let n = self.headstage_channels[i];
-        if n == 32 && self.settings.rhd2132_16ch[i % 8] { 16 } else { n }
+        if n == 32 && self.settings.rhd2132_16ch[i % 8] {
+            16
+        } else {
+            n
+        }
     }
 
     fn rebuild(&mut self) {
         let fs = self.settings.sample_rate as f64;
         let ne = self.electrodes();
-        self.nch = ne + if self.settings.acquire_aux { 3 * self.headstage_channels.len() } else { 0 } + if self.settings.acquire_adc { 8 } else { 0 };
+        self.nch =
+            ne + if self.settings.acquire_aux {
+                3 * self.headstage_channels.len()
+            } else {
+                0
+            } + if self.settings.acquire_adc { 8 } else { 0 };
         self.units.clear();
         let mut r = Rng(42);
         for ch in 0..ne {
@@ -145,7 +154,11 @@ impl SimBoard {
                 }
                 // Theta-modulated Poisson process with refractoriness and bursts.
                 let rate = u.rate_hz * (1.0 + 0.6 * (2.0 * PI * 7.0 * t).sin());
-                let isi = if self.rng.uniform() < u.burstiness { fs * (0.003 + 0.004 * self.rng.uniform()) } else { -(self.rng.uniform().max(1e-12)).ln() * fs / rate.max(0.1) };
+                let isi = if self.rng.uniform() < u.burstiness {
+                    fs * (0.003 + 0.004 * self.rng.uniform())
+                } else {
+                    -(self.rng.uniform().max(1e-12)).ln() * fs / rate.max(0.1)
+                };
                 u.next_spike_in = (isi as usize).max(u.refractory);
             } else {
                 u.next_spike_in -= 1;
@@ -155,7 +168,11 @@ impl SimBoard {
         let hum = (2.0 * PI * 50.0 * t).sin();
         // Optional common-mode broadband artefact (motion/EMG-like) for testing the CAR:
         // 30 ms every 1.7 s, identical on every channel. On by default; KALILA_SIM_ARTEFACT=0 turns it off.
-        let artefact = if self.artefact && t % 1.7 < 0.03 { 40.0 * self.rng.gauss() } else { 0.0 };
+        let artefact = if self.artefact && t % 1.7 < 0.03 {
+            40.0 * self.rng.gauss()
+        } else {
+            0.0
+        };
         let start = blk.data.len();
         for ch in 0..ne {
             // 1/f-ish LFP: leaky integrated noise + shared theta.
@@ -202,30 +219,67 @@ impl SimBoard {
 
 impl Board for SimBoard {
     fn info(&self) -> BoardInfo {
-        BoardInfo { kind: "Simulated acquisition board".into(), description: vec![("Units".into(), self.units.len().to_string())] }
+        BoardInfo {
+            kind: "Simulated acquisition board".into(),
+            description: vec![("Units".into(), self.units.len().to_string())],
+        }
     }
     fn layout(&self) -> StreamLayout {
         let mut channels = Vec::new();
         let mut headstages = Vec::new();
         for (i, &raw) in self.headstage_channels.iter().enumerate() {
             let n = self.hs_channels(i);
-            headstages.push(HeadstageInfo { name: ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"][i % 8].into(), slot: i % 8, port: i / 2, chip: if raw == 64 { "RHD2164" } else { "RHD2132" }.into(), num_channels: n, first_channel: channels.len(), has_bno: false });
+            headstages.push(HeadstageInfo {
+                name: ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"][i % 8].into(),
+                slot: i % 8,
+                port: i / 2,
+                chip: if raw == 64 { "RHD2164" } else { "RHD2132" }.into(),
+                num_channels: n,
+                first_channel: channels.len(),
+                has_bno: false,
+            });
             for _ in 0..n {
                 let k = channels.len() + 1;
-                channels.push(ChannelInfo { name: format!("CH{k}"), kind: ChannelKind::Electrode, bit_volts: ELECTRODE_UV_PER_BIT, units: "uV".into(), headstage: Some(i) });
+                channels.push(ChannelInfo {
+                    name: format!("CH{k}"),
+                    kind: ChannelKind::Electrode,
+                    bit_volts: ELECTRODE_UV_PER_BIT,
+                    units: "uV".into(),
+                    headstage: Some(i),
+                });
             }
         }
         if self.settings.acquire_aux {
             for i in 0..3 * self.headstage_channels.len() {
-                channels.push(ChannelInfo { name: format!("AUX{}", i + 1), kind: ChannelKind::Aux, bit_volts: AUX_V_PER_BIT, units: "V".into(), headstage: None });
+                channels.push(ChannelInfo {
+                    name: format!("AUX{}", i + 1),
+                    kind: ChannelKind::Aux,
+                    bit_volts: AUX_V_PER_BIT,
+                    units: "V".into(),
+                    headstage: None,
+                });
             }
         }
         if self.settings.acquire_adc {
             for i in 0..8 {
-                channels.push(ChannelInfo { name: format!("ADC{}", i + 1), kind: ChannelKind::Adc, bit_volts: 0.00015258789, units: "V".into(), headstage: None });
+                channels.push(ChannelInfo {
+                    name: format!("ADC{}", i + 1),
+                    kind: ChannelKind::Adc,
+                    bit_volts: 0.00015258789,
+                    units: "V".into(),
+                    headstage: None,
+                });
             }
         }
-        StreamLayout { name: "acquisition_board".into(), sample_rate: self.settings.sample_rate as f64, channels, headstages, ttl_lines: 8, side_streams: vec![], hw_clock_hz: self.settings.sample_rate as f64 }
+        StreamLayout {
+            name: "acquisition_board".into(),
+            sample_rate: self.settings.sample_rate as f64,
+            channels,
+            headstages,
+            ttl_lines: 8,
+            side_streams: vec![],
+            hw_clock_hz: self.settings.sample_rate as f64,
+        }
     }
     fn settings(&self) -> &BoardSettings {
         &self.settings
@@ -236,7 +290,9 @@ impl Board for SimBoard {
         Ok(())
     }
     fn available_sample_rates(&self) -> Vec<u32> {
-        vec![1000, 1250, 1500, 2000, 2500, 3000, 3333, 5000, 6250, 10000, 12500, 15000, 20000, 25000, 30000]
+        vec![
+            1000, 1250, 1500, 2000, 2500, 3000, 3333, 5000, 6250, 10000, 12500, 15000, 20000, 25000, 30000,
+        ]
     }
     fn scan_ports(&mut self) -> Result<()> {
         Ok(())

@@ -48,7 +48,13 @@ pub struct Biquad {
 
 impl Biquad {
     fn from_f64(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Self {
-        Self { b0: (b0 / a0) as f32, b1: (b1 / a0) as f32, b2: (b2 / a0) as f32, a1: (a1 / a0) as f32, a2: (a2 / a0) as f32 }
+        Self {
+            b0: (b0 / a0) as f32,
+            b1: (b1 / a0) as f32,
+            b2: (b2 / a0) as f32,
+            a1: (a1 / a0) as f32,
+            a2: (a2 / a0) as f32,
+        }
     }
     pub fn lowpass(fs: f64, f: f64, q: f64) -> Self {
         let w = 2.0 * PI * f / fs;
@@ -60,14 +66,28 @@ impl Biquad {
         let w = 2.0 * PI * f / fs;
         let (s, c) = w.sin_cos();
         let al = s / (2.0 * q);
-        Self::from_f64((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + al, -2.0 * c, 1.0 - al)
+        Self::from_f64(
+            (1.0 + c) / 2.0,
+            -(1.0 + c),
+            (1.0 + c) / 2.0,
+            1.0 + al,
+            -2.0 * c,
+            1.0 - al,
+        )
     }
     pub fn peaking(fs: f64, f: f64, q: f64, gain_db: f64) -> Self {
         let a = 10f64.powf(gain_db / 40.0);
         let w = 2.0 * PI * f / fs;
         let (s, c) = w.sin_cos();
         let al = s / (2.0 * q);
-        Self::from_f64(1.0 + al * a, -2.0 * c, 1.0 - al * a, 1.0 + al / a, -2.0 * c, 1.0 - al / a)
+        Self::from_f64(
+            1.0 + al * a,
+            -2.0 * c,
+            1.0 - al * a,
+            1.0 + al / a,
+            -2.0 * c,
+            1.0 - al / a,
+        )
     }
     pub fn notch(fs: f64, f: f64, q: f64) -> Self {
         let w = 2.0 * PI * f / fs;
@@ -87,7 +107,9 @@ impl Biquad {
 
 /// Butterworth section Qs for an even order.
 fn butter_qs(order: usize) -> Vec<f64> {
-    (0..order / 2).map(|k| 1.0 / (2.0 * ((2 * k + 1) as f64 * PI / (2.0 * order as f64)).cos())).collect()
+    (0..order / 2)
+        .map(|k| 1.0 / (2.0 * ((2 * k + 1) as f64 * PI / (2.0 * order as f64)).cos()))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -101,16 +123,32 @@ pub struct BandSpec {
 }
 
 impl BandSpec {
-    pub const SPIKES: BandSpec = BandSpec { low_hz: 300.0, high_hz: 6000.0, order: 4 };
-    pub const LFP: BandSpec = BandSpec { low_hz: 1.0, high_hz: 300.0, order: 2 };
+    pub const SPIKES: BandSpec = BandSpec {
+        low_hz: 300.0,
+        high_hz: 6000.0,
+        order: 4,
+    };
+    pub const LFP: BandSpec = BandSpec {
+        low_hz: 1.0,
+        high_hz: 300.0,
+        order: 2,
+    };
     pub fn sections(&self, fs: f64) -> Vec<Biquad> {
         let mut v = Vec::new();
         let nyq = fs / 2.0;
         if self.low_hz > 0.0 && self.low_hz < nyq {
-            v.extend(butter_qs(self.order).into_iter().map(|q| Biquad::highpass(fs, self.low_hz, q)));
+            v.extend(
+                butter_qs(self.order)
+                    .into_iter()
+                    .map(|q| Biquad::highpass(fs, self.low_hz, q)),
+            );
         }
         if self.high_hz > 0.0 && self.high_hz < nyq * 0.98 {
-            v.extend(butter_qs(self.order).into_iter().map(|q| Biquad::lowpass(fs, self.high_hz, q)));
+            v.extend(
+                butter_qs(self.order)
+                    .into_iter()
+                    .map(|q| Biquad::lowpass(fs, self.high_hz, q)),
+            );
         }
         v
     }
@@ -127,7 +165,11 @@ pub struct FilterBank {
 impl FilterBank {
     pub fn new(sections: Vec<Biquad>, nch: usize) -> Self {
         let n = sections.len() * nch;
-        Self { sections, nch, state: vec![[0.0; 2]; n] }
+        Self {
+            sections,
+            nch,
+            state: vec![[0.0; 2]; n],
+        }
     }
     #[inline]
     pub fn tick(&mut self, ch: usize, mut x: f32) -> f32 {
@@ -169,7 +211,18 @@ impl NoiseEstimator {
         let decim = ((fs / 10000.0) as usize).max(1);
         let cap = ((fs * window_s) as usize / decim).max(64);
         let guard = ((fs * 1.0e-3) as usize / decim).max(1);
-        Self { buf: Vec::with_capacity(cap), scratch: Vec::with_capacity(cap), mask: Vec::with_capacity(cap), guard, cap, decim, count: 0, sigma: 0.0, windows: 0, smooth: 0.3 }
+        Self {
+            buf: Vec::with_capacity(cap),
+            scratch: Vec::with_capacity(cap),
+            mask: Vec::with_capacity(cap),
+            guard,
+            cap,
+            decim,
+            count: 0,
+            sigma: 0.0,
+            windows: 0,
+            smooth: 0.3,
+        }
     }
     pub fn with_smoothing(mut self, w: f32) -> Self {
         self.smooth = w;
@@ -195,7 +248,11 @@ impl NoiseEstimator {
             return true;
         }
         self.buf.clear();
-        self.sigma = if self.windows == 0 { est } else { self.sigma + self.smooth * (est - self.sigma) };
+        self.sigma = if self.windows == 0 {
+            est
+        } else {
+            self.sigma + self.smooth * (est - self.sigma)
+        };
         self.windows += 1;
         true
     }
@@ -227,7 +284,8 @@ impl NoiseEstimator {
             }
         }
         self.scratch.clear();
-        self.scratch.extend(self.buf.iter().zip(&self.mask).filter(|(_, m)| !**m).map(|(v, _)| *v));
+        self.scratch
+            .extend(self.buf.iter().zip(&self.mask).filter(|(_, m)| !**m).map(|(v, _)| *v));
         if self.scratch.len() < n / 4 {
             return s0; // pathological: mostly "spikes"; fall back
         }
@@ -342,7 +400,13 @@ impl SpikeDetector {
                     let age = back + SPIKE_PRE - k; // how many samples ago
                     w.push(self.hist[ch * HIST + (p + HIST - age % HIST) % HIST]);
                 }
-                out.push(Spike { channel: ch, sample_number: peak_n, waveform: w, peak_uv: peak_v, threshold_uv: self.threshold(ch) });
+                out.push(Spike {
+                    channel: ch,
+                    sample_number: peak_n,
+                    waveform: w,
+                    peak_uv: peak_v,
+                    threshold_uv: self.threshold(ch),
+                });
                 self.pending[ch] = (0, 0, 0.0);
             }
         }
@@ -358,7 +422,10 @@ mod tests {
 
     #[test]
     fn car_mean_and_mask() {
-        let c = Car { reference: vec![0, 2, 9], subtract: vec![1, 2, 9] };
+        let c = Car {
+            reference: vec![0, 2, 9],
+            subtract: vec![1, 2, 9],
+        };
         // Channel 9 is out of range for a 4-channel row: ignored in both.
         assert_eq!(c.mean(&[10, 100, -4, 7]), 3.0);
         assert_eq!(c.mask(4), vec![false, true, true, false]);

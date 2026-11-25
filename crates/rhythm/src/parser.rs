@@ -19,7 +19,11 @@ pub const RHD2132_16CH_OFFSET: usize = 8;
 /// First chip channel read from a stream: 8 for an RHD2132 in 16-channel mode, else 0.
 /// Same rule as the stock plugin (`chipId == RHD2132 && nChans == 16`).
 pub fn first_chip_channel(chip_id: i32, channels: usize) -> usize {
-    if chip_id == crate::oni_board::CHIP_ID_RHD2132 && channels == 16 { RHD2132_16CH_OFFSET } else { 0 }
+    if chip_id == crate::oni_board::CHIP_ID_RHD2132 && channels == 16 {
+        RHD2132_16CH_OFFSET
+    } else {
+        0
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -51,8 +55,21 @@ pub enum ParseResult {
 }
 
 impl RhythmParser {
-    pub fn new(channels_per_stream: Vec<usize>, chip_ids: Vec<i32>, acquire_aux: bool, acquire_adc: bool, adc_v3: bool) -> Self {
-        let mut p = Self { channels_per_stream, chip_ids, acquire_aux, acquire_adc, adc_v3, ..Default::default() };
+    pub fn new(
+        channels_per_stream: Vec<usize>,
+        chip_ids: Vec<i32>,
+        acquire_aux: bool,
+        acquire_adc: bool,
+        adc_v3: bool,
+    ) -> Self {
+        let mut p = Self {
+            channels_per_stream,
+            chip_ids,
+            acquire_aux,
+            acquire_adc,
+            adc_v3,
+            ..Default::default()
+        };
         p.reset();
         p
     }
@@ -66,7 +83,11 @@ impl RhythmParser {
         self.channels_per_stream.len()
     }
     pub fn num_aux(&self) -> usize {
-        if self.acquire_aux { 3 * self.chip_ids.iter().filter(|&&c| c != CHIP_ID_RHD2164_B).count() } else { 0 }
+        if self.acquire_aux {
+            3 * self.chip_ids.iter().filter(|&&c| c != CHIP_ID_RHD2164_B).count()
+        } else {
+            0
+        }
     }
     fn first_chip_channel(&self, s: usize) -> usize {
         first_chip_channel(self.chip_ids[s], self.channels_per_stream[s])
@@ -115,7 +136,9 @@ impl RhythmParser {
             && dl != 1
         {
             health.discontinuities.fetch_add(1, Ordering::Relaxed);
-            health.dropped_samples.fetch_add(dl.wrapping_sub(1) as u64, Ordering::Relaxed);
+            health
+                .dropped_samples
+                .fetch_add(dl.wrapping_sub(1) as u64, Ordering::Relaxed);
         }
         self.behind = 0;
         self.last_counter = Some(counter);
@@ -161,8 +184,13 @@ impl RhythmParser {
         if self.acquire_adc {
             for k in 0..8 {
                 let raw = word(adc_base + 2 * k) as f64;
-                let volts = if self.adc_v3 { -(ADC_BIT_VOLTS * raw - 5.0) } else { ADC_BIT_VOLTS * raw - 5.0 - 0.4096 };
-                blk.data.push((volts / ADC_BIT_VOLTS).round().clamp(-32768.0, 32767.0) as i16);
+                let volts = if self.adc_v3 {
+                    -(ADC_BIT_VOLTS * raw - 5.0)
+                } else {
+                    ADC_BIT_VOLTS * raw - 5.0 - 0.4096
+                };
+                blk.data
+                    .push((volts / ADC_BIT_VOLTS).round().clamp(-32768.0, 32767.0) as i16);
             }
         }
         blk.ttl.push(word(adc_base + 16));
@@ -173,7 +201,14 @@ impl RhythmParser {
 }
 
 /// Build a synthetic Rhythm payload (used by tests and the hardware-free self check).
-pub fn encode_payload(ns: usize, counter: u32, aux: impl Fn(usize, usize) -> u16, amp: impl Fn(usize, usize) -> u16, adc: [u16; 8], ttl: u16) -> Vec<u8> {
+pub fn encode_payload(
+    ns: usize,
+    counter: u32,
+    aux: impl Fn(usize, usize) -> u16,
+    amp: impl Fn(usize, usize) -> u16,
+    adc: [u16; 8],
+    ttl: u16,
+) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&RHD2000_MAGIC.to_le_bytes());
     v.extend_from_slice(&counter.to_le_bytes());
@@ -231,7 +266,10 @@ mod tests {
         // Stream 0: RHD2132 in 16-channel mode; stream 1: RHD2216 (16 ch, no offset).
         let mut p = RhythmParser::new(vec![16, 16], vec![1, 2], false, false, false);
         let h = Health::default();
-        let mut b = Block { num_channels: p.num_channels(), ..Default::default() };
+        let mut b = Block {
+            num_channels: p.num_channels(),
+            ..Default::default()
+        };
         assert_eq!(p.num_channels(), 32);
         let d = encode_payload(2, 0, |_, _| 0, amp_val, [0; 8], 0);
         assert_eq!(d.len(), p.payload_len());
@@ -253,7 +291,20 @@ mod tests {
         b.num_channels = p.num_channels();
         // counters 1,2,3 carry aux 0,1,2 (aux_num = (c+3)%4), counter 4 latches them.
         for c in 1..=4u32 {
-            let d = encode_payload(2, c, |s, slot| if slot == 1 { (32768 + 10 * (c as i32) + s as i32) as u16 } else { 0 }, |_, _| 32768, [0; 8], 0);
+            let d = encode_payload(
+                2,
+                c,
+                |s, slot| {
+                    if slot == 1 {
+                        (32768 + 10 * (c as i32) + s as i32) as u16
+                    } else {
+                        0
+                    }
+                },
+                |_, _| 32768,
+                [0; 8],
+                0,
+            );
             assert!(matches!(p.parse(&d, 0.0, &mut b, &h), ParseResult::Appended));
         }
         assert_eq!(p.num_aux(), 3);
@@ -298,7 +349,13 @@ mod tests {
         assert!(matches!(p.parse(&f(1_000_001), 0.0, &mut b, &h), ParseResult::Bad));
         assert!(matches!(p.parse(&f(999_990), 0.0, &mut b, &h), ParseResult::Bad));
         assert!(matches!(p.parse(&f(1_000_002), 0.0, &mut b, &h), ParseResult::Appended));
-        assert_eq!((h.dropped_samples.load(Ordering::Relaxed), h.bad_frames.load(Ordering::Relaxed)), (0, 2));
+        assert_eq!(
+            (
+                h.dropped_samples.load(Ordering::Relaxed),
+                h.bad_frames.load(Ordering::Relaxed)
+            ),
+            (0, 2)
+        );
         assert_eq!((b.first_sample, b.len()), (0, 3));
         // The counter restarts at 0 for good: after RESYNC_AFTER skipped frames, sample
         // numbers carry on from the last one.

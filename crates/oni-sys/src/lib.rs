@@ -131,7 +131,13 @@ unsafe extern "C" {
     pub fn oni_read_reg(ctx: oni_ctx, dev: oni_dev_idx_t, addr: oni_reg_addr_t, value: *mut oni_reg_val_t) -> c_int;
     pub fn oni_write_reg(ctx: oni_ctx, dev: oni_dev_idx_t, addr: oni_reg_addr_t, value: oni_reg_val_t) -> c_int;
     pub fn oni_read_frame(ctx: oni_ctx, frame: *mut *mut oni_frame_t) -> c_int;
-    pub fn oni_create_frame(ctx: oni_ctx, frame: *mut *mut oni_frame_t, dev: oni_dev_idx_t, data: *mut c_void, data_sz: usize) -> c_int;
+    pub fn oni_create_frame(
+        ctx: oni_ctx,
+        frame: *mut *mut oni_frame_t,
+        dev: oni_dev_idx_t,
+        data: *mut c_void,
+        data_sz: usize,
+    ) -> c_int;
     pub fn oni_write_frame(ctx: oni_ctx, frame: *const oni_frame_t) -> c_int;
     pub fn oni_destroy_frame(frame: *mut oni_frame_t);
     pub fn oni_version(major: *mut c_int, minor: *mut c_int, patch: *mut c_int);

@@ -1,0 +1,2 @@
+# One width for the whole tree (chosen 2026-11-25); everything else is rustfmt's default.
+max_width = 120

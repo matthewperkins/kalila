@@ -52,17 +52,34 @@ pub struct Notes {
     pub changed: bool,
 }
 
-const PRESET_KEYS: [Key; 9] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+const PRESET_KEYS: [Key; 9] = [
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+    Key::Num7,
+    Key::Num8,
+    Key::Num9,
+];
 
 impl Notes {
     pub fn new(s: &NotesSettings) -> Self {
         let mut presets = s.presets.clone();
         presets.resize(9, String::new());
-        Self { drafts: s.drafts.iter().cloned().collect(), presets, ..Default::default() }
+        Self {
+            drafts: s.drafts.iter().cloned().collect(),
+            presets,
+            ..Default::default()
+        }
     }
 
     pub fn settings(&self) -> NotesSettings {
-        NotesSettings { presets: self.presets.clone(), drafts: self.drafts.iter().cloned().collect() }
+        NotesSettings {
+            presets: self.presets.clone(),
+            drafts: self.drafts.iter().cloned().collect(),
+        }
     }
 
     fn say(&mut self, msg: String) {
@@ -145,7 +162,9 @@ impl Notes {
             let key = match t.as_str() {
                 "/" => Key::Slash,
                 "`" => Key::Backtick,
-                d if d.len() == 1 && ('1'..='9').contains(&d.chars().next().unwrap()) => PRESET_KEYS[(d.as_bytes()[0] - b'1') as usize],
+                d if d.len() == 1 && ('1'..='9').contains(&d.chars().next().unwrap()) => {
+                    PRESET_KEYS[(d.as_bytes()[0] - b'1') as usize]
+                }
                 _ => continue,
             };
             used = Some(key);
@@ -158,7 +177,13 @@ impl Notes {
             return;
         };
         match key {
-            Key::Slash => self.compose = Some(Compose { sample: s, text: String::new(), keys: vec![(s, "/".into())] }),
+            Key::Slash => {
+                self.compose = Some(Compose {
+                    sample: s,
+                    text: String::new(),
+                    keys: vec![(s, "/".into())],
+                })
+            }
             Key::Backtick => match self.drafts.pop_front() {
                 Some(d) => {
                     self.changed = true;
@@ -169,7 +194,13 @@ impl Notes {
             _ => {
                 let n = PRESET_KEYS.iter().position(|k| *k == key).unwrap();
                 match self.presets.get(n).filter(|p| !p.trim().is_empty()).cloned() {
-                    Some(p) => self.finish(Note { sample: s, text: p.trim().to_string() }, vec![]),
+                    Some(p) => self.finish(
+                        Note {
+                            sample: s,
+                            text: p.trim().to_string(),
+                        },
+                        vec![],
+                    ),
                     None => self.say(format!("No preset on {} (set one in the Notes panel)", n + 1)),
                 }
             }
@@ -181,9 +212,17 @@ impl Notes {
     /// Bar at the bottom of a window while typing, or a short confirmation.
     pub fn draw(&mut self, ctx: &egui::Context, viewport: egui::ViewportId, time_of: impl Fn(i64) -> String) {
         let text = if let Some(c) = &self.compose {
-            Some((format!("Note {}   {}|", time_of(c.sample), c.text), "Enter or \\ saves · Esc cancels".to_string(), true))
+            Some((
+                format!("Note {}   {}|", time_of(c.sample), c.text),
+                "Enter or \\ saves · Esc cancels".to_string(),
+                true,
+            ))
         } else if let Some((until, msg)) = &self.flash {
-            if Instant::now() < *until { Some((msg.clone(), String::new(), false)) } else { None }
+            if Instant::now() < *until {
+                Some((msg.clone(), String::new(), false))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -191,16 +230,31 @@ impl Notes {
             self.flash = None;
             return;
         };
-        egui::Area::new(egui::Id::unique(("note-bar", viewport))).anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -28.0)).order(egui::Order::Foreground).interactable(false).show(ctx, |ui| {
-            let fill = if open { egui::Color32::from_rgb(70, 55, 15) } else { egui::Color32::from_gray(40) };
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            egui::Frame::popup(ui.style()).fill(fill).inner_margin(10.0).show(ui, |ui| {
-                ui.label(egui::RichText::new(main).size(17.0).color(egui::Color32::from_rgb(255, 220, 140)));
-                if !hint.is_empty() {
-                    ui.small(hint);
-                }
+        egui::Area::new(egui::Id::unique(("note-bar", viewport)))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -28.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                let fill = if open {
+                    egui::Color32::from_rgb(70, 55, 15)
+                } else {
+                    egui::Color32::from_gray(40)
+                };
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                egui::Frame::popup(ui.style())
+                    .fill(fill)
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(main)
+                                .size(17.0)
+                                .color(egui::Color32::from_rgb(255, 220, 140)),
+                        );
+                        if !hint.is_empty() {
+                            ui.small(hint);
+                        }
+                    });
             });
-        });
         ctx.request_repaint_of(viewport);
     }
 }
@@ -213,7 +267,13 @@ mod tests {
         Event::Text(s.into())
     }
     fn key(k: Key) -> Event {
-        Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }
+        Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }
     }
 
     #[test]
@@ -230,7 +290,13 @@ mod tests {
         n.handle(&mut vec![text("\\")], false, Some(1600));
         assert!(n.compose.is_none());
         let f = &n.out[0];
-        assert_eq!(f.note, Note { sample: 1000, text: "drink".into() });
+        assert_eq!(
+            f.note,
+            Note {
+                sample: 1000,
+                text: "drink".into()
+            }
+        );
         assert_eq!(f.keys.first(), Some(&(1000, "/".to_string())));
         assert!(f.keys.contains(&(1400, "<BS>".to_string())));
         assert_eq!(f.keys.last(), Some(&(1600, "\\".to_string())));
@@ -244,12 +310,21 @@ mod tests {
         assert!(n.compose.is_none() && n.out.is_empty());
         n.handle(&mut vec![text("/")], false, Some(7));
         n.handle(&mut vec![text("eating"), key(Key::Enter)], false, Some(8));
-        assert_eq!(n.out[0].note, Note { sample: 7, text: "eating".into() });
+        assert_eq!(
+            n.out[0].note,
+            Note {
+                sample: 7,
+                text: "eating".into()
+            }
+        );
     }
 
     #[test]
     fn drafts_and_presets_stamp_with_one_key() {
-        let mut n = Notes::new(&NotesSettings { presets: vec!["drinking".into(), "".into()], drafts: vec!["laser 2 mW".into(), "laser 4 mW".into()] });
+        let mut n = Notes::new(&NotesSettings {
+            presets: vec!["drinking".into(), "".into()],
+            drafts: vec!["laser 2 mW".into(), "laser 4 mW".into()],
+        });
         let mut ev = vec![text("`"), key(Key::Backtick)];
         n.handle(&mut ev, false, Some(100));
         assert!(ev.is_empty());
@@ -262,7 +337,10 @@ mod tests {
 
     #[test]
     fn nothing_happens_while_a_text_box_has_focus_or_without_acquisition() {
-        let mut n = Notes::new(&NotesSettings { presets: vec!["x".into()], drafts: vec![] });
+        let mut n = Notes::new(&NotesSettings {
+            presets: vec!["x".into()],
+            drafts: vec![],
+        });
         let mut ev = vec![text("/"), text("1")];
         n.handle(&mut ev, true, Some(1));
         assert_eq!(ev.len(), 2);

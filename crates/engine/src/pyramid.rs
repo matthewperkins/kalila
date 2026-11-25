@@ -22,15 +22,15 @@
 //! (dropped blocks, the recording's first block, a filter's warm-up) are holes in the
 //! coverage that the backfill closes.
 
+use crate::PipelineStats;
 use crate::dsp::{BandSpec, FilterBank};
 use crate::record::{RecSource, RecStatus};
-use crate::PipelineStats;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use rhythm::{Block, ChannelKind, StreamLayout};
 use std::fs::File;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Samples per bucket of the finest level.
@@ -72,12 +72,20 @@ pub struct BandKey {
 
 impl BandKey {
     pub fn band(&self) -> BandSpec {
-        BandSpec { low_hz: f64::from_bits(self.low_bits), high_hz: f64::from_bits(self.high_bits), order: 4 }
+        BandSpec {
+            low_hz: f64::from_bits(self.low_bits),
+            high_hz: f64::from_bits(self.high_bits),
+            order: 4,
+        }
     }
     /// Filter settling time (samples) read before a backfilled chunk; see `lead_in_s`.
     fn lead(&self, fs: f64) -> u64 {
         let b = self.band();
-        let s = if b.low_hz > 0.0 { (3.0 / b.low_hz).max(0.05) } else { 0.05 };
+        let s = if b.low_hz > 0.0 {
+            (3.0 / b.low_hz).max(0.05)
+        } else {
+            0.05
+        };
         ((s * fs) as u64).div_ceil(BUCKET) * BUCKET
     }
 }
@@ -97,7 +105,12 @@ struct Level {
 
 impl Level {
     fn new(k: usize) -> Self {
-        Self { per: (CHUNK_SAMPLES / (BUCKET << (2 * k))) as usize, data: Vec::new(), ttl: Vec::new(), floor: 0 }
+        Self {
+            per: (CHUNK_SAMPLES / (BUCKET << (2 * k))) as usize,
+            data: Vec::new(),
+            ttl: Vec::new(),
+            floor: 0,
+        }
     }
     /// Bucket `b`'s `nch` values, allocating its chunk; None if the chunk was released.
     fn slot(&mut self, b: usize, nch: usize, with_ttl: bool) -> Option<(&mut [[i16; 2]], Option<&mut u16>)> {
@@ -111,7 +124,11 @@ impl Level {
         }
         let per = self.per;
         let d = self.data[c].get_or_insert_with(|| vec![EMPTY; per * nch].into_boxed_slice());
-        let t = if with_ttl { Some(&mut self.ttl[c].get_or_insert_with(|| vec![0; per].into_boxed_slice())[o]) } else { None };
+        let t = if with_ttl {
+            Some(&mut self.ttl[c].get_or_insert_with(|| vec![0; per].into_boxed_slice())[o])
+        } else {
+            None
+        };
         Some((&mut d[o * nch..(o + 1) * nch], t))
     }
     /// Bucket `b`'s values and TTL word, if its chunk holds data.
@@ -122,7 +139,8 @@ impl Level {
         Some((&d[o * nch..(o + 1) * nch], t))
     }
     fn bytes(&self) -> usize {
-        self.data.iter().flatten().map(|d| d.len() * 4).sum::<usize>() + self.ttl.iter().flatten().map(|t| t.len() * 2).sum::<usize>()
+        self.data.iter().flatten().map(|d| d.len() * 4).sum::<usize>()
+            + self.ttl.iter().flatten().map(|t| t.len() * 2).sum::<usize>()
     }
     /// Release the chunks below `floor`.
     fn release_below(&mut self, floor: usize) {
@@ -145,7 +163,12 @@ pub struct Pyramid {
 
 impl Pyramid {
     pub fn new(nch: usize, with_ttl: bool) -> Self {
-        Self { nch: nch.max(1), with_ttl, levels: (0..LEVELS).map(Level::new).collect(), covered: Vec::new() }
+        Self {
+            nch: nch.max(1),
+            with_ttl,
+            levels: (0..LEVELS).map(Level::new).collect(),
+            covered: Vec::new(),
+        }
     }
 
     pub fn bytes(&self) -> usize {
@@ -163,7 +186,10 @@ impl Pyramid {
 
     /// Samples covered within `[start, end)`.
     pub fn covered_in(&self, start: u64, end: u64) -> u64 {
-        self.covered.iter().map(|&(a, b)| b.min(end).saturating_sub(a.max(start))).sum()
+        self.covered
+            .iter()
+            .map(|&(a, b)| b.min(end).saturating_sub(a.max(start)))
+            .sum()
     }
 
     /// The newest hole in `[0, end)`, as `[a, b)`, if any.
@@ -218,7 +244,9 @@ impl Pyramid {
             }
             let word = if self.with_ttl && !ttl.is_empty() {
                 let o = ((b - b0) * BUCKET) as usize;
-                ttl[o..(o + BUCKET as usize).min(ttl.len())].iter().fold(0u16, |a, &w| a | w)
+                ttl[o..(o + BUCKET as usize).min(ttl.len())]
+                    .iter()
+                    .fold(0u16, |a, &w| a | w)
             } else {
                 0
             };
@@ -257,7 +285,10 @@ impl Pyramid {
         let cols = cols.max(1) as usize;
         let spc = span / cols as u64;
         // The coarsest level whose buckets fit in a column (at least the finest).
-        let mut k = (0..LEVELS).rev().find(|&k| BUCKET << (2 * k) <= spc.max(BUCKET)).unwrap_or(0);
+        let mut k = (0..LEVELS)
+            .rev()
+            .find(|&k| BUCKET << (2 * k) <= spc.max(BUCKET))
+            .unwrap_or(0);
         while (t0.max(0) as u64) < self.levels[k].floor as u64 * CHUNK_SAMPLES {
             if !coarser_ok || k + 1 == LEVELS {
                 return None;
@@ -278,7 +309,9 @@ impl Pyramid {
             let b1 = (s1 as u64).div_ceil(bsz);
             let o = &mut out[c * nch..(c + 1) * nch];
             for b in b0..b1 {
-                let Some((vals, word)) = l.get(b as usize, nch) else { continue };
+                let Some((vals, word)) = l.get(b as usize, nch) else {
+                    continue;
+                };
                 for (m, v) in o.iter_mut().zip(vals) {
                     m[0] = m[0].min(v[0]);
                     m[1] = m[1].max(v[1]);
@@ -313,7 +346,17 @@ pub struct Store {
 
 impl Default for Store {
     fn default() -> Self {
-        Self { src: None, raw: None, bands: Default::default(), want: Default::default(), live_end: 0, backfilling: false, budget: DEFAULT_BUDGET, floor: [0; RELEASABLE], over_warned: false }
+        Self {
+            src: None,
+            raw: None,
+            bands: Default::default(),
+            want: Default::default(),
+            live_end: 0,
+            backfilling: false,
+            budget: DEFAULT_BUDGET,
+            floor: [0; RELEASABLE],
+            over_warned: false,
+        }
     }
 }
 
@@ -357,7 +400,11 @@ impl Store {
             let Some(k) = (0..RELEASABLE).find(|&k| self.floor[k] < live) else {
                 if !self.over_warned {
                     self.over_warned = true;
-                    log::warn!("review pyramids: {:.2} GB, over the {:.2} GB budget with only the coarse levels and the newest stretch left", self.bytes() as f64 / 1e9, self.budget as f64 / 1e9);
+                    log::warn!(
+                        "review pyramids: {:.2} GB, over the {:.2} GB budget with only the coarse levels and the newest stretch left",
+                        self.bytes() as f64 / 1e9,
+                        self.budget as f64 / 1e9
+                    );
                 }
                 return;
             };
@@ -367,7 +414,11 @@ impl Store {
                 p.release_below(k, f);
             }
             let fs = self.src.as_ref().map_or(30000.0, |s| s.sample_rate);
-            log::info!("review pyramids: level {k} released before {:.1} min of the recording ({:.0} MB left)", (f as u64 * CHUNK_SAMPLES) as f64 / fs / 60.0, self.bytes() as f64 / 1e6);
+            log::info!(
+                "review pyramids: level {k} released before {:.1} min of the recording ({:.0} MB left)",
+                (f as u64 * CHUNK_SAMPLES) as f64 / fs / 60.0,
+                self.bytes() as f64 / 1e6
+            );
         }
     }
 
@@ -419,15 +470,31 @@ fn band_live(key: &BandKey, fs: f64) -> BandLive {
     let nchp = key.chans.len();
     let pos = |c: usize| key.chans.iter().position(|&x| x == c);
     let (car_ref, car_sub) = match &key.car {
-        Some((r, s)) => (r.iter().filter_map(|&c| pos(c)).collect(), (0..nchp).map(|i| s.contains(&key.chans[i])).collect()),
+        Some((r, s)) => (
+            r.iter().filter_map(|&c| pos(c)).collect(),
+            (0..nchp).map(|i| s.contains(&key.chans[i])).collect(),
+        ),
         None => (Vec::new(), vec![false; nchp]),
     };
-    BandLive { bank: FilterBank::new(key.band().sections(fs), nchp), car_ref, car_sub, warm: key.lead(fs), backfill_at: Some(Instant::now() + SETTLE), key: key.clone() }
+    BandLive {
+        bank: FilterBank::new(key.band().sections(fs), nchp),
+        car_ref,
+        car_sub,
+        warm: key.lead(fs),
+        backfill_at: Some(Instant::now() + SETTLE),
+        key: key.clone(),
+    }
 }
 
 /// The builder thread: folds live blocks into the pyramids and backfills holes from the
 /// recording file. Runs at idle priority: it yields to everything else on the machine.
-pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status: Arc<RecStatus>, pipe: Arc<PipelineStats>, layout: StreamLayout) {
+pub fn pyramid_thread(
+    rx: Receiver<Arc<Block>>,
+    store: Arc<Mutex<Store>>,
+    status: Arc<RecStatus>,
+    pipe: Arc<PipelineStats>,
+    layout: StreamLayout,
+) {
     if let Err(e) = crate::sched::set_idle() {
         log::warn!("pyramid builder: idle scheduling not set ({e}); using normal priority");
     }
@@ -468,7 +535,8 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
             // Band pyramids the windows want.
             let want: Vec<(u32, BandKey)> = st.want.iter().map(|(v, k)| (*v, k.clone())).collect();
             bands.retain(|(v, b)| want.iter().any(|(w, k)| w == v && *k == b.key));
-            st.bands.retain(|v, (k, _)| want.iter().any(|(w, wk)| w == v && wk == k));
+            st.bands
+                .retain(|v, (k, _)| want.iter().any(|(w, wk)| w == v && wk == k));
             if st.src.is_some() {
                 for (v, k) in &want {
                     if k.chans.is_empty() || k.chans.iter().any(|&c| c >= nch) {
@@ -578,10 +646,13 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
             let st = store.lock();
             let end = st.live_end.min(avail);
             let raw_hole = st.raw.as_ref().and_then(|p| p.newest_hole(end)).map(|h| (None, h));
-            let band_hole = bands.iter().filter(|(_, bl)| bl.backfill_at.is_some_and(|t| t <= Instant::now())).find_map(|(v, bl)| {
-                let (k, p) = st.bands.get(v)?;
-                (*k == bl.key).then(|| p.newest_hole(end).map(|h| (Some(*v), h)))?
-            });
+            let band_hole = bands
+                .iter()
+                .filter(|(_, bl)| bl.backfill_at.is_some_and(|t| t <= Instant::now()))
+                .find_map(|(v, bl)| {
+                    let (k, p) = st.bands.get(v)?;
+                    (*k == bl.key).then(|| p.newest_hole(end).map(|h| (Some(*v), h)))?
+                });
             raw_hole.or(band_hole)
         };
         let Some((view, (h0, h1))) = job else {
@@ -600,7 +671,11 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
             continue;
         }
         let lead = match view {
-            Some(v) => bands.iter().find(|(bv, _)| *bv == v).map_or(0, |(_, bl)| bl.key.lead(fs)).min(c0),
+            Some(v) => bands
+                .iter()
+                .find(|(bv, _)| *bv == v)
+                .map_or(0, |(_, bl)| bl.key.lead(fs))
+                .min(c0),
             None => 0,
         };
         let f = match &file {
@@ -650,7 +725,12 @@ pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status
         st.enforce_budget();
         if last_log.elapsed() > Duration::from_secs(10) {
             last_log = Instant::now();
-            log::debug!("pyramid backfill: {} at {:.1} s, {:.0} MB in RAM", view.map_or("raw".to_string(), |v| format!("band of view {v}")), c0 as f64 / fs, st.bytes() as f64 / 1e6);
+            log::debug!(
+                "pyramid backfill: {} at {:.1} s, {:.0} MB in RAM",
+                view.map_or("raw".to_string(), |v| format!("band of view {v}")),
+                c0 as f64 / fs,
+                st.bytes() as f64 / 1e6
+            );
         }
         drop(st);
         last_chunk = Instant::now();
@@ -672,7 +752,12 @@ pub fn band_channels(layout: &StreamLayout, headstages: &[String]) -> Vec<usize>
         .channels
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.kind == ChannelKind::Electrode && (headstages.is_empty() || c.headstage.is_some_and(|h| layout.headstages.get(h).is_some_and(|hs| headstages.contains(&hs.name)))))
+        .filter(|(_, c)| {
+            c.kind == ChannelKind::Electrode
+                && (headstages.is_empty()
+                    || c.headstage
+                        .is_some_and(|h| layout.headstages.get(h).is_some_and(|hs| headstages.contains(&hs.name))))
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -727,7 +812,17 @@ mod tests {
             p.ingest(s0 as u64, &data[s0 * nch..s1 * nch], &ttl[s0..s1]);
         }
         assert_eq!(p.covered(), &[(0, n as u64)]);
-        for (t0, cols) in [(0, 2000u32), (0, 500), (0, 125), (0, 31), (0, 7), (0, 2), (40_000, 300), (40_000, 1000), (12_345, 50)] {
+        for (t0, cols) in [
+            (0, 2000u32),
+            (0, 500),
+            (0, 125),
+            (0, 31),
+            (0, 7),
+            (0, 2),
+            (40_000, 300),
+            (40_000, 1000),
+            (12_345, 50),
+        ] {
             let m = n - t0;
             let (c, w) = p.columns(t0 as i64, m as u64, cols, false).unwrap();
             for col in 0..cols as usize {
@@ -761,7 +856,10 @@ mod tests {
         let chunks = 5u64;
         let n = (chunks * CHUNK_SAMPLES) as usize;
         let data: Vec<i16> = (0..n * nch).map(|i| ((i * 7919) % 20011) as i16 - 10000).collect();
-        let mut st = Store { raw: Some(Pyramid::new(nch, false)), ..Default::default() };
+        let mut st = Store {
+            raw: Some(Pyramid::new(nch, false)),
+            ..Default::default()
+        };
         // Fill in one-chunk steps, as live blocks would, with room for about 1.5 chunks of
         // every level.
         let per_chunk = {
@@ -772,7 +870,10 @@ mod tests {
         st.budget = per_chunk * 3 / 2;
         for c in 0..chunks {
             let (s0, s1) = ((c * CHUNK_SAMPLES) as usize, ((c + 1) * CHUNK_SAMPLES) as usize);
-            st.raw.as_mut().unwrap().ingest(s0 as u64, &data[s0 * nch..s1 * nch], &[]);
+            st.raw
+                .as_mut()
+                .unwrap()
+                .ingest(s0 as u64, &data[s0 * nch..s1 * nch], &[]);
             st.live_end = s1 as u64;
             st.enforce_budget();
             assert!(st.bytes() <= st.budget, "chunk {c}: {} > {}", st.bytes(), st.budget);
@@ -792,14 +893,18 @@ mod tests {
         let bsz = (BUCKET << 6) as usize;
         for ch in 0..nch {
             let s1 = span as usize / cols as usize;
-            let (mn, mx) = (0..s1.div_ceil(bsz) * bsz).map(|s| data[s * nch + ch]).fold((i16::MAX, i16::MIN), |(a, b), v| (a.min(v), b.max(v)));
+            let (mn, mx) = (0..s1.div_ceil(bsz) * bsz)
+                .map(|s| data[s * nch + ch])
+                .fold((i16::MAX, i16::MIN), |(a, b), v| (a.min(v), b.max(v)));
             assert_eq!(c[ch], [mn, mx]);
         }
         // The newest stretch at full resolution.
         let t0 = (chunks - 1) * CHUNK_SAMPLES;
         let (c, _) = p.columns(t0 as i64, 100 * BUCKET, cols, false).unwrap();
         let s = t0 as usize;
-        let (mn, mx) = (s..s + BUCKET as usize).map(|s| data[s * nch]).fold((i16::MAX, i16::MIN), |(a, b), v| (a.min(v), b.max(v)));
+        let (mn, mx) = (s..s + BUCKET as usize)
+            .map(|s| data[s * nch])
+            .fold((i16::MAX, i16::MIN), |(a, b), v| (a.min(v), b.max(v)));
         assert_eq!(c[0], [mn, mx]);
         // A late backfill into a released chunk doesn't bring it back.
         let before = st.bytes();
@@ -830,7 +935,12 @@ mod tests {
 
     #[test]
     fn band_filter_subtracts_the_car_and_keeps_lsb_units() {
-        let key = BandKey { low_bits: 0f64.to_bits(), high_bits: 0f64.to_bits(), chans: vec![1, 2, 3], car: Some((vec![1, 2], vec![3])) };
+        let key = BandKey {
+            low_bits: 0f64.to_bits(),
+            high_bits: 0f64.to_bits(),
+            chans: vec![1, 2, 3],
+            car: Some((vec![1, 2], vec![3])),
+        };
         let mut bl = band_live(&key, 30000.0);
         // No corners: the filter is identity. 4 channels, 2 samples.
         let data = [0i16, 10, 20, 100, 0, -10, -30, 5];

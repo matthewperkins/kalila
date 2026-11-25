@@ -63,7 +63,26 @@ const REGISTER_59_MISO_A: i32 = 53;
 const DEVICE_ID_V3: u32 = 0x0102;
 const BNO_CHANNELS: usize = 18;
 /// Same scaling as the stock plugin (euler 1/16 deg, quaternion 2^-14, accel/gravity 0.01 m/s², temp/cal 1).
-const BNO_BIT_VOLTS: [f32; BNO_CHANNELS] = [0.0625, 0.0625, 0.0625, 6.103_515_6e-5, 6.103_515_6e-5, 6.103_515_6e-5, 6.103_515_6e-5, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 1.0, 1.0, 1.0, 1.0, 1.0];
+const BNO_BIT_VOLTS: [f32; BNO_CHANNELS] = [
+    0.0625,
+    0.0625,
+    0.0625,
+    6.103_515_6e-5,
+    6.103_515_6e-5,
+    6.103_515_6e-5,
+    6.103_515_6e-5,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+];
 
 const HS_NAMES: [&str; 8] = ["A1", "A2", "B1", "B2", "C1", "C2", "D1", "D2"];
 
@@ -180,7 +199,10 @@ impl OniBoard {
             info!("Searching for ONI acquisition board (driver ft600 on D3XX, KALILA_DRIVER=d3xx)...");
             match crate::oni::configure_driver_search() {
                 Some(d) => info!("using {} from {}", crate::oni::DRIVER_FILE, d.display()),
-                None => info!("{} not found in known locations; trying the default library path", crate::oni::DRIVER_FILE),
+                None => info!(
+                    "{} not found in known locations; trying the default library path",
+                    crate::oni::DRIVER_FILE
+                ),
             }
             Context::open("ft600", -1)?
         } else {
@@ -229,7 +251,14 @@ impl OniBoard {
         let (a, b, c) = Context::library_version();
         info!("liboni {a}.{b}.{c}");
         if let Some(d) = self.ctx.driver_info() {
-            info!("ONI driver {} {}.{}.{}{}", d.name, d.version.0, d.version.1, d.version.2, d.pre_release.map(|p| format!("-{p}")).unwrap_or_default());
+            info!(
+                "ONI driver {} {}.{}.{}{}",
+                d.name,
+                d.version.0,
+                d.version.1,
+                d.version.2,
+                d.pre_release.map(|p| format!("-{p}")).unwrap_or_default()
+            );
         }
         // Driver option 0 is the D3XX driver version on liboni's ft600 driver; kalila's own
         // driver logs the FT60x firmware itself when it opens the chip.
@@ -263,7 +292,10 @@ impl OniBoard {
         }
         if let Ok(t) = self.ctx.device_table() {
             for d in t {
-                debug!("dev idx {:#x} id {:#x} ver {:#x} rd {} wr {}", d.idx, d.id, d.version, d.read_size, d.write_size);
+                debug!(
+                    "dev idx {:#x} id {:#x} ver {:#x} rd {} wr {}",
+                    d.idx, d.id, d.version, d.read_size, d.write_size
+                );
             }
         }
         Ok(())
@@ -283,13 +315,18 @@ impl OniBoard {
     fn reset_board(&self) -> OniResult<()> {
         std::thread::sleep(Duration::from_millis(50));
         self.ctx.set_opt_u32(oni_sys::ONI_OPT_RESET, 1)?;
-        self.ctx.set_opt_u32(oni_sys::ONI_OPT_BLOCKREADSIZE, self.settings.usb_block_bytes)
+        self.ctx
+            .set_opt_u32(oni_sys::ONI_OPT_BLOCKREADSIZE, self.settings.usb_block_bytes)
     }
     fn rw(&self, addr: u32, val: u32, mask: u32) -> OniResult<()> {
         self.ctx.write_reg_mask(DEVICE_RHYTHM, addr, val, mask)
     }
     fn set_continuous(&self, on: bool) -> OniResult<()> {
-        self.rw(reg::MODE, (on as u32) << MODE_SPI_RUN_CONTINUOUS, 1 << MODE_SPI_RUN_CONTINUOUS)
+        self.rw(
+            reg::MODE,
+            (on as u32) << MODE_SPI_RUN_CONTINUOUS,
+            1 << MODE_SPI_RUN_CONTINUOUS,
+        )
     }
     fn set_max_timestep(&self, n: u32) -> OniResult<()> {
         self.ctx.write_reg(DEVICE_RHYTHM, reg::MAX_TIMESTEP, n)
@@ -301,7 +338,10 @@ impl OniBoard {
         self.ctx.set_opt_u32(oni_sys::ONI_OPT_RUNNING, 0)
     }
     fn is_running(&self) -> bool {
-        self.ctx.read_reg(DEVICE_RHYTHM, reg::SPI_RUNNING).map(|v| v != 0).unwrap_or(false)
+        self.ctx
+            .read_reg(DEVICE_RHYTHM, reg::SPI_RUNNING)
+            .map(|v| v != 0)
+            .unwrap_or(false)
     }
     fn set_cable_delay(&mut self, port: usize, delay: i32) -> OniResult<()> {
         if !(0..=15).contains(&delay) {
@@ -337,8 +377,10 @@ impl OniBoard {
         (0..4).try_for_each(|p| self.select_aux_bank(p, slot, bank))
     }
     fn select_aux_length(&self, slot: AuxSlot, loop_idx: u32, end_idx: u32) -> OniResult<()> {
-        self.ctx.write_reg(DEVICE_RHYTHM, reg::LOOP_AUXCMD_INDEX_1 + slot as u32, loop_idx)?;
-        self.ctx.write_reg(DEVICE_RHYTHM, reg::MAX_AUXCMD_INDEX_1 + slot as u32, end_idx)
+        self.ctx
+            .write_reg(DEVICE_RHYTHM, reg::LOOP_AUXCMD_INDEX_1 + slot as u32, loop_idx)?;
+        self.ctx
+            .write_reg(DEVICE_RHYTHM, reg::MAX_AUXCMD_INDEX_1 + slot as u32, end_idx)
     }
     fn set_dsp_settle(&self, on: bool) -> OniResult<()> {
         self.rw(reg::MODE, (on as u32) << MODE_DSP_SETTLE, 1 << MODE_DSP_SETTLE)
@@ -425,7 +467,10 @@ impl OniBoard {
     }
 
     fn set_sample_rate_hw(&mut self, hz: u32) -> Result<()> {
-        let &(_, actual, div_en, sel, div) = SAMPLE_RATES.iter().find(|r| r.0 == hz).with_context(|| format!("unsupported sample rate {hz}"))?;
+        let &(_, actual, div_en, sel, div) = SAMPLE_RATES
+            .iter()
+            .find(|r| r.0 == hz)
+            .with_context(|| format!("unsupported sample rate {hz}"))?;
         let v = ((div & 0xf) << 3) + ((sel & 3) << 1) + (div_en & 1);
         self.ctx.write_reg(RHYTHM_HUB_MANAGER, HUB_CLOCK_SEL, v)?;
         // DIFF: upstream polls forever; we time out so a wedged board is reported.
@@ -538,7 +583,10 @@ impl OniBoard {
         s.dsp_cutoff = self.regs.set_dsp_cutoff_freq(s.dsp_cutoff);
         let lo = self.regs.set_lower_bandwidth(s.lower_bandwidth);
         let up = self.regs.set_upper_bandwidth(s.upper_bandwidth);
-        debug!("bandwidth requested {}..{} Hz, actual {lo:.3}..{up:.1} Hz", s.lower_bandwidth, s.upper_bandwidth);
+        debug!(
+            "bandwidth requested {}..{} Hz, actual {lo:.3}..{up:.1} Hz",
+            s.lower_bandwidth, s.upper_bandwidth
+        );
         self.regs.enable_dsp(s.dsp_enabled);
         self.regs.enable_aux(s.acquire_aux);
         let fast = s.fast_settle;
@@ -561,7 +609,9 @@ impl OniBoard {
     /// Run `n` frames of the (already started) SPI sequence and collect aux words.
     fn read_scan_block(&self, n: usize) -> Result<ScanBlock> {
         let ns = self.num_data_streams;
-        let mut sb = ScanBlock { aux: vec![[[0u16; INIT_STEP]; 3]; ns] };
+        let mut sb = ScanBlock {
+            aux: vec![[[0u16; INIT_STEP]; 3]; ns],
+        };
         let mut t = 0;
         // DIFF: upstream waits for as long as it takes; a board that sends no Rhythm frames
         // would leave the scan (and the board) busy for good. n frames take n / 30 kHz.
@@ -595,7 +645,14 @@ impl OniBoard {
     fn intan_chip_id(sb: &ScanBlock, stream: usize) -> (i32, i32) {
         let a = &sb.aux[stream][2];
         let ch = |i: usize| a[i] as u8 as char;
-        let ok = ch(32) == 'I' && ch(33) == 'N' && ch(34) == 'T' && ch(35) == 'A' && ch(36) == 'N' && ch(24) == 'R' && ch(25) == 'H' && ch(26) == 'D';
+        let ok = ch(32) == 'I'
+            && ch(33) == 'N'
+            && ch(34) == 'T'
+            && ch(35) == 'A'
+            && ch(36) == 'N'
+            && ch(24) == 'R'
+            && ch(25) == 'H'
+            && ch(26) == 'D';
         if !ok { (-1, -1) } else { (a[19] as i32, a[23] as i32) }
     }
 
@@ -612,7 +669,9 @@ impl OniBoard {
     }
 
     fn check_all_cable_delays(&mut self) -> Result<()> {
-        let connected: Vec<bool> = (0..4).map(|p| self.headstages[2 * p].connected() || self.headstages[2 * p + 1].connected()).collect();
+        let connected: Vec<bool> = (0..4)
+            .map(|p| self.headstages[2 * p].connected() || self.headstages[2 * p + 1].connected())
+            .collect();
         self.select_aux_bank_all(AuxSlot::Cmd3, 0)?;
         self.set_max_timestep(128 * INIT_STEP as u32)?;
         self.set_continuous(false)?;
@@ -656,7 +715,11 @@ impl OniBoard {
                 let shift = opt[2 * p].max(opt[2 * p + 1]);
                 let d = (self.delay_for_port(p, true) + shift).clamp(0, 15);
                 self.set_cable_delay(p, d)?;
-                debug!("port {} cable delay at {} Hz: {d}", "ABCD".as_bytes()[p] as char, self.sample_rate);
+                debug!(
+                    "port {} cable delay at {} Hz: {d}",
+                    "ABCD".as_bytes()[p] as char,
+                    self.sample_rate
+                );
             }
         }
         Ok(())
@@ -767,7 +830,11 @@ impl OniBoard {
                 let bno = self.bno_connected(p);
                 self.has_bno[p as usize] = bno;
                 let _ = self.ctx.write_reg(DEVICE_BNO_A + p * 2, 0, bno as u32);
-                let i2c = self.ctx.read_reg(DEVICE_I2C_RAW_A + p * 2, 1 + (1 << 15)).map(|v| v > 0).unwrap_or(false);
+                let i2c = self
+                    .ctx
+                    .read_reg(DEVICE_I2C_RAW_A + p * 2, 1 + (1 << 15))
+                    .map(|v| v > 0)
+                    .unwrap_or(false);
                 let id = if i2c { self.eeprom_device_id(p) } else { 0 };
                 if bno {
                     let map = match id {
@@ -850,10 +917,19 @@ impl OniBoard {
                         self.enable_headstage(hs, true, 1, 32, bno, tmp_chip[hs]);
                     }
                 } else {
-                    let ch = if tmp_chip[hs] == CHIP_ID_RHD2132 { if self.settings.rhd2132_16ch[hs] { 16 } else { 32 } } else { 16 };
+                    let ch = if tmp_chip[hs] == CHIP_ID_RHD2132 {
+                        if self.settings.rhd2132_16ch[hs] { 16 } else { 32 }
+                    } else {
+                        16
+                    };
                     self.enable_headstage(hs, true, 1, ch, bno, tmp_chip[hs]);
                 }
-                info!("headstage {} found: {} ({} ch)", HS_NAMES[hs], chip_name(tmp_chip[hs]), self.headstages[hs].num_channels());
+                info!(
+                    "headstage {} found: {} ({} ch)",
+                    HS_NAMES[hs],
+                    chip_name(tmp_chip[hs]),
+                    self.headstages[hs].num_channels()
+                );
             } else if hs % 2 == 1 && bno {
                 self.enable_headstage(hs, true, 0, 0, true, 0);
             } else {
@@ -890,7 +966,10 @@ impl OniBoard {
             if electrode < acc + n {
                 // Physical chip channel. (Stock omits the RHD2132 16-ch offset here, so its DAC
                 // outputs an unwired channel in that mode.)
-                return Some((i, electrode - acc + crate::parser::first_chip_channel(self.chip_ids[i], n)));
+                return Some((
+                    i,
+                    electrode - acc + crate::parser::first_chip_channel(self.chip_ids[i], n),
+                ));
             }
             acc += n;
         }
@@ -941,8 +1020,17 @@ impl OniBoard {
             if d.len() >= 12 {
                 let used = u32::from_le_bytes(d[8..12].try_into().unwrap());
                 let pct = 100.0 * used as f32 / self.total_memory.max(1) as f32;
-                self.health.as_ref().unwrap().hw_buffer_milli_pct.store((pct * 1000.0) as u64, Ordering::Relaxed);
-                blk.side.push(SideSample { stream: 0, sample_number: self.mem_sample, timestamp: ts, values: vec![pct] });
+                self.health
+                    .as_ref()
+                    .unwrap()
+                    .hw_buffer_milli_pct
+                    .store((pct * 1000.0) as u64, Ordering::Relaxed);
+                blk.side.push(SideSample {
+                    stream: 0,
+                    sample_number: self.mem_sample,
+                    timestamp: ts,
+                    values: vec![pct],
+                });
                 self.mem_sample += 1;
             }
             return;
@@ -962,7 +1050,12 @@ impl OniBoard {
                 let cal = d[8 + 27];
                 (0..4).for_each(|i| v.push(((cal >> (2 * i)) & 3) as f32));
                 let stream = self.has_memmon as usize + (0..p).filter(|&q| self.has_bno[q]).count();
-                blk.side.push(SideSample { stream, sample_number: self.bno_samples[p], timestamp: ts, values: v });
+                blk.side.push(SideSample {
+                    stream,
+                    sample_number: self.bno_samples[p],
+                    timestamp: ts,
+                    values: v,
+                });
                 self.bno_samples[p] += 1;
                 return;
             }
@@ -985,10 +1078,27 @@ impl Board for OniBoard {
         BoardInfo {
             kind: "Open Ephys Acquisition Board (ONI/FT600)".into(),
             description: vec![
-                ("Gateware".into(), format!("v{a}.{b}.{c}{}", if rc != 0 { format!("-rc{}", rc & 0x3f) } else { String::new() })),
+                (
+                    "Gateware".into(),
+                    format!(
+                        "v{a}.{b}.{c}{}",
+                        if rc != 0 {
+                            format!("-rc{}", rc & 0x3f)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                ),
                 ("Board ID".into(), format!("{:#06x}", self.device_id)),
                 ("Acq clock".into(), format!("{} Hz", self.acq_clock_hz)),
-                ("Memory monitor".into(), if self.has_memmon { format!("{} words", self.total_memory) } else { "unsupported".into() }),
+                (
+                    "Memory monitor".into(),
+                    if self.has_memmon {
+                        format!("{} words", self.total_memory)
+                    } else {
+                        "unsupported".into()
+                    },
+                ),
                 ("Cable delays".into(), format!("{:?}", self.cable_delay)),
             ],
         }
@@ -1002,32 +1112,84 @@ impl Board for OniBoard {
                 continue;
             }
             let idx = headstages.len();
-            headstages.push(HeadstageInfo { name: HS_NAMES[hs].into(), slot: hs, port: hs / 2, chip: chip_name(h.chip_id).into(), num_channels: h.num_channels(), first_channel: h.first_channel, has_bno: h.has_bno });
+            headstages.push(HeadstageInfo {
+                name: HS_NAMES[hs].into(),
+                slot: hs,
+                port: hs / 2,
+                chip: chip_name(h.chip_id).into(),
+                num_channels: h.num_channels(),
+                first_channel: h.first_channel,
+                has_bno: h.has_bno,
+            });
             for _ in 0..h.num_channels() {
                 let n = channels.len() + 1;
-                channels.push(ChannelInfo { name: format!("CH{n}"), kind: ChannelKind::Electrode, bit_volts: ELECTRODE_UV_PER_BIT, units: "uV".into(), headstage: Some(idx) });
+                channels.push(ChannelInfo {
+                    name: format!("CH{n}"),
+                    kind: ChannelKind::Electrode,
+                    bit_volts: ELECTRODE_UV_PER_BIT,
+                    units: "uV".into(),
+                    headstage: Some(idx),
+                });
             }
         }
         for i in 0..self.num_aux_channels() {
-            channels.push(ChannelInfo { name: format!("AUX{}", i + 1), kind: ChannelKind::Aux, bit_volts: AUX_V_PER_BIT, units: "V".into(), headstage: None });
+            channels.push(ChannelInfo {
+                name: format!("AUX{}", i + 1),
+                kind: ChannelKind::Aux,
+                bit_volts: AUX_V_PER_BIT,
+                units: "V".into(),
+                headstage: None,
+            });
         }
         if self.settings.acquire_adc {
             for i in 0..8 {
-                channels.push(ChannelInfo { name: format!("ADC{}", i + 1), kind: ChannelKind::Adc, bit_volts: ADC_BIT_VOLTS as f32, units: "V".into(), headstage: None });
+                channels.push(ChannelInfo {
+                    name: format!("ADC{}", i + 1),
+                    kind: ChannelKind::Adc,
+                    bit_volts: ADC_BIT_VOLTS as f32,
+                    units: "V".into(),
+                    headstage: None,
+                });
             }
         }
         let mut side_streams = Vec::new();
         if self.has_memmon {
-            side_streams.push(SideStreamInfo { name: "memory_usage".into(), sample_rate: MEMORY_MONITOR_FS as f64, channel_names: vec!["MEM".into()], units: vec!["%".into()], bit_volts: vec![1.0] });
+            side_streams.push(SideStreamInfo {
+                name: "memory_usage".into(),
+                sample_rate: MEMORY_MONITOR_FS as f64,
+                channel_names: vec!["MEM".into()],
+                units: vec!["%".into()],
+                bit_volts: vec![1.0],
+            });
         }
         for p in 0..4 {
             if self.has_bno[p] {
-                let names = ["Eul-Y", "Eul-R", "Eul-P", "Quat-W", "Quat-X", "Quat-Y", "Quat-Z", "Acc-X", "Acc-Y", "Acc-Z", "Grav-X", "Grav-Y", "Grav-Z", "Temp", "Cal-Mag", "Cal-Acc", "Cal-Gyr", "Cal-Sys"];
-                let units = ["deg", "deg", "deg", "", "", "", "", "m/s^2", "m/s^2", "m/s^2", "m/s^2", "m/s^2", "m/s^2", "degC", "", "", "", ""];
-                side_streams.push(SideStreamInfo { name: format!("IMU_port_{}", (b'A' + p as u8) as char), sample_rate: 100.0, channel_names: names.iter().map(|s| s.to_string()).collect(), units: units.iter().map(|s| s.to_string()).collect(), bit_volts: BNO_BIT_VOLTS.to_vec() });
+                let names = [
+                    "Eul-Y", "Eul-R", "Eul-P", "Quat-W", "Quat-X", "Quat-Y", "Quat-Z", "Acc-X", "Acc-Y", "Acc-Z",
+                    "Grav-X", "Grav-Y", "Grav-Z", "Temp", "Cal-Mag", "Cal-Acc", "Cal-Gyr", "Cal-Sys",
+                ];
+                let units = [
+                    "deg", "deg", "deg", "", "", "", "", "m/s^2", "m/s^2", "m/s^2", "m/s^2", "m/s^2", "m/s^2", "degC",
+                    "", "", "", "",
+                ];
+                side_streams.push(SideStreamInfo {
+                    name: format!("IMU_port_{}", (b'A' + p as u8) as char),
+                    sample_rate: 100.0,
+                    channel_names: names.iter().map(|s| s.to_string()).collect(),
+                    units: units.iter().map(|s| s.to_string()).collect(),
+                    bit_volts: BNO_BIT_VOLTS.to_vec(),
+                });
             }
         }
-        StreamLayout { name: "acquisition_board".into(), sample_rate: self.sample_rate, channels, headstages, ttl_lines: 8, side_streams, hw_clock_hz: self.acq_clock_hz as f64 }
+        StreamLayout {
+            name: "acquisition_board".into(),
+            sample_rate: self.sample_rate,
+            channels,
+            headstages,
+            ttl_lines: 8,
+            side_streams,
+            hw_clock_hz: self.acq_clock_hz as f64,
+        }
     }
 
     fn settings(&self) -> &BoardSettings {
@@ -1051,7 +1213,21 @@ impl Board for OniBoard {
         } else if new.cable_delay_adjust != old.cable_delay_adjust {
             self.check_all_cable_delays()?;
             self.update_registers()?;
-        } else if (new.lower_bandwidth, new.upper_bandwidth, new.dsp_enabled, new.dsp_cutoff, new.acquire_aux, new.fast_settle) != (old.lower_bandwidth, old.upper_bandwidth, old.dsp_enabled, old.dsp_cutoff, old.acquire_aux, old.fast_settle) {
+        } else if (
+            new.lower_bandwidth,
+            new.upper_bandwidth,
+            new.dsp_enabled,
+            new.dsp_cutoff,
+            new.acquire_aux,
+            new.fast_settle,
+        ) != (
+            old.lower_bandwidth,
+            old.upper_bandwidth,
+            old.dsp_enabled,
+            old.dsp_cutoff,
+            old.acquire_aux,
+            old.fast_settle,
+        ) {
             self.update_registers()?;
         }
         self.apply_live_settings()?;
@@ -1078,7 +1254,13 @@ impl Board for OniBoard {
         self.ttl_out = 0;
         self.write_ttl_out(0)?;
         let nstreams = self.enabled_streams.len();
-        self.parser = RhythmParser::new(self.channels_per_stream.clone(), self.chip_ids.clone(), self.settings.acquire_aux, self.settings.acquire_adc, self.device_id == DEVICE_ID_V3);
+        self.parser = RhythmParser::new(
+            self.channels_per_stream.clone(),
+            self.chip_ids.clone(),
+            self.settings.acquire_aux,
+            self.settings.acquire_adc,
+            self.device_id == DEVICE_ID_V3,
+        );
         self.pending = None;
         self.mem_sample = 0;
         self.bno_samples = [0; 4];
@@ -1087,7 +1269,11 @@ impl Board for OniBoard {
         self.set_continuous(true)?;
         self.run()?;
         self.running = true;
-        info!("acquisition started: {} streams, {} channels", nstreams, self.layout().num_channels());
+        info!(
+            "acquisition started: {} streams, {} channels",
+            nstreams,
+            self.layout().num_channels()
+        );
         Ok(())
     }
 
@@ -1104,7 +1290,16 @@ impl Board for OniBoard {
                     health.read_errors.fetch_add(1, Ordering::Relaxed);
                 })
             };
-            match crate::assemble::assemble(&mut self.parser, &mut self.pending, blk, target, has_rhythm, self.acq_clock_hz, &health, next)? {
+            match crate::assemble::assemble(
+                &mut self.parser,
+                &mut self.pending,
+                blk,
+                target,
+                has_rhythm,
+                self.acq_clock_hz,
+                &health,
+                next,
+            )? {
                 Assembled::Block => return Ok(()),
                 Assembled::Side(f) => {
                     self.handle_side(&f, blk);
@@ -1123,9 +1318,15 @@ impl Board for OniBoard {
                 self.ttl_out = w;
                 self.write_ttl_out(w)?;
             }
-            LiveCommand::DacRoute { dac, electrode, threshold_uv } => {
+            LiveCommand::DacRoute {
+                dac,
+                electrode,
+                threshold_uv,
+            } => {
                 if dac < 8 {
-                    self.dac_route[dac] = electrode.and_then(|e| self.electrode_to_stream(e)).map(|(s, c)| (s, c, threshold_uv));
+                    self.dac_route[dac] = electrode
+                        .and_then(|e| self.electrode_to_stream(e))
+                        .map(|(s, c)| (s, c, threshold_uv));
                     self.apply_dac(dac)?;
                 }
             }
@@ -1165,4 +1366,3 @@ impl Board for OniBoard {
         Ok(())
     }
 }
-

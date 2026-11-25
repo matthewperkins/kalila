@@ -240,12 +240,38 @@ impl Rhd2000Registers {
         let p = &self.a_pwr;
         let byte = |b: usize| -> i32 { (0..8).map(|i| p[b + i] << i).sum() };
         match reg {
-            0 => (self.adc_reference_bw << 6) + (self.amp_fast_settle << 5) + (self.amp_vref_enable << 4) + (self.adc_comparator_bias << 2) + self.adc_comparator_select,
+            0 => {
+                (self.adc_reference_bw << 6)
+                    + (self.amp_fast_settle << 5)
+                    + (self.amp_vref_enable << 4)
+                    + (self.adc_comparator_bias << 2)
+                    + self.adc_comparator_select
+            }
             1 => (self.vdd_sense_enable << 6) + self.adc_buffer_bias,
             2 => self.mux_bias,
-            3 => (self.mux_load << 5) + (self.temp_s2 << 4) + (self.temp_s1 << 3) + (self.temp_en << 2) + (self.dig_out_hiz << 1) + self.dig_out,
-            4 => (self.weak_miso << 7) + (self.twos_comp << 6) + (self.abs_mode << 5) + (self.dsp_en << 4) + self.dsp_cutoff_freq,
-            5 => (self.zcheck_dac_power << 6) + (self.zcheck_load << 5) + (self.zcheck_scale << 3) + (self.zcheck_conn_all << 2) + (self.zcheck_sel_pol << 1) + self.zcheck_en,
+            3 => {
+                (self.mux_load << 5)
+                    + (self.temp_s2 << 4)
+                    + (self.temp_s1 << 3)
+                    + (self.temp_en << 2)
+                    + (self.dig_out_hiz << 1)
+                    + self.dig_out
+            }
+            4 => {
+                (self.weak_miso << 7)
+                    + (self.twos_comp << 6)
+                    + (self.abs_mode << 5)
+                    + (self.dsp_en << 4)
+                    + self.dsp_cutoff_freq
+            }
+            5 => {
+                (self.zcheck_dac_power << 6)
+                    + (self.zcheck_load << 5)
+                    + (self.zcheck_scale << 3)
+                    + (self.zcheck_conn_all << 2)
+                    + (self.zcheck_sel_pol << 1)
+                    + self.zcheck_en
+            }
             6 => 128,
             7 => self.zcheck_select,
             8 => (self.off_chip_rh1 << 7) + self.rh1_dac1,
@@ -375,7 +401,9 @@ impl Rhd2000Registers {
         (self.rl_dac1, self.rl_dac2, self.rl_dac3)
     }
     pub fn lower_bandwidth(&self) -> f64 {
-        Self::lower_from_rl(3500.0 + self.rl_dac1 as f64 * 175.0 + self.rl_dac2 as f64 * 12700.0 + self.rl_dac3 as f64 * 3_000_000.0)
+        Self::lower_from_rl(
+            3500.0 + self.rl_dac1 as f64 * 175.0 + self.rl_dac2 as f64 * 12700.0 + self.rl_dac3 as f64 * 3_000_000.0,
+        )
     }
 
     pub fn command_list_register_config(&self, calibrate: bool) -> Vec<i32> {

@@ -63,7 +63,15 @@ impl Sweeps {
     /// Triggers whose window `[rise - pre, rise + post)` is complete in the GPU ring once
     /// `uploaded` samples have been ingested. Returns (slot, ring index of window start), at
     /// most `max_cuts` (the newest).
-    pub fn take_ready(&mut self, uploaded: u64, pre: u32, post: u32, nslots: u32, ring: u32, max_cuts: usize) -> Vec<(u32, u32)> {
+    pub fn take_ready(
+        &mut self,
+        uploaded: u64,
+        pre: u32,
+        post: u32,
+        nslots: u32,
+        ring: u32,
+        max_cuts: usize,
+    ) -> Vec<(u32, u32)> {
         let mut ready = Vec::new();
         while let Some(&rise) = self.pending.front() {
             if rise + post as u64 > uploaded {
@@ -91,7 +99,11 @@ impl Sweeps {
     }
 
     pub fn newest_slot(&self, nslots: u32) -> u32 {
-        if self.count == 0 { 0 } else { ((self.count - 1) % nslots.max(1) as u64) as u32 }
+        if self.count == 0 {
+            0
+        } else {
+            ((self.count - 1) % nslots.max(1) as u64) as u32
+        }
     }
     pub fn filled(&self, nslots: u32) -> u32 {
         self.count.min(nslots as u64) as u32
@@ -114,7 +126,15 @@ mod tests {
     fn cuts_after_post_window_with_slots_and_width() {
         let mut s = Sweeps::default();
         // Line 1 (TTL2): high for samples 100..120 and 300..320.
-        let words: Vec<u16> = (0..400u64).map(|i| if (100..120).contains(&i) || (300..320).contains(&i) { 0b10 } else { 0 }).collect();
+        let words: Vec<u16> = (0..400u64)
+            .map(|i| {
+                if (100..120).contains(&i) || (300..320).contains(&i) {
+                    0b10
+                } else {
+                    0
+                }
+            })
+            .collect();
         s.scan(&words[..200], 0, 1);
         // pre 10, post 50: first trigger needs samples up to 150.
         assert_eq!(s.take_ready(140, 10, 50, 4, 1024, 16), vec![]);

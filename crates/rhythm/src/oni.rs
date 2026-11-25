@@ -70,7 +70,11 @@ impl Context {
         let rc = unsafe { sys::oni_init_ctx(ctx, host_idx) };
         if rc != sys::ONI_ESUCCESS {
             unsafe { sys::oni_destroy_ctx(ctx) };
-            return Err(if rc == sys::ONI_EBADCONTROLLER { OpenError::BadController } else { OpenError::NoBoard(OniError(rc)) });
+            return Err(if rc == sys::ONI_EBADCONTROLLER {
+                OpenError::BadController
+            } else {
+                OpenError::NoBoard(OniError(rc))
+            });
         }
         Ok(Self { ctx })
     }
@@ -81,8 +85,18 @@ impl Context {
             return None;
         }
         let i = unsafe { &*p };
-        let s = |c: *const std::os::raw::c_char| if c.is_null() { None } else { Some(unsafe { CStr::from_ptr(c) }.to_string_lossy().into_owned()) };
-        Some(DriverInfo { name: s(i.name).unwrap_or_default(), version: (i.major, i.minor, i.patch), pre_release: s(i.pre_release) })
+        let s = |c: *const std::os::raw::c_char| {
+            if c.is_null() {
+                None
+            } else {
+                Some(unsafe { CStr::from_ptr(c) }.to_string_lossy().into_owned())
+            }
+        };
+        Some(DriverInfo {
+            name: s(i.name).unwrap_or_default(),
+            version: (i.major, i.minor, i.patch),
+            pre_release: s(i.pre_release),
+        })
     }
 
     pub fn library_version() -> (i32, i32, i32) {
@@ -111,7 +125,15 @@ impl Context {
         Ok(v)
     }
     pub fn set_opt_u32(&self, opt: c_int, v: u32) -> OniResult<()> {
-        check(unsafe { sys::oni_set_opt(self.ctx, opt, &v as *const u32 as *const c_void, std::mem::size_of::<u32>()) }).map(|_| ())
+        check(unsafe {
+            sys::oni_set_opt(
+                self.ctx,
+                opt,
+                &v as *const u32 as *const c_void,
+                std::mem::size_of::<u32>(),
+            )
+        })
+        .map(|_| ())
     }
     pub fn get_driver_opt_u32(&self, opt: c_int) -> OniResult<u32> {
         let mut v = 0u32;
@@ -124,7 +146,14 @@ impl Context {
         let n = self.get_opt_u32(sys::ONI_OPT_NUMDEVICES)? as usize;
         let mut v = vec![sys::oni_device_t::default(); n];
         let mut sz = n * std::mem::size_of::<sys::oni_device_t>();
-        check(unsafe { sys::oni_get_opt(self.ctx, sys::ONI_OPT_DEVICETABLE, v.as_mut_ptr() as *mut c_void, &mut sz) })?;
+        check(unsafe {
+            sys::oni_get_opt(
+                self.ctx,
+                sys::ONI_OPT_DEVICETABLE,
+                v.as_mut_ptr() as *mut c_void,
+                &mut sz,
+            )
+        })?;
         Ok(v)
     }
 
@@ -187,7 +216,11 @@ impl Drop for Frame {
 /// library path: `$ONI_DRIVER_PATH`, next to the executable, `../lib`, common prefixes and
 /// existing Open Ephys GUI installs (so the driver they ship can be reused).
 /// File name liboni's loader opens for the FT600 driver on this platform.
-pub const DRIVER_FILE: &str = if cfg!(target_os = "macos") { "libonidriver_ft600.dylib" } else { "libonidriver_ft600.so" };
+pub const DRIVER_FILE: &str = if cfg!(target_os = "macos") {
+    "libonidriver_ft600.dylib"
+} else {
+    "libonidriver_ft600.so"
+};
 
 pub fn driver_search_candidates() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
@@ -207,7 +240,11 @@ pub fn driver_search_candidates() -> Vec<std::path::PathBuf> {
     }
     v.push("/usr/local/lib".into());
     // Open Ephys GUI installs keep plugin shared libraries in "shared*" folders.
-    let mut roots: Vec<PathBuf> = vec!["/usr/local/bin/open-ephys-gui".into(), "/usr/local/bin/open-ephys".into(), "/opt/open-ephys".into()];
+    let mut roots: Vec<PathBuf> = vec![
+        "/usr/local/bin/open-ephys-gui".into(),
+        "/usr/local/bin/open-ephys".into(),
+        "/opt/open-ephys".into(),
+    ];
     if let Some(h) = &home {
         roots.push(h.join(".local/share/open-ephys"));
         roots.push(h.join(".config/open-ephys"));
@@ -228,7 +265,9 @@ pub fn driver_search_candidates() -> Vec<std::path::PathBuf> {
 
 /// Point liboni at the first directory containing the FT600 driver. Returns it, if any.
 pub fn configure_driver_search() -> Option<std::path::PathBuf> {
-    let found = driver_search_candidates().into_iter().find(|d| d.join(DRIVER_FILE).exists())?;
+    let found = driver_search_candidates()
+        .into_iter()
+        .find(|d| d.join(DRIVER_FILE).exists())?;
     let c = CString::new(found.to_string_lossy().as_bytes()).ok()?;
     unsafe { sys::oni_set_driver_search_dir(c.as_ptr()) };
     Some(found)

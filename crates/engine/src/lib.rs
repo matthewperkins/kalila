@@ -43,7 +43,12 @@ pub struct DspSettings {
 
 impl Default for DspSettings {
     fn default() -> Self {
-        Self { band: BandSpec::SPIKES, threshold: ThresholdMode::Sigma(4.5), detect: true, car: None }
+        Self {
+            band: BandSpec::SPIKES,
+            threshold: ThresholdMode::Sigma(4.5),
+            detect: true,
+            car: None,
+        }
     }
 }
 
@@ -124,7 +129,10 @@ impl Engine {
         let rec_status = Arc::new(RecStatus::default());
         *rec_status.root.lock() = record_root;
         let st = rec_status.clone();
-        let rec_thread = std::thread::Builder::new().name("recorder".into()).spawn(move || record::run_recorder(rec_rx, st)).expect("spawn recorder");
+        let rec_thread = std::thread::Builder::new()
+            .name("recorder".into())
+            .spawn(move || record::run_recorder(rec_rx, st))
+            .expect("spawn recorder");
         Self {
             board: None,
             simulated: false,
@@ -252,7 +260,10 @@ impl Engine {
             let name = w.thread().name().unwrap_or("worker").to_string();
             if w.join().is_err() {
                 error!("{name} thread crashed");
-                self.last_error = Some(format!("the {name} thread crashed: {}. Recording is not affected; stop and restart acquisition to recover.", worker_role(&name)));
+                self.last_error = Some(format!(
+                    "the {name} thread crashed: {}. Recording is not affected; stop and restart acquisition to recover.",
+                    worker_role(&name)
+                ));
             }
         }
         // The recorder thread ends only at shutdown; earlier means it crashed.
@@ -287,10 +298,17 @@ impl Engine {
         self.board.is_some() || self.running.is_some()
     }
     pub fn board_settings(&self) -> Option<BoardSettings> {
-        self.board.as_ref().map(|b| b.settings().clone()).or_else(|| self.running.as_ref().map(|r| r.settings.clone()))
+        self.board
+            .as_ref()
+            .map(|b| b.settings().clone())
+            .or_else(|| self.running.as_ref().map(|r| r.settings.clone()))
     }
     pub fn available_sample_rates(&self) -> Vec<u32> {
-        self.board.as_ref().map(|b| b.available_sample_rates()).or_else(|| self.running.as_ref().map(|r| r.rates.clone())).unwrap_or_default()
+        self.board
+            .as_ref()
+            .map(|b| b.available_sample_rates())
+            .or_else(|| self.running.as_ref().map(|r| r.rates.clone()))
+            .unwrap_or_default()
     }
     pub fn layout(&self) -> Option<&StreamLayout> {
         self.layout.as_ref()
@@ -339,7 +357,9 @@ impl Engine {
         if self.is_busy() {
             bail!("board is busy");
         }
-        let Some(mut board) = self.board.take() else { bail!("no board open") };
+        let Some(mut board) = self.board.take() else {
+            bail!("no board open")
+        };
         let layout = board.layout();
         let settings = board.settings().clone();
         let rates = board.available_sample_rates();
@@ -381,7 +401,12 @@ impl Engine {
             let rx = dsp_rx;
             let settings = self.dsp_settings.clone();
             let cs = self.channel_stats.clone();
-            workers.push(std::thread::Builder::new().name("dsp".into()).spawn(move || dsp_thread(rx, spk_tx, settings, cs, fs, nel)).unwrap());
+            workers.push(
+                std::thread::Builder::new()
+                    .name("dsp".into())
+                    .spawn(move || dsp_thread(rx, spk_tx, settings, cs, fs, nel))
+                    .unwrap(),
+            );
         }
         // Min/max pyramids of the recording.
         {
@@ -390,7 +415,12 @@ impl Engine {
             let status = self.rec_status.clone();
             let pipe = self.pipeline.clone();
             let layout = layout.clone();
-            workers.push(std::thread::Builder::new().name("pyramid".into()).spawn(move || pyramid::pyramid_thread(rx, store, status, pipe, layout)).unwrap());
+            workers.push(
+                std::thread::Builder::new()
+                    .name("pyramid".into())
+                    .spawn(move || pyramid::pyramid_thread(rx, store, status, pipe, layout))
+                    .unwrap(),
+            );
         }
         // Audio feeder (owns the cpal stream).
         {
@@ -427,7 +457,20 @@ impl Engine {
                 let _stopped = AcqStopped(rec_tx.clone());
                 let _awake = sched::KeepAwake::new();
                 rt2.store(set_realtime(), Ordering::Relaxed);
-                let r = acquisition_loop(board.as_mut(), &stop2, &live_rx, &disp_tx, &dsp_tx, &aud_tx, &pyr_tx, &rec_tx, &rec_status, rec_limit, &health, &pipe);
+                let r = acquisition_loop(
+                    board.as_mut(),
+                    &stop2,
+                    &live_rx,
+                    &disp_tx,
+                    &dsp_tx,
+                    &aud_tx,
+                    &pyr_tx,
+                    &rec_tx,
+                    &rec_status,
+                    rec_limit,
+                    &health,
+                    &pipe,
+                );
                 if let Err(e) = &r {
                     error!("acquisition loop ended with error: {e:#}");
                 }
@@ -441,12 +484,26 @@ impl Engine {
         std::thread::sleep(Duration::from_millis(5));
         self.rt_priority = rt.load(Ordering::Relaxed);
         if !self.rt_priority {
-            warn!("acquisition thread is not real-time{}. Board DRAM still buffers stalls.", if cfg!(target_os = "linux") { "; see README (rtprio limits)" } else { "" });
+            warn!(
+                "acquisition thread is not real-time{}. Board DRAM still buffers stalls.",
+                if cfg!(target_os = "linux") {
+                    "; see README (rtprio limits)"
+                } else {
+                    ""
+                }
+            );
         }
         self.live_tx = Some(live_tx);
         self.display_rx = Some(disp_rx);
         self.spike_rx = Some(spk_rx);
-        self.running = Some(Running { stop, acq, workers, started: Instant::now(), settings, rates });
+        self.running = Some(Running {
+            stop,
+            acq,
+            workers,
+            started: Instant::now(),
+            settings,
+            rates,
+        });
         info!("acquisition running: {nch} channels @ {fs} Hz, {block_samples} samples/block");
         Ok(())
     }
@@ -501,7 +558,8 @@ impl Engine {
 
     pub fn start_recording(&self) {
         if self.rec_thread.as_ref().is_none_or(|h| h.is_finished()) || self.rec_tx.send(RecMsg::Start).is_err() {
-            *self.rec_status.error.lock() = Some("cannot record: the recorder thread has crashed. Restart kalila.".into());
+            *self.rec_status.error.lock() =
+                Some("cannot record: the recorder thread has crashed. Restart kalila.".into());
         }
     }
     pub fn stop_recording(&self) {
@@ -568,7 +626,11 @@ fn acquisition_loop(
     // block, sized up front).
     let (nch, bs) = (board.layout().num_channels(), board.settings().block_samples.max(1));
     let new_block = || Arc::new(Block::with_capacity(nch, bs));
-    let pool_len = [disp, dsp, aud, pyr].iter().map(|tx| tx.capacity().unwrap_or(0)).sum::<usize>() + 16;
+    let pool_len = [disp, dsp, aud, pyr]
+        .iter()
+        .map(|tx| tx.capacity().unwrap_or(0))
+        .sum::<usize>()
+        + 16;
     let mut pool: Vec<Arc<Block>> = (0..pool_len).map(|_| new_block()).collect();
     let mut idx = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -593,7 +655,10 @@ fn acquisition_loop(
         if rec_status.recording.load(Ordering::Relaxed) {
             let t = Instant::now();
             // `recording` also clears if the recorder thread dies, so this can't spin forever.
-            while rec.len() as u64 >= rec_limit && !stop.load(Ordering::Relaxed) && rec_status.recording.load(Ordering::Relaxed) {
+            while rec.len() as u64 >= rec_limit
+                && !stop.load(Ordering::Relaxed)
+                && rec_status.recording.load(Ordering::Relaxed)
+            {
                 std::thread::sleep(Duration::from_micros(200));
             }
             let w = t.elapsed().as_micros() as u64;
@@ -606,7 +671,12 @@ fn acquisition_loop(
             }
             pipe.rec_queue.store(rec.len() as u64, Ordering::Relaxed);
         }
-        for (tx, ctr) in [(disp, &pipe.display_dropped), (dsp, &pipe.dsp_dropped), (aud, &pipe.audio_dropped), (pyr, &pipe.pyramid_dropped)] {
+        for (tx, ctr) in [
+            (disp, &pipe.display_dropped),
+            (dsp, &pipe.dsp_dropped),
+            (aud, &pipe.audio_dropped),
+            (pyr, &pipe.pyramid_dropped),
+        ] {
             if let Err(TrySendError::Full(_)) = tx.try_send(blk.clone()) {
                 ctr.fetch_add(1, Ordering::Relaxed);
             }
@@ -615,7 +685,14 @@ fn acquisition_loop(
     Ok(())
 }
 
-fn dsp_thread(rx: Receiver<Arc<Block>>, spikes: Sender<Spike>, settings: Arc<Mutex<DspSettings>>, cs: Arc<Mutex<ChannelStats>>, fs: f64, nel: usize) {
+fn dsp_thread(
+    rx: Receiver<Arc<Block>>,
+    spikes: Sender<Spike>,
+    settings: Arc<Mutex<DspSettings>>,
+    cs: Arc<Mutex<ChannelStats>>,
+    fs: f64,
+    nel: usize,
+) {
     let mut cur = settings.lock().clone();
     let mut bank = FilterBank::new(cur.band.sections(fs), nel);
     let mut det = SpikeDetector::new(fs, nel, cur.threshold);
@@ -641,7 +718,12 @@ fn dsp_thread(rx: Receiver<Arc<Block>>, spikes: Sender<Spike>, settings: Arc<Mut
                 _ => (0.0, &[][..]),
             };
             for (ch, v) in row.iter_mut().enumerate() {
-                let x = r[ch] as f32 - if mask.get(ch).copied().unwrap_or(false) { car } else { 0.0 };
+                let x = r[ch] as f32
+                    - if mask.get(ch).copied().unwrap_or(false) {
+                        car
+                    } else {
+                        0.0
+                    };
                 *v = bank.tick(ch, x * ELECTRODE_UV_PER_BIT);
             }
             if cur.detect {
@@ -760,7 +842,11 @@ mod tests {
         let mut e = Engine::new(root.clone());
         e.audio_settings.lock().enabled = false;
         let (tx, rx) = crossbeam_channel::bounded(1);
-        e.set_board(Box::new(HangAfter { inner: SimBoard::new(vec![16]), left: 300, release: rx }));
+        e.set_board(Box::new(HangAfter {
+            inner: SimBoard::new(vec![16]),
+            left: 300,
+            release: rx,
+        }));
         e.start_acquisition().unwrap();
         e.start_recording();
         wait_for("recording", || e.is_recording());
@@ -769,7 +855,13 @@ mod tests {
         e.stop_acquisition();
         assert!(t.elapsed() < STOP_WAIT + Duration::from_secs(1));
         assert!(!e.is_acquiring() && !e.has_board());
-        assert!(e.last_error.as_deref().is_some_and(|m| m.contains("stopped responding")), "{:?}", e.last_error);
+        assert!(
+            e.last_error
+                .as_deref()
+                .is_some_and(|m| m.contains("stopped responding")),
+            "{:?}",
+            e.last_error
+        );
         wait_for("the recording to be finished", || !e.is_recording());
         // The read returns after all (say, the board was power-cycled): the board comes back.
         tx.send(()).unwrap();
@@ -810,19 +902,34 @@ mod tests {
         let check = |e: &Engine, when: &str| {
             let st = e.pyramids.lock();
             assert_eq!(st.src.as_ref().map(|s| &s.dat), Some(&src.dat), "{when}");
-            assert!(st.live_end > 0 && st.live_end <= file_end, "{when}: overview to {} > file {file_end}", st.live_end);
+            assert!(
+                st.live_end > 0 && st.live_end <= file_end,
+                "{when}: overview to {} > file {file_end}",
+                st.live_end
+            );
         };
         // Still acquiring, not recording.
         std::thread::sleep(Duration::from_millis(1000));
         check(&e, "after Stop");
-        let cols = |e: &Engine| e.pyramids.lock().raw.as_ref().and_then(|p| p.columns(0, file_end / 64 * 64, (file_end / 64) as u32, false)).unwrap().0;
+        let cols = |e: &Engine| {
+            e.pyramids
+                .lock()
+                .raw
+                .as_ref()
+                .and_then(|p| p.columns(0, file_end / 64 * 64, (file_end / 64) as u32, false))
+                .unwrap()
+                .0
+        };
         let before = cols(&e);
         // A new acquisition run: its samples 0.. would otherwise land on the recording's.
         e.stop_acquisition();
         e.start_acquisition().unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         check(&e, "after a restart");
-        assert!(before == cols(&e), "the new run's samples changed the recording's overview");
+        assert!(
+            before == cols(&e),
+            "the new run's samples changed the recording's overview"
+        );
         drop(e);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -834,7 +941,10 @@ mod tests {
         let mut e = Engine::new(root.clone());
         e.audio_settings.lock().enabled = false;
         // ~0.3 s of blocks: enough to start recording before the panic.
-        e.set_board(Box::new(PanicAfter { inner: SimBoard::new(vec![32]), left: 300 }));
+        e.set_board(Box::new(PanicAfter {
+            inner: SimBoard::new(vec![32]),
+            left: 300,
+        }));
         e.start_acquisition().unwrap();
         e.start_recording();
         wait_for("recording", || e.is_recording());
@@ -843,7 +953,11 @@ mod tests {
             !e.is_acquiring()
         });
         wait_for("the recorder to finalise", || !e.is_recording());
-        assert!(e.last_error.as_deref().is_some_and(|m| m.contains("panicked")), "{:?}", e.last_error);
+        assert!(
+            e.last_error.as_deref().is_some_and(|m| m.contains("panicked")),
+            "{:?}",
+            e.last_error
+        );
         // The recorder finished the recording normally (no recorder error).
         assert!(e.rec_status.error.lock().is_none());
         drop(e);

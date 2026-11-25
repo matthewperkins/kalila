@@ -1,6 +1,13 @@
 fn main() {
     let dir = "liboni";
-    for f in ["oni.c", "onix.c", "onidriverloader.c", "oni.h", "onidefs.h", "onidriver.h"] {
+    for f in [
+        "oni.c",
+        "onix.c",
+        "onidriverloader.c",
+        "oni.h",
+        "onidefs.h",
+        "onidriver.h",
+    ] {
         println!("cargo:rerun-if-changed={dir}/{f}");
     }
     let mut build = cc::Build::new();
@@ -12,7 +19,11 @@ fn main() {
         build.include(compat);
     }
     build
-        .files([format!("{dir}/oni.c"), format!("{dir}/onix.c"), format!("{dir}/onidriverloader.c")])
+        .files([
+            format!("{dir}/oni.c"),
+            format!("{dir}/onix.c"),
+            format!("{dir}/onidriverloader.c"),
+        ])
         .include(dir)
         .opt_level(3)
         .flag_if_supported("-fPIC")

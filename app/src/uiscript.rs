@@ -35,10 +35,27 @@ enum Step {
     Window(String),
     Wait(f64),
     Move(Pos2),
-    Click { pos: Pos2, button: PointerButton, mods: Modifiers },
-    Drag { from: Pos2, to: Pos2, button: PointerButton, mods: Modifiers, steps: u32 },
-    Scroll { pos: Pos2, delta: Vec2, mods: Modifiers },
-    Key { key: egui::Key, mods: Modifiers },
+    Click {
+        pos: Pos2,
+        button: PointerButton,
+        mods: Modifiers,
+    },
+    Drag {
+        from: Pos2,
+        to: Pos2,
+        button: PointerButton,
+        mods: Modifiers,
+        steps: u32,
+    },
+    Scroll {
+        pos: Pos2,
+        delta: Vec2,
+        mods: Modifiers,
+    },
+    Key {
+        key: egui::Key,
+        mods: Modifiers,
+    },
     Text(String),
     Shot(String),
     Fullscreen(bool),
@@ -91,7 +108,13 @@ fn parse_line(line: &str) -> Result<Option<Step>, String> {
             },
         }
     }
-    let need = |n: usize| if nums.len() >= n { Ok(()) } else { Err(format!("`{cmd}` needs {n} numbers: {line}")) };
+    let need = |n: usize| {
+        if nums.len() >= n {
+            Ok(())
+        } else {
+            Err(format!("`{cmd}` needs {n} numbers: {line}"))
+        }
+    };
     let p = |i: usize| Pos2::new(nums[i], nums[i + 1]);
     Ok(Some(match cmd {
         "window" => Step::Window(rest.to_string()),
@@ -105,22 +128,43 @@ fn parse_line(line: &str) -> Result<Option<Step>, String> {
         }
         "click" => {
             need(2)?;
-            Step::Click { pos: p(0), button, mods }
+            Step::Click {
+                pos: p(0),
+                button,
+                mods,
+            }
         }
         "drag" => {
             need(4)?;
-            Step::Drag { from: p(0), to: p(2), button, mods, steps: nums.get(4).map_or(12, |&n| n.max(1.0) as u32) }
+            Step::Drag {
+                from: p(0),
+                to: p(2),
+                button,
+                mods,
+                steps: nums.get(4).map_or(12, |&n| n.max(1.0) as u32),
+            }
         }
         "scroll" => {
             need(4)?;
-            Step::Scroll { pos: p(0), delta: Vec2::new(nums[2], nums[3]), mods }
+            Step::Scroll {
+                pos: p(0),
+                delta: Vec2::new(nums[2], nums[3]),
+                mods,
+            }
         }
         "key" => {
             let name = other.first().ok_or(format!("`key` needs a key name: {line}"))?;
-            Step::Key { key: egui::Key::from_name(name).ok_or(format!("unknown key `{name}`"))?, mods }
+            Step::Key {
+                key: egui::Key::from_name(name).ok_or(format!("unknown key `{name}`"))?,
+                mods,
+            }
         }
         "text" => Step::Text(rest.to_string()),
-        "shot" => Step::Shot(if rest.is_empty() { "shot".into() } else { rest.to_string() }),
+        "shot" => Step::Shot(if rest.is_empty() {
+            "shot".into()
+        } else {
+            rest.to_string()
+        }),
         "log" => Step::Log(rest.to_string()),
         "fullscreen" => Step::Fullscreen(rest != "off"),
         "cover" => Step::Cover(rest.to_string()),
@@ -167,9 +211,22 @@ impl UiScript {
                 return None;
             }
         };
-        let shots = std::env::var_os("KALILA_UI_SHOTS").map(PathBuf::from).unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
-        log::warn!("ui-script: running {} ({} steps); scripted input goes to kalila windows only", path.display(), steps.len());
-        Some(Self { steps, target: "Open Ephys acquisition".into(), batches: VecDeque::new(), wait_until: None, shots, done: false })
+        let shots = std::env::var_os("KALILA_UI_SHOTS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
+        log::warn!(
+            "ui-script: running {} ({} steps); scripted input goes to kalila windows only",
+            path.display(),
+            steps.len()
+        );
+        Some(Self {
+            steps,
+            target: "Open Ephys acquisition".into(),
+            batches: VecDeque::new(),
+            wait_until: None,
+            shots,
+            done: false,
+        })
     }
 
     /// Called for every window's input each frame.
@@ -177,7 +234,11 @@ impl UiScript {
         if self.done {
             return;
         }
-        let target = raw.viewports.iter().find(|(_, v)| v.title.as_deref().is_some_and(|t| t.contains(&self.target))).map(|(id, _)| *id);
+        let target = raw
+            .viewports
+            .iter()
+            .find(|(_, v)| v.title.as_deref().is_some_and(|t| t.contains(&self.target)))
+            .map(|(id, _)| *id);
         let Some(target) = target else {
             // Not open (yet): keep the main window ticking until it is.
             ctx.request_repaint_of(ViewportId::ROOT);
@@ -207,24 +268,73 @@ impl UiScript {
                 }
                 Step::Window(t) => self.target = t,
                 Step::Wait(s) => self.wait_until = Some(Instant::now() + Duration::from_secs_f64(s.max(0.0))),
-                Step::Move(p) => self.batches.push_back(one(vec![Event::PointerMoved(p)], Modifiers::NONE)),
+                Step::Move(p) => self
+                    .batches
+                    .push_back(one(vec![Event::PointerMoved(p)], Modifiers::NONE)),
                 Step::Click { pos, button, mods } => {
                     self.batches.push_back(one(vec![Event::PointerMoved(pos)], mods));
-                    self.batches.push_back(one(vec![Event::PointerButton { pos, button, pressed: true, modifiers: mods }], mods));
-                    self.batches.push_back(one(vec![Event::PointerButton { pos, button, pressed: false, modifiers: mods }], mods));
+                    self.batches.push_back(one(
+                        vec![Event::PointerButton {
+                            pos,
+                            button,
+                            pressed: true,
+                            modifiers: mods,
+                        }],
+                        mods,
+                    ));
+                    self.batches.push_back(one(
+                        vec![Event::PointerButton {
+                            pos,
+                            button,
+                            pressed: false,
+                            modifiers: mods,
+                        }],
+                        mods,
+                    ));
                 }
-                Step::Drag { from, to, button, mods, steps } => {
+                Step::Drag {
+                    from,
+                    to,
+                    button,
+                    mods,
+                    steps,
+                } => {
                     self.batches.push_back(one(vec![Event::PointerMoved(from)], mods));
-                    self.batches.push_back(one(vec![Event::PointerButton { pos: from, button, pressed: true, modifiers: mods }], mods));
+                    self.batches.push_back(one(
+                        vec![Event::PointerButton {
+                            pos: from,
+                            button,
+                            pressed: true,
+                            modifiers: mods,
+                        }],
+                        mods,
+                    ));
                     for i in 1..=steps {
-                        self.batches.push_back(one(vec![Event::PointerMoved(from.lerp(to, i as f32 / steps as f32))], mods));
+                        self.batches.push_back(one(
+                            vec![Event::PointerMoved(from.lerp(to, i as f32 / steps as f32))],
+                            mods,
+                        ));
                     }
-                    self.batches.push_back(one(vec![Event::PointerButton { pos: to, button, pressed: false, modifiers: mods }], mods));
+                    self.batches.push_back(one(
+                        vec![Event::PointerButton {
+                            pos: to,
+                            button,
+                            pressed: false,
+                            modifiers: mods,
+                        }],
+                        mods,
+                    ));
                 }
                 Step::Scroll { pos, delta, mods } => {
                     self.batches.push_back(one(vec![Event::PointerMoved(pos)], mods));
                     self.batches.push_back(one(
-                        vec![Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: mods }],
+                        vec![Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Wheel,
+                            modifiers: mods,
+                        }],
                         mods,
                     ));
                     // A few idle frames, so the smoothed scroll lands while the modifiers are held.
@@ -233,8 +343,26 @@ impl UiScript {
                     }
                 }
                 Step::Key { key, mods } => {
-                    self.batches.push_back(one(vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: mods }], mods));
-                    self.batches.push_back(one(vec![Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: mods }], mods));
+                    self.batches.push_back(one(
+                        vec![Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: mods,
+                        }],
+                        mods,
+                    ));
+                    self.batches.push_back(one(
+                        vec![Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: false,
+                            repeat: false,
+                            modifiers: mods,
+                        }],
+                        mods,
+                    ));
                 }
                 Step::Text(t) => self.batches.push_back(one(vec![Event::Text(t)], Modifiers::NONE)),
                 Step::Shot(name) => {
@@ -258,7 +386,10 @@ impl UiScript {
             }
             // Input steps end with the modifiers released.
             if !self.batches.is_empty() {
-                self.batches.push_back(Batch { events: vec![], mods: Modifiers::NONE });
+                self.batches.push_back(Batch {
+                    events: vec![],
+                    mods: Modifiers::NONE,
+                });
             }
             break;
         }
@@ -275,14 +406,20 @@ impl UiScript {
 #[cfg(target_os = "macos")]
 mod cover {
     use objc2::encode::{Encode, Encoding};
-    use objc2::runtime::{AnyClass, AnyObject};
     use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
 
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Rect([f64; 4]);
     unsafe impl Encode for Rect {
-        const ENCODING: Encoding = Encoding::Struct("CGRect", &[Encoding::Struct("CGPoint", &[Encoding::Double, Encoding::Double]), Encoding::Struct("CGSize", &[Encoding::Double, Encoding::Double])]);
+        const ENCODING: Encoding = Encoding::Struct(
+            "CGRect",
+            &[
+                Encoding::Struct("CGPoint", &[Encoding::Double, Encoding::Double]),
+                Encoding::Struct("CGSize", &[Encoding::Double, Encoding::Double]),
+            ],
+        );
     }
 
     pub fn cover(title: &str) {
@@ -306,7 +443,11 @@ mod cover {
                 let _: () = msg_send![w, setLevel: 25isize]; // above the menu bar
                 let _: () = msg_send![w, setFrame: frame, display: true];
                 let _: () = msg_send![w, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
-                log::info!("ui-script: '{title}' covers its screen ({} x {} points)", frame.0[2], frame.0[3]);
+                log::info!(
+                    "ui-script: '{title}' covers its screen ({} x {} points)",
+                    frame.0[2],
+                    frame.0[3]
+                );
                 return;
             }
             log::warn!("ui-script: cover: no window titled '{title}'");
@@ -323,10 +464,39 @@ mod tests {
         let s = parse("# setup\nwindow Port B\nwait 0.5\nclick 10 20 right shift  # palette\ndrag 1 2 3 4 6\nscroll 5 6 0 -120 alt\nkey ArrowLeft shift\nshot a b\nquit\n").unwrap();
         assert_eq!(s[0], Step::Window("Port B".into()));
         assert_eq!(s[1], Step::Wait(0.5));
-        assert_eq!(s[2], Step::Click { pos: Pos2::new(10.0, 20.0), button: PointerButton::Secondary, mods: Modifiers::SHIFT });
-        assert_eq!(s[3], Step::Drag { from: Pos2::new(1.0, 2.0), to: Pos2::new(3.0, 4.0), button: PointerButton::Primary, mods: Modifiers::NONE, steps: 6 });
-        assert_eq!(s[4], Step::Scroll { pos: Pos2::new(5.0, 6.0), delta: Vec2::new(0.0, -120.0), mods: Modifiers::ALT });
-        assert_eq!(s[5], Step::Key { key: egui::Key::ArrowLeft, mods: Modifiers::SHIFT });
+        assert_eq!(
+            s[2],
+            Step::Click {
+                pos: Pos2::new(10.0, 20.0),
+                button: PointerButton::Secondary,
+                mods: Modifiers::SHIFT
+            }
+        );
+        assert_eq!(
+            s[3],
+            Step::Drag {
+                from: Pos2::new(1.0, 2.0),
+                to: Pos2::new(3.0, 4.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+                steps: 6
+            }
+        );
+        assert_eq!(
+            s[4],
+            Step::Scroll {
+                pos: Pos2::new(5.0, 6.0),
+                delta: Vec2::new(0.0, -120.0),
+                mods: Modifiers::ALT
+            }
+        );
+        assert_eq!(
+            s[5],
+            Step::Key {
+                key: egui::Key::ArrowLeft,
+                mods: Modifiers::SHIFT
+            }
+        );
         assert_eq!(s[6], Step::Shot("a b".into()));
         assert_eq!(s[7], Step::Quit);
         assert!(parse("click 1").is_err());

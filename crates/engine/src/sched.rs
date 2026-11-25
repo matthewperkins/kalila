@@ -9,7 +9,13 @@ pub fn set_realtime() -> bool {
     #[cfg(target_os = "linux")]
     {
         let p = ThreadPriority::from_posix(ScheduleParams { sched_priority: 70 });
-        if set_thread_priority_and_policy(thread_native_id(), p, ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo)).is_ok() {
+        if set_thread_priority_and_policy(
+            thread_native_id(),
+            p,
+            ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo),
+        )
+        .is_ok()
+        {
             return true;
         }
     }
@@ -26,7 +32,12 @@ pub fn set_idle() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         use thread_priority::*;
-        set_thread_priority_and_policy(thread_native_id(), ThreadPriority::Min, ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Idle)).map_err(|e| format!("{e:?}"))
+        set_thread_priority_and_policy(
+            thread_native_id(),
+            ThreadPriority::Min,
+            ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Idle),
+        )
+        .map_err(|e| format!("{e:?}"))
     }
     #[cfg(target_os = "macos")]
     {
@@ -138,8 +149,18 @@ mod mac {
             if libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) != 0 {
                 return false;
             }
-            let mut p = TimeConstraint { period: mach_units(PERIOD_US), computation: mach_units(COMPUTATION_US), constraint: mach_units(CONSTRAINT_US), preemptible: 1 };
-            thread_policy_set(libc::pthread_mach_thread_np(libc::pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (&raw mut p).cast(), COUNT) == 0
+            let mut p = TimeConstraint {
+                period: mach_units(PERIOD_US),
+                computation: mach_units(COMPUTATION_US),
+                constraint: mach_units(CONSTRAINT_US),
+                preemptible: 1,
+            };
+            thread_policy_set(
+                libc::pthread_mach_thread_np(libc::pthread_self()),
+                THREAD_TIME_CONSTRAINT_POLICY,
+                (&raw mut p).cast(),
+                COUNT,
+            ) == 0
         }
     }
 
@@ -187,7 +208,9 @@ mod mac {
 mod tests {
     #[test]
     fn the_time_constraint_policy_is_accepted() {
-        std::thread::spawn(|| assert!(super::mac::time_constraint())).join().unwrap();
+        std::thread::spawn(|| assert!(super::mac::time_constraint()))
+            .join()
+            .unwrap();
     }
 
     #[test]

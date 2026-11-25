@@ -48,7 +48,11 @@ struct Ring {
 
 impl Ring {
     fn new(size: usize) -> Self {
-        Ring { buf: vec![0; size], r: 0, w: 0 }
+        Ring {
+            buf: vec![0; size],
+            r: 0,
+            w: 0,
+        }
     }
     fn len(&self) -> usize {
         let n = self.buf.len();
@@ -211,7 +215,9 @@ impl Ctx {
     }
 
     fn send_cmd(&mut self, data: &[u8]) -> c_int {
-        let Some(ft) = self.ft.as_ref() else { return sys::ONI_EINVALSTATE };
+        let Some(ft) = self.ft.as_ref() else {
+            return sys::ONI_EINVALSTATE;
+        };
         let mut total = 0;
         while total < data.len() {
             match ft.write(Channel::Control, &data[total..], 1000) {
@@ -318,7 +324,10 @@ impl Ctx {
         }
         // GPIO 0 is the board's FIFO reset.
         let ft = self.ft.as_ref().unwrap();
-        let gpio = ft.gpio_pull_oni().and_then(|_| ft.gpio_write(1, 0)).and_then(|_| ft.gpio_enable(1, 1));
+        let gpio = ft
+            .gpio_pull_oni()
+            .and_then(|_| ft.gpio_write(1, 0))
+            .and_then(|_| ft.gpio_enable(1, 1));
         if gpio.is_err() {
             self.close_device();
             return sys::ONI_EINIT;
@@ -345,7 +354,9 @@ impl Ctx {
         if want < self.in_block as usize {
             return sys::ONI_EINVALREADSIZE;
         }
-        let Some(ft) = self.ft.as_mut() else { return sys::ONI_EINVALSTATE };
+        let Some(ft) = self.ft.as_mut() else {
+            return sys::ONI_EINVALSTATE;
+        };
         // The chip ends a transfer whenever its FIFO runs empty, so reading as fast as
         // possible fetches a block in dozens of pieces of one sample each (about 12,000
         // transfers a second, each with its announcement). liboni needs the whole block
@@ -450,7 +461,12 @@ extern "C" fn init(p: sys::oni_driver_ctx, host_idx: c_int) -> c_int {
     guard(|| unsafe { cast(p) }.init(host_idx))
 }
 
-extern "C" fn read_stream(p: sys::oni_driver_ctx, stream: sys::oni_read_stream_t, data: *mut c_void, size: usize) -> c_int {
+extern "C" fn read_stream(
+    p: sys::oni_driver_ctx,
+    stream: sys::oni_read_stream_t,
+    data: *mut c_void,
+    size: usize,
+) -> c_int {
     guard(|| {
         let ctx = unsafe { cast(p) };
         if data.is_null() {
@@ -478,13 +494,20 @@ extern "C" fn read_stream(p: sys::oni_driver_ctx, stream: sys::oni_read_stream_t
     })
 }
 
-extern "C" fn write_stream(p: sys::oni_driver_ctx, stream: sys::oni_write_stream_t, data: *const std::os::raw::c_char, size: usize) -> c_int {
+extern "C" fn write_stream(
+    p: sys::oni_driver_ctx,
+    stream: sys::oni_write_stream_t,
+    data: *const std::os::raw::c_char,
+    size: usize,
+) -> c_int {
     guard(|| {
         let ctx = unsafe { cast(p) };
         if stream != sys::ONI_WRITE_STREAM_DATA {
             return sys::ONI_EPATHINVALID;
         }
-        let Some(ft) = ctx.ft.as_ref() else { return sys::ONI_EINVALSTATE };
+        let Some(ft) = ctx.ft.as_ref() else {
+            return sys::ONI_EINVALSTATE;
+        };
         let src = unsafe { std::slice::from_raw_parts(data as *const u8, size) };
         let total = size & !3;
         let mut done = 0;
@@ -525,11 +548,26 @@ extern "C" fn write_config(p: sys::oni_driver_ctx, reg: sys::oni_config_t, value
         let mut buf = [0u8; 45];
         let mut i = 0;
         if reg == sys::ONI_CONFIG_TRIG {
-            put_reg_write(&mut buf, &mut i, reg_offset(sys::ONI_CONFIG_DEV_IDX), ctx.reg_op.dev_idx);
-            put_reg_write(&mut buf, &mut i, reg_offset(sys::ONI_CONFIG_REG_ADDR), ctx.reg_op.dev_addr);
+            put_reg_write(
+                &mut buf,
+                &mut i,
+                reg_offset(sys::ONI_CONFIG_DEV_IDX),
+                ctx.reg_op.dev_idx,
+            );
+            put_reg_write(
+                &mut buf,
+                &mut i,
+                reg_offset(sys::ONI_CONFIG_REG_ADDR),
+                ctx.reg_op.dev_addr,
+            );
             put_reg_write(&mut buf, &mut i, reg_offset(sys::ONI_CONFIG_RW), ctx.reg_op.rw);
             if ctx.reg_op.rw != 0 {
-                put_reg_write(&mut buf, &mut i, reg_offset(sys::ONI_CONFIG_REG_VALUE), ctx.reg_op.value);
+                put_reg_write(
+                    &mut buf,
+                    &mut i,
+                    reg_offset(sys::ONI_CONFIG_REG_VALUE),
+                    ctx.reg_op.value,
+                );
             }
             put_reg_write(&mut buf, &mut i, reg_offset(sys::ONI_CONFIG_TRIG), 1);
         } else {
@@ -606,7 +644,9 @@ extern "C" fn set_opt(_: sys::oni_driver_ctx, _: c_int, _: *const c_void, _: usi
 extern "C" fn get_opt(p: sys::oni_driver_ctx, option: c_int, value: *mut c_void, len: *mut usize) -> c_int {
     guard(|| {
         let ctx = unsafe { cast(p) };
-        let Some(ft) = ctx.ft.as_ref() else { return sys::ONI_EINVALSTATE };
+        let Some(ft) = ctx.ft.as_ref() else {
+            return sys::ONI_EINVALSTATE;
+        };
         if option != 0 {
             return sys::ONI_EINVALOPT;
         }
@@ -668,7 +708,21 @@ mod tests {
     fn control_stream_parser_splits_signals_and_register_replies() {
         let mut ctx = Ctx::new();
         // A register reply, then a signal packet ending in 0, then a reply split over two reads.
-        ctx.fill_control_buffers(&[SIGRES_REG, 0x78, 0x56, 0x34, 0x12, SIGRES_SIGNAL, 5, 6, 7, 0, SIGRES_REG, 0xaa, 0xbb]);
+        ctx.fill_control_buffers(&[
+            SIGRES_REG,
+            0x78,
+            0x56,
+            0x34,
+            0x12,
+            SIGRES_SIGNAL,
+            5,
+            6,
+            7,
+            0,
+            SIGRES_REG,
+            0xaa,
+            0xbb,
+        ]);
         ctx.fill_control_buffers(&[0xcc, 0xdd, SIGRES_SIGNAL, 9]);
         ctx.fill_control_buffers(&[0]);
         assert_eq!(ctx.reg.len(), 8);
@@ -721,7 +775,10 @@ mod tests {
         let ctx = unsafe { sys::oni_create_ctx(name.as_ptr()) };
         assert!(!ctx.is_null(), "liboni did not find the built-in driver");
         let info = unsafe { &*sys::oni_get_driver_info(ctx) };
-        assert_eq!(unsafe { std::ffi::CStr::from_ptr(info.name) }.to_str().unwrap(), "kalila-ft600-usb");
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(info.name) }.to_str().unwrap(),
+            "kalila-ft600-usb"
+        );
         let rc = unsafe { sys::oni_init_ctx(ctx, -1) };
         assert_eq!(rc, sys::ONI_EDEVID);
         unsafe { sys::oni_destroy_ctx(ctx) };

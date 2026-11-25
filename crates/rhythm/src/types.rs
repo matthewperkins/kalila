@@ -67,7 +67,10 @@ impl StreamLayout {
         self.channels.len()
     }
     pub fn num_electrodes(&self) -> usize {
-        self.channels.iter().filter(|c| c.kind == ChannelKind::Electrode).count()
+        self.channels
+            .iter()
+            .filter(|c| c.kind == ChannelKind::Electrode)
+            .count()
     }
 }
 
@@ -152,7 +155,15 @@ impl Health {
         }
     }
     pub fn reset(&self) {
-        for a in [&self.frames, &self.samples, &self.dropped_samples, &self.discontinuities, &self.bad_frames, &self.hw_buffer_milli_pct, &self.read_errors] {
+        for a in [
+            &self.frames,
+            &self.samples,
+            &self.dropped_samples,
+            &self.discontinuities,
+            &self.bad_frames,
+            &self.hw_buffer_milli_pct,
+            &self.read_errors,
+        ] {
             a.store(0, Ordering::Relaxed);
         }
     }
@@ -236,9 +247,16 @@ impl Default for BoardSettings {
 pub enum LiveCommand {
     SetTtlOut(u16),
     /// Route an electrode channel (global electrode index) to a board DAC, or disable with None.
-    DacRoute { dac: usize, electrode: Option<usize>, threshold_uv: f32 },
+    DacRoute {
+        dac: usize,
+        electrode: Option<usize>,
+        threshold_uv: f32,
+    },
     SetLeds(bool),
-    SetDacHpf { enabled: bool, hz: f64 },
+    SetDacHpf {
+        enabled: bool,
+        hz: f64,
+    },
     SetNoiseSlicer(i32),
     /// TTL outputs 1–8 driven by the DAC threshold comparators (stock "DAC TTL") instead of
     /// software. Rhythm MODE register, TTL-out-mode bit.

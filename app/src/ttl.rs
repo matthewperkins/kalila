@@ -11,7 +11,16 @@ use eframe::egui::{self, Color32};
 const VALID: u32 = 1 << 16;
 
 /// Distinct, colour-blind-friendly hues for TTL lines 1..8 (repeats for 9..16).
-const LINE_COLORS: [[u8; 3]; 8] = [[255, 176, 0], [100, 143, 255], [220, 38, 127], [120, 220, 120], [254, 97, 0], [120, 94, 240], [80, 220, 220], [230, 230, 230]];
+const LINE_COLORS: [[u8; 3]; 8] = [
+    [255, 176, 0],
+    [100, 143, 255],
+    [220, 38, 127],
+    [120, 220, 120],
+    [254, 97, 0],
+    [120, 94, 240],
+    [80, 220, 220],
+    [230, 230, 230],
+];
 
 pub fn line_color(line: usize) -> Color32 {
     let [r, g, b] = LINE_COLORS[line % LINE_COLORS.len()];
@@ -37,7 +46,17 @@ pub struct TtlGeom {
 
 impl TtlGeom {
     pub fn live(plot: egui::Rect, strip: egui::Rect, label_x: f32, ppp: f32, cursor: u32, gap: Option<u32>) -> Self {
-        Self { plot, strip, label_x, ppp, cursor, gap, rot: 0, x_shift: 0.0, x_scale: 1.0 }
+        Self {
+            plot,
+            strip,
+            label_x,
+            ppp,
+            cursor,
+            gap,
+            rot: 0,
+            x_shift: 0.0,
+            x_scale: 1.0,
+        }
     }
 }
 
@@ -59,7 +78,11 @@ impl TtlOverlay {
     /// An overlay from one TTL word per column (the OR of the words in that column), e.g.
     /// from the min/max pyramid.
     pub fn from_columns(words: &[u16]) -> Self {
-        Self { cols: words.iter().map(|&w| VALID | w as u32).collect(), cur: u32::MAX, seen: words.iter().fold(0, |a, &w| a | w) }
+        Self {
+            cols: words.iter().map(|&w| VALID | w as u32).collect(),
+            cur: u32::MAX,
+            seen: words.iter().fold(0, |a, &w| a | w),
+        }
     }
 
     /// Forget column contents (display geometry changed) but keep the lanes.
@@ -72,7 +95,6 @@ impl TtlOverlay {
     pub fn seen(&self) -> u16 {
         self.seen
     }
-
 
     /// Fold `words` (one per new sample, the first at window position `pos0`).
     pub fn ingest(&mut self, words: &[u16], pos0: u32, window: u32, cols: u32) {
@@ -124,7 +146,17 @@ impl TtlOverlay {
 
     /// Draw bands over `g.plot` and one lane per line in `g.strip`.
     pub fn draw(&self, p: &egui::Painter, g: &TtlGeom, lines: &[usize]) {
-        let TtlGeom { plot, strip, label_x, ppp, cursor, gap, rot, x_shift, x_scale } = *g;
+        let TtlGeom {
+            plot,
+            strip,
+            label_x,
+            ppp,
+            cursor,
+            gap,
+            rot,
+            x_shift,
+            x_scale,
+        } = *g;
         if lines.is_empty() || self.cols.is_empty() {
             return;
         }
@@ -134,7 +166,10 @@ impl TtlOverlay {
             let c = line_color(line);
             let band = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 22);
             let y0 = strip.min.y + k as f32 * lane_h;
-            let lane = egui::Rect::from_min_max(egui::pos2(strip.min.x, y0 + 0.5), egui::pos2(strip.max.x, y0 + lane_h - 0.5));
+            let lane = egui::Rect::from_min_max(
+                egui::pos2(strip.min.x, y0 + 0.5),
+                egui::pos2(strip.max.x, y0 + lane_h - 0.5),
+            );
             p.rect_filled(lane, 0.0, Color32::from_gray(22));
             for (s, e) in self.runs(line, cursor, gap, rot) {
                 let x0 = (plot.min.x + (s as f32 * x_scale + x_shift) / ppp).max(plot.min.x);
@@ -142,11 +177,31 @@ impl TtlOverlay {
                 if x1 <= x0 {
                     continue;
                 }
-                p.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, plot.min.y), egui::pos2(x1.max(x0 + 1.0 / ppp), plot.max.y)), 0.0, band);
-                p.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, lane.min.y), egui::pos2(x1.max(x0 + 1.0 / ppp), lane.max.y)), 0.0, c);
+                p.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, plot.min.y),
+                        egui::pos2(x1.max(x0 + 1.0 / ppp), plot.max.y),
+                    ),
+                    0.0,
+                    band,
+                );
+                p.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, lane.min.y),
+                        egui::pos2(x1.max(x0 + 1.0 / ppp), lane.max.y),
+                    ),
+                    0.0,
+                    c,
+                );
             }
             if lane_h >= 7.0 {
-                p.text(egui::pos2(label_x, lane.center().y), egui::Align2::LEFT_CENTER, format!("TTL{}", line + 1), egui::FontId::monospace((lane_h * 0.8).clamp(7.0, 11.0)), c);
+                p.text(
+                    egui::pos2(label_x, lane.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("TTL{}", line + 1),
+                    egui::FontId::monospace((lane_h * 0.8).clamp(7.0, 11.0)),
+                    c,
+                );
             }
         }
     }
