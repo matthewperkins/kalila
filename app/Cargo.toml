@@ -21,3 +21,6 @@ parking_lot.workspace = true
 objc2 = "0.6"
 block2 = "0.6"
 libc = "0.2"
+
+[lints]
+workspace = true

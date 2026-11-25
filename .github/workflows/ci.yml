@@ -12,6 +12,7 @@ on:
 permissions:
   contents: read
 
+# Keep in step with rust-toolchain.toml and packaging/ci-build.sh (RUST_VERSION).
 env:
   RUST_VERSION: 1.95.0
   CARGO_TERM_COLOR: always
@@ -68,7 +69,7 @@ jobs:
             build-essential pkg-config libasound2-dev libpipewire-0.3-dev libclang-dev
       - name: Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup default "$RUST_VERSION"
           rustc --version
       - uses: actions/cache@v4
@@ -83,3 +84,7 @@ jobs:
         run: cargo build --release --workspace
       - name: Test
         run: cargo test --release --workspace
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

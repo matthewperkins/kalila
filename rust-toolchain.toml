@@ -1,0 +1,6 @@
+# The Rust version the release (packaging/ci-build.sh, RUST_VERSION) and CI
+# (.github/workflows/ci.yml, RUST_VERSION) are built and tested with. Keep all three in step.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

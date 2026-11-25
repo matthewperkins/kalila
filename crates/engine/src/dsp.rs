@@ -367,8 +367,7 @@ impl SpikeDetector {
     /// Feed one sample per channel (`x[ch]`, µV, filtered) with absolute sample number `n`.
     pub fn push(&mut self, n: i64, x: &[f32], out: &mut Vec<Spike>) {
         let p = self.hpos;
-        for ch in 0..self.nch {
-            let v = x[ch];
+        for (ch, &v) in x[..self.nch].iter().enumerate() {
             self.hist[ch * HIST + p] = v;
             self.noise[ch].update(v);
             let thr = self.threshold(ch);

@@ -842,8 +842,8 @@ mod tests {
                     }
                     assert_eq!(c[col * nch + ch], [mn, mx], "cols {cols} col {col} ch {ch} level {k}");
                 }
-                for s in e0..e1 {
-                    word |= ttl[s];
+                for &t in &ttl[e0..e1] {
+                    word |= t;
                 }
                 assert_eq!(w[col], word, "cols {cols} col {col} level {k}");
             }

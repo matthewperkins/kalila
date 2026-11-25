@@ -7,3 +7,6 @@ links = "oni"
 
 [build-dependencies]
 cc = "1"
+
+[lints]
+workspace = true

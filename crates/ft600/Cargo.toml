@@ -9,3 +9,6 @@ description = "FT600 USB bridge of the Open Ephys acquisition board, without FTD
 oni-sys = { path = "../oni-sys" }
 libc = "0.2"
 log.workspace = true
+
+[lints]
+workspace = true

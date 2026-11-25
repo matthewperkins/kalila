@@ -26,6 +26,7 @@ mkdir -p "$2"
 out=$(cd "$2" && pwd -P)
 cd "$root"
 
+# Keep in step with rust-toolchain.toml and .github/workflows/ci.yml (RUST_VERSION).
 RUST_VERSION=1.95.0
 
 # ---------------------------------------------------------------- build dependencies
