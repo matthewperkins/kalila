@@ -351,8 +351,10 @@ pub struct DacOut {
     pub threshold_uv: f32,
 }
 
-/// DAC/TTL outputs. Sent to the board whenever acquisition starts and live on change (the
-/// board-level ones are mirrored into `BoardSettings`, so they never need "Apply").
+/// DAC/TTL outputs. Sent to the board whenever acquisition starts and live on change. The panel
+/// owns the four board-level ones (TTL-out mode, DAC high-pass on and corner, noise slicer):
+/// whatever `BoardSettings` holds for them, the board is handed the panel's (`with_outputs`),
+/// and they never need "Apply" (`board_differs` ignores them).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct OutputSettings {
@@ -378,6 +380,24 @@ impl Default for OutputSettings {
             noise_slicer: 0,
         }
     }
+}
+
+/// `b` with the four board-level outputs taken from the Outputs panel: what the app hands the
+/// engine wherever it gives the board settings (open, Apply). The only place the two
+/// representations are mapped onto each other.
+pub fn with_outputs(mut b: BoardSettings, o: &OutputSettings) -> BoardSettings {
+    b.ttl_output_mode = o.ttl_threshold_mode;
+    b.dac_hpf_enabled = o.dac_hpf_enabled;
+    b.dac_hpf_hz = o.dac_hpf_hz;
+    b.noise_slicer = o.noise_slicer;
+    b
+}
+
+/// Whether `a` and `b` differ in anything Apply sets, i.e. in anything but the four values the
+/// Outputs panel owns (`with_outputs`).
+pub fn board_differs(a: &BoardSettings, b: &BoardSettings) -> bool {
+    let o = OutputSettings::default();
+    with_outputs(a.clone(), &o) != with_outputs(b.clone(), &o)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -635,11 +655,10 @@ mod tests {
         assert_eq!(Config::default().defaults_rev, DEFAULTS_REV);
     }
 
-    /// The four board-level outputs are stored twice: in `outputs` (the panel) and in `board`
-    /// (what the board was last programmed with; `App::sync_outputs` mirrors them there while
-    /// acquiring). Loading keeps both as saved: nothing reconciles them at load. At run time
-    /// `board` is what the board gets at open and at Apply, `outputs` from the first
-    /// `sync_outputs` of each acquisition on (package 3e's analysis).
+    /// The four board-level outputs are stored twice: in `outputs` (the panel) and in `board`.
+    /// Loading keeps both as saved: nothing reconciles them at load. At run time the panel owns
+    /// them: the board gets `outputs`' values at open and at Apply (`with_outputs` over `board`)
+    /// and from `sync_outputs` while acquiring; `board`'s copy is saved but no longer read, and an edit of the four never shows as a pending board change (`board_differs`).
     #[test]
     fn board_and_outputs_keep_their_own_output_values_at_load() {
         let s = r#"{
@@ -666,6 +685,101 @@ mod tests {
             (o.ttl_threshold_mode, o.dac_hpf_enabled, o.dac_hpf_hz, o.noise_slicer)
         );
         assert_eq!((b.sample_rate, b.noise_slicer, b.dac_hpf_hz), (20000, 0, 300.0));
+    }
+
+    /// Every field of `BoardSettings` by name, each changed in turn (through serde, so a field
+    /// added later is covered too).
+    fn each_field_changed() -> Vec<(String, BoardSettings)> {
+        use serde_json::{Value, json};
+        let base = serde_json::to_value(BoardSettings::default()).unwrap();
+        let Value::Object(m) = &base else {
+            panic!("BoardSettings is not an object")
+        };
+        m.iter()
+            .map(|(k, v)| {
+                let changed = match v {
+                    Value::Bool(b) => json!(!b),
+                    Value::Number(n) if n.is_f64() => json!(n.as_f64().unwrap() + 1.0),
+                    Value::Number(n) => json!(n.as_u64().unwrap() + 1),
+                    Value::Null => json!(1),
+                    Value::Array(a) => {
+                        let mut a = a.clone();
+                        a[0] = match &a[0] {
+                            Value::Bool(b) => json!(!b),
+                            Value::Number(n) if n.is_f64() => json!(n.as_f64().unwrap() + 1.0),
+                            Value::Number(n) => json!(n.as_i64().unwrap() + 1),
+                            x => panic!("{k}: unexpected element {x}"),
+                        };
+                        Value::Array(a)
+                    }
+                    x => panic!("{k}: unexpected value {x}"),
+                };
+                let mut s = base.clone();
+                s[k.as_str()] = changed;
+                let b: BoardSettings = serde_json::from_value(s).unwrap();
+                assert_ne!(b, BoardSettings::default(), "{k} did not change");
+                (k.clone(), b)
+            })
+            .collect()
+    }
+
+    const PANEL_OWNED: [&str; 4] = ["ttl_output_mode", "dac_hpf_enabled", "dac_hpf_hz", "noise_slicer"];
+
+    #[test]
+    fn with_outputs_maps_the_four_panel_values_and_nothing_else() {
+        let o = OutputSettings {
+            ttl_threshold_mode: true,
+            dac_hpf_enabled: true,
+            dac_hpf_hz: 150.0,
+            noise_slicer: 20,
+            // Not board settings: must not leak anywhere.
+            dac1_follows_audio: true,
+            dacs: [DacOut {
+                electrode: Some(3),
+                threshold_uv: -70.0,
+            }; 8],
+        };
+        let b = with_outputs(BoardSettings::default(), &o);
+        assert_eq!(
+            (b.ttl_output_mode, b.dac_hpf_enabled, b.dac_hpf_hz, b.noise_slicer),
+            (true, true, 150.0, 20)
+        );
+        // Every other field as it was, for any starting value.
+        for (k, start) in each_field_changed() {
+            let got = with_outputs(start.clone(), &o);
+            let want = BoardSettings {
+                ttl_output_mode: true,
+                dac_hpf_enabled: true,
+                dac_hpf_hz: 150.0,
+                noise_slicer: 20,
+                ..start
+            };
+            assert_eq!(got, want, "starting with {k} changed");
+        }
+    }
+
+    #[test]
+    fn board_differs_ignores_the_panel_values_and_sees_every_other_field() {
+        let d = BoardSettings::default();
+        assert!(!board_differs(&d, &d));
+        let fields = each_field_changed();
+        for k in PANEL_OWNED {
+            assert!(fields.iter().any(|(f, _)| f == k), "{k} is not a field");
+        }
+        for (k, b) in fields {
+            let owned = PANEL_OWNED.contains(&k.as_str());
+            assert_eq!(board_differs(&d, &b), !owned, "{k}");
+            assert_eq!(board_differs(&b, &d), !owned, "{k}");
+        }
+        // All four at once: still no difference.
+        let o = OutputSettings {
+            ttl_threshold_mode: true,
+            dac_hpf_enabled: true,
+            dac_hpf_hz: 150.0,
+            noise_slicer: 20,
+            ..OutputSettings::default()
+        };
+        assert!(!board_differs(&d, &with_outputs(d.clone(), &o)));
     }
 
     #[test]

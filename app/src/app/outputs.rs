@@ -135,7 +135,7 @@ struct SentOutputs {
 }
 
 /// The live commands `sync_outputs` sends, in order, and whether the board-level ones are among
-/// them (the caller then mirrors them into the board settings). Updates `sent` as if they were sent.
+/// them. Updates `sent` as if they were sent.
 fn plan_outputs(
     sent: &mut SentOutputs,
     o: &OutputSettings,

@@ -325,14 +325,63 @@ impl Board for SimBoard {
         }
         Ok(())
     }
+    /// Records in `settings` what `OniBoard::live` records there (LEDs, DAC high-pass, noise
+    /// slicer, TTL-out mode), so the settings that come back after Stop are the ones in force.
     fn live(&mut self, cmd: &LiveCommand) -> Result<()> {
-        if let LiveCommand::SetTtlOut(w) = cmd {
-            self.ttl_out = *w;
+        match *cmd {
+            LiveCommand::SetTtlOut(w) => self.ttl_out = w,
+            LiveCommand::DacRoute { .. } => {}
+            LiveCommand::SetLeds(on) => self.settings.leds = on,
+            LiveCommand::SetDacHpf { enabled, hz } => {
+                self.settings.dac_hpf_enabled = enabled;
+                self.settings.dac_hpf_hz = hz;
+            }
+            LiveCommand::SetNoiseSlicer(n) => self.settings.noise_slicer = n,
+            LiveCommand::SetTtlMode(on) => self.settings.ttl_output_mode = on,
         }
         Ok(())
     }
     fn stop(&mut self) -> Result<()> {
         self.t0 = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live commands that change board settings are recorded in them, field for field as
+    /// `OniBoard::live` records them; the others leave the settings alone.
+    #[test]
+    fn live_commands_are_recorded_in_the_settings() {
+        let mut b = SimBoard::new(vec![16]);
+        let mut want = b.settings().clone();
+        b.live(&LiveCommand::SetTtlMode(true)).unwrap();
+        want.ttl_output_mode = true;
+        assert_eq!(b.settings(), &want);
+        b.live(&LiveCommand::SetDacHpf {
+            enabled: true,
+            hz: 150.0,
+        })
+        .unwrap();
+        want.dac_hpf_enabled = true;
+        want.dac_hpf_hz = 150.0;
+        assert_eq!(b.settings(), &want);
+        b.live(&LiveCommand::SetNoiseSlicer(20)).unwrap();
+        want.noise_slicer = 20;
+        assert_eq!(b.settings(), &want);
+        b.live(&LiveCommand::SetLeds(true)).unwrap();
+        want.leds = true;
+        assert_eq!(b.settings(), &want);
+        b.live(&LiveCommand::SetTtlOut(0x5)).unwrap();
+        b.live(&LiveCommand::DacRoute {
+            dac: 0,
+            electrode: Some(3),
+            threshold_uv: -50.0,
+        })
+        .unwrap();
+        assert_eq!(b.settings(), &want);
+        assert_eq!(b.ttl_out, 0x5);
     }
 }

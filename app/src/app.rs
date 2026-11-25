@@ -1,4 +1,4 @@
-use crate::config::{Config, ElectrodeMap, ViewFilter, electrode_keys};
+use crate::config::{Config, ElectrodeMap, ViewFilter, board_differs, electrode_keys, with_outputs};
 use crate::spikes::SpikeGpu;
 use crate::sweep::Sweeps;
 use crate::traces::{
@@ -162,7 +162,7 @@ impl App {
         } else {
             BoardChoice::Simulated(cfg.sim_headstages.clone())
         };
-        engine.open_board(choice, cfg.board.clone());
+        engine.open_board(choice, with_outputs(cfg.board.clone(), &cfg.outputs));
         if let Some(e) = &cfg.load_error {
             engine.report(e);
         }
@@ -216,6 +216,12 @@ impl App {
         self
     }
 
+    /// The board settings the engine is handed (open, Apply): the ones being edited, with the
+    /// four board-level outputs from the Outputs panel, which owns them.
+    fn board_for_engine(&self) -> BoardSettings {
+        with_outputs(self.edit_board.clone(), &self.cfg.outputs)
+    }
+
     fn layout(&self) -> Option<StreamLayout> {
         self.engine.layout().cloned()
     }
@@ -254,6 +260,26 @@ impl App {
         self.engine.stop_recording();
     }
 
+    /// Starts acquisition (the button, Ctrl+Space, `--acquire`, the restart after an Apply made
+    /// while acquiring), unless the last Apply failed part way: then the board must be
+    /// programmed again first, and the error bar says so.
+    fn start_acquisition_now(&mut self) {
+        if let Some(m) = start_refusal(self.engine.settings_applied()) {
+            // Keep the Apply's own error beside it.
+            let msg = match &self.engine.last_error {
+                Some(e) if e.starts_with(m) => e.clone(),
+                Some(e) => format!("{m} ({e})"),
+                None => m.to_string(),
+            };
+            log::warn!("{msg}");
+            self.engine.report(msg);
+            return;
+        }
+        if let Err(e) = self.engine.start_acquisition() {
+            self.engine.report(e);
+        }
+    }
+
     /// Stops acquisition, which ends a recording too (after the notes).
     fn stop_acquisition_now(&mut self) {
         self.flush_notes_for_stop();
@@ -262,6 +288,9 @@ impl App {
     }
 
     fn save_cfg(&mut self) {
+        // The saved board section carries the panel's four outputs too, so a config read by an
+        // older kalila (which opens the board with `board` alone) programs the same values.
+        self.cfg.board = with_outputs(self.cfg.board.clone(), &self.cfg.outputs);
         self.cfg.audio = self.engine.audio_settings.lock().clone();
         self.cfg.dsp = self.engine.dsp_settings.lock().clone();
         let sh = self.shared.lock();
@@ -325,7 +354,7 @@ impl App {
                     .clicked()
                 {
                     self.cfg.open_hardware_on_start = true;
-                    self.engine.open_board(BoardChoice::Hardware, self.edit_board.clone());
+                    self.engine.open_board(BoardChoice::Hardware, self.board_for_engine());
                     self.reset_views();
                 }
             } else if ui
@@ -335,7 +364,7 @@ impl App {
             {
                 self.engine.open_board(
                     BoardChoice::Simulated(self.cfg.sim_headstages.clone()),
-                    self.edit_board.clone(),
+                    self.board_for_engine(),
                 );
                 self.reset_views();
             }
@@ -352,9 +381,7 @@ impl App {
                     || (can_start && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space)))
                 {
                     self.reset_views();
-                    if let Err(e) = self.engine.start_acquisition() {
-                        self.engine.report(e);
-                    }
+                    self.start_acquisition_now();
                 }
             } else if ui
                 .add(egui::Button::new(RichText::new("Stop").strong()).min_size(egui::vec2(100.0, 0.0)))
@@ -413,7 +440,7 @@ impl App {
                         .on_hover_text("Try opening the acquisition board again")
                         .clicked()
                     {
-                        self.engine.open_board(BoardChoice::Hardware, self.edit_board.clone());
+                        self.engine.open_board(BoardChoice::Hardware, self.board_for_engine());
                         self.reset_views();
                     }
                 });
@@ -715,17 +742,32 @@ impl App {
                 self.cfg.board.leds = on;
                 self.cfg.save();
             }
-            let changed = self.engine.board_settings().is_some_and(|s| s != self.edit_board);
+            // The four outputs the Outputs panel owns never count as a pending change.
+            let changed = self.engine.board_settings().is_some_and(|s| board_differs(&s, &self.edit_board));
+            let applied = self.engine.settings_applied();
             ui.horizontal(|ui| {
-                let label = if acquiring { "Apply (restarts acquisition)" } else { "Apply" };
-                if ui.add_enabled(editable && changed, egui::Button::new(label)).clicked() {
+                let label = if acquiring {
+                    "Apply (restarts acquisition)"
+                } else if keep_edits(applied) {
+                    "Apply again"
+                } else {
+                    "Apply"
+                };
+                let mut apply = ui.add_enabled(apply_enabled(editable, changed, applied), egui::Button::new(label));
+                if keep_edits(applied) {
+                    apply = apply.on_hover_text(
+                        "The last Apply failed part way, so the board holds some old and some new settings. \
+                         Apply programs all of them again; acquisition cannot start until it succeeds.",
+                    );
+                }
+                if apply.clicked() {
                     if acquiring {
                         // Restarted when the board comes back from the apply (see `ui`).
                         self.stop_acquisition_now();
                         self.autostart = true;
                     }
-                    self.cfg.board = self.edit_board.clone();
-                    self.engine.apply_board_settings(self.edit_board.clone());
+                    self.cfg.board = self.board_for_engine();
+                    self.engine.apply_board_settings(self.board_for_engine());
                     self.cfg.save();
                     self.reset_views();
                 }
@@ -830,19 +872,11 @@ impl App {
         }
         let nel = self.electrode_rows();
         let audio_first = self.engine.audio_settings.lock().channels.first().copied();
-        let (cmds, board_level) = self.outputs.plan(&self.cfg.outputs, nel, audio_first, force);
+        // The board-level ones need no mirroring into the board settings: the panel owns them
+        // (`with_outputs` at open and Apply, `board_differs` for "changed").
+        let (cmds, _board_level) = self.outputs.plan(&self.cfg.outputs, nel, audio_first, force);
         for c in cmds {
             self.engine.send_live(c);
-        }
-        if board_level {
-            let o = &self.cfg.outputs;
-            // Mirror into the board settings so they never show up as "changed" (Apply).
-            for b in [&mut self.edit_board, &mut self.cfg.board] {
-                b.ttl_output_mode = o.ttl_threshold_mode;
-                b.dac_hpf_enabled = o.dac_hpf_enabled;
-                b.dac_hpf_hz = o.dac_hpf_hz;
-                b.noise_slicer = o.noise_slicer;
-            }
         }
     }
 
@@ -1201,24 +1235,24 @@ impl eframe::App for App {
         }
         let was_board = self.engine.has_board();
         self.engine.poll();
+        let applied = self.engine.settings_applied();
         if !was_board && self.engine.has_board() {
-            self.edit_board = self.engine.board_settings().unwrap_or_default();
+            // After a failed Apply the board reports its old settings: the user's edits stay.
+            if !keep_edits(applied) {
+                self.edit_board = self.engine.board_settings().unwrap_or_default();
+            }
             self.reset_views();
-            if std::mem::take(&mut self.autostart)
-                && let Err(e) = self.engine.start_acquisition()
-            {
-                self.engine.report(e);
+            if std::mem::take(&mut self.autostart) {
+                self.start_acquisition_now();
             }
         }
         if !self.engine.is_busy()
-            && self.engine.board_settings().is_some_and(|s| s != self.edit_board)
-            && self.edit_board == self.cfg.board
+            && let Some(s) = self.engine.board_settings()
+            && adopt_board_settings(&s, &self.edit_board, &self.cfg.board, applied)
         {
             // Board coerced some values (e.g. actual DSP cutoff): reflect them.
-            if let Some(s) = self.engine.board_settings() {
-                self.edit_board = s.clone();
-                self.cfg.board = s;
-            }
+            self.edit_board = s.clone();
+            self.cfg.board = s;
         }
         // Before anything sends electrode indices to the board or the engine.
         self.remap_electrodes();
@@ -1310,7 +1344,7 @@ impl eframe::App for App {
                     if ui.small_button("Use simulator").clicked() {
                         self.engine.open_board(
                             BoardChoice::Simulated(self.cfg.sim_headstages.clone()),
-                            self.edit_board.clone(),
+                            self.board_for_engine(),
                         );
                     }
                     if ui.small_button("Dismiss").clicked() {
@@ -1416,6 +1450,86 @@ impl eframe::App for App {
 /// A window close is refused while recording, unless it comes from a signal (`signal_quit`).
 fn refuse_close(close_requested: bool, recording: bool, signal_quit: bool) -> bool {
     close_requested && recording && !signal_quit
+}
+
+/// Why acquisition may not start, given `Engine::settings_applied`.
+fn start_refusal(applied: Option<bool>) -> Option<&'static str> {
+    keep_edits(applied).then_some("the last Apply failed part way: press Apply again before acquiring")
+}
+
+/// The last Apply failed part way (`Board::settings_applied` false): the board reports its old
+/// settings, but the user's edits are what still has to be applied, so they are kept.
+fn keep_edits(applied: Option<bool>) -> bool {
+    applied == Some(false)
+}
+
+/// Whether to take the board's settings into the edited and saved ones: the board coerced some
+/// values (e.g. the actual DSP cutoff) of settings that were applied unedited. Never after a
+/// failed Apply. The four outputs the Outputs panel owns are not compared.
+fn adopt_board_settings(
+    board: &BoardSettings,
+    edit: &BoardSettings,
+    saved: &BoardSettings,
+    applied: Option<bool>,
+) -> bool {
+    !keep_edits(applied) && board_differs(board, edit) && !board_differs(edit, saved)
+}
+
+/// Whether Apply is offered: something to apply, or the board must be programmed again after a
+/// failed Apply even though nothing differs (the user may have reverted by hand).
+fn apply_enabled(editable: bool, changed: bool, applied: Option<bool>) -> bool {
+    editable && (changed || keep_edits(applied))
+}
+
+#[cfg(test)]
+mod board_state_tests {
+    use super::{adopt_board_settings, apply_enabled, keep_edits, start_refusal};
+    use engine::rhythm::BoardSettings;
+
+    #[test]
+    fn after_a_failed_apply_the_edits_stay_apply_stays_on_and_start_is_refused() {
+        let old = BoardSettings::default();
+        let new = BoardSettings {
+            sample_rate: 20000,
+            ..old.clone()
+        };
+        // Normal: a coerced value is adopted when the edits were applied unchanged.
+        let coerced = BoardSettings {
+            dsp_cutoff: 0.48,
+            ..old.clone()
+        };
+        assert!(adopt_board_settings(&coerced, &old, &old, Some(true)));
+        // Not while the user has edits of their own (edit ≠ saved).
+        assert!(!adopt_board_settings(&coerced, &new, &old, Some(true)));
+        // After a failed Apply (saved = edit = new, board still old): the edits stay.
+        assert!(
+            adopt_board_settings(&old, &new, &new, Some(true)),
+            "what happened before"
+        );
+        assert!(!adopt_board_settings(&old, &new, &new, Some(false)));
+        assert!(keep_edits(Some(false)));
+        assert!(!keep_edits(Some(true)) && !keep_edits(None));
+        // Only the panel's four differ: nothing to adopt.
+        let outputs_only = BoardSettings {
+            noise_slicer: 9,
+            dac_hpf_enabled: true,
+            ..old.clone()
+        };
+        assert!(!adopt_board_settings(&outputs_only, &old, &old, Some(true)));
+        // Apply.
+        assert!(apply_enabled(true, true, Some(true)));
+        assert!(!apply_enabled(true, false, Some(true)));
+        assert!(!apply_enabled(true, false, None));
+        assert!(
+            apply_enabled(true, false, Some(false)),
+            "reverted by hand after a failure"
+        );
+        assert!(!apply_enabled(false, true, Some(false)), "not while recording or busy");
+        // Start.
+        assert_eq!(start_refusal(Some(true)), None);
+        assert_eq!(start_refusal(None), None);
+        assert!(start_refusal(Some(false)).is_some_and(|m| m.contains("press Apply again")));
+    }
 }
 
 #[cfg(test)]

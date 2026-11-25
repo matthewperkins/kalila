@@ -285,6 +285,12 @@ pub trait Board: Send {
     fn settings(&self) -> &BoardSettings;
     /// Apply settings while idle (may reprogram the chips).
     fn apply_settings(&mut self, s: &BoardSettings) -> anyhow::Result<()>;
+    /// False after an `apply_settings` failed part way: the board then holds neither the old
+    /// settings (which `settings()` still reports) nor the new ones, and must be programmed
+    /// again (by a successful `apply_settings`) before acquiring.
+    fn settings_applied(&self) -> bool {
+        true
+    }
     fn available_sample_rates(&self) -> Vec<u32>;
     /// Detect headstages and tune cable delays.
     fn scan_ports(&mut self) -> anyhow::Result<()>;

@@ -94,6 +94,8 @@ struct Running {
     /// The board's settings while it is owned by the acquisition thread (kept in step with
     /// live commands), so `board_settings()` still answers during acquisition.
     settings: BoardSettings,
+    /// `Board::settings_applied` when acquisition started.
+    settings_applied: bool,
     rates: Vec<u32>,
 }
 
@@ -311,6 +313,16 @@ impl Engine {
             .map(|b| b.settings().clone())
             .or_else(|| self.running.as_ref().map(|r| r.settings.clone()))
     }
+    /// `Board::settings_applied` of the board, answered like `board_settings()`: from the board
+    /// while idle, from the snapshot taken at start while acquiring, None while a board op
+    /// (open, Apply, scan) is in flight or there is no board. Some(false): the last Apply failed
+    /// part way and the board must be programmed again before acquiring.
+    pub fn settings_applied(&self) -> Option<bool> {
+        self.board
+            .as_ref()
+            .map(|b| b.settings_applied())
+            .or_else(|| self.running.as_ref().map(|r| r.settings_applied))
+    }
     pub fn available_sample_rates(&self) -> Vec<u32> {
         self.board
             .as_ref()
@@ -370,6 +382,7 @@ impl Engine {
         };
         let layout = board.layout();
         let settings = board.settings().clone();
+        let settings_applied = board.settings_applied();
         let rates = board.available_sample_rates();
         if let Err(e) = board.start(self.health.clone()) {
             self.board = Some(board);
@@ -506,6 +519,7 @@ impl Engine {
             workers,
             started: Instant::now(),
             settings,
+            settings_applied,
             rates,
         });
         info!("acquisition running: {nch} channels @ {fs} Hz, {block_samples} samples/block");
@@ -916,6 +930,104 @@ mod tests {
             e.has_board()
         });
         drop(e);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The simulator, whose `apply_settings` fails part way while `fail` is set, as
+    /// `OniBoard::apply_settings` does: the old settings kept, `settings_applied` false until an
+    /// apply succeeds.
+    struct FailApply {
+        inner: SimBoard,
+        fail: Arc<AtomicBool>,
+        unknown: bool,
+    }
+    impl Board for FailApply {
+        fn info(&self) -> BoardInfo {
+            self.inner.info()
+        }
+        fn layout(&self) -> StreamLayout {
+            self.inner.layout()
+        }
+        fn settings(&self) -> &BoardSettings {
+            self.inner.settings()
+        }
+        fn apply_settings(&mut self, s: &BoardSettings) -> Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                self.unknown = true;
+                bail!("test: apply fails part way");
+            }
+            self.unknown = false;
+            self.inner.apply_settings(s)
+        }
+        fn settings_applied(&self) -> bool {
+            !self.unknown
+        }
+        fn available_sample_rates(&self) -> Vec<u32> {
+            self.inner.available_sample_rates()
+        }
+        fn scan_ports(&mut self) -> Result<()> {
+            self.inner.scan_ports()
+        }
+        fn start(&mut self, h: SharedHealth) -> Result<()> {
+            self.inner.start(h)
+        }
+        fn read_block(&mut self, blk: &mut Block) -> Result<()> {
+            self.inner.read_block(blk)
+        }
+        fn live(&mut self, c: &LiveCommand) -> Result<()> {
+            self.inner.live(c)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+    }
+
+    /// `settings_applied` reaches the engine's user: the board's flag while idle, None while the
+    /// apply runs, false after it failed (with the old settings reported), true again after an
+    /// apply succeeds; while acquiring, the value at start.
+    #[test]
+    fn a_failed_apply_shows_as_settings_not_applied() {
+        let root = std::env::temp_dir().join(format!("kalila-apply-test-{}", std::process::id()));
+        let mut e = Engine::new(root.clone());
+        e.audio_settings.lock().enabled = false;
+        let fail = Arc::new(AtomicBool::new(true));
+        e.set_board(Box::new(FailApply {
+            inner: SimBoard::new(vec![16]),
+            fail: fail.clone(),
+            unknown: false,
+        }));
+        assert_eq!(e.settings_applied(), Some(true));
+        let old = e.board_settings().unwrap();
+        let new = BoardSettings {
+            sample_rate: 20000,
+            ..old.clone()
+        };
+        e.apply_board_settings(new.clone());
+        assert!(e.is_busy());
+        assert_eq!(e.settings_applied(), None, "unknown while the apply runs");
+        wait_for("the apply", || {
+            e.poll();
+            !e.is_busy()
+        });
+        assert_eq!(e.settings_applied(), Some(false));
+        assert_eq!(e.board_settings(), Some(old));
+        assert!(
+            e.last_error
+                .as_deref()
+                .is_some_and(|m| m.starts_with("apply settings:"))
+        );
+        fail.store(false, Ordering::SeqCst);
+        e.apply_board_settings(new.clone());
+        wait_for("the second apply", || {
+            e.poll();
+            !e.is_busy()
+        });
+        assert_eq!(e.settings_applied(), Some(true));
+        assert_eq!(e.board_settings(), Some(new));
+        e.start_acquisition().unwrap();
+        assert_eq!(e.settings_applied(), Some(true), "while acquiring: the value at start");
+        e.stop_acquisition();
+        assert_eq!(e.settings_applied(), Some(true));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1288,6 +1288,10 @@ impl Board for OniBoard {
         &self.settings
     }
 
+    fn settings_applied(&self) -> bool {
+        !self.settings_unknown
+    }
+
     fn apply_settings(&mut self, new: &BoardSettings) -> Result<()> {
         if self.running {
             bail!("cannot change board settings while acquiring");
