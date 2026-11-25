@@ -132,6 +132,11 @@ pub struct App {
     /// before), so the chip shows recent trouble, not the total since startup.
     underrun_window: std::cell::Cell<(Instant, u64, u64)>,
     autostart: bool,
+    /// Start was pressed with Outputs values the board does not hold yet: they are being
+    /// applied first (`start_acquisition_now`), and acquisition starts when that returns.
+    outputs_before_start: bool,
+    /// The board edits pending when that apply was sent; put back when it returns.
+    edits_over_start: Option<BoardSettings>,
     was_acquiring: bool,
     outputs: Outputs,
 }
@@ -202,6 +207,8 @@ impl App {
             dirty_cfg: Instant::now(),
             underrun_window: std::cell::Cell::new((Instant::now(), 0, 0)),
             autostart,
+            outputs_before_start: false,
+            edits_over_start: None,
             was_acquiring: false,
             outputs: Outputs::default(),
         }
@@ -273,6 +280,19 @@ impl App {
             };
             log::warn!("{msg}");
             self.engine.report(msg);
+            return;
+        }
+        // The panel's four values go onto the board before the first sample, not a frame after
+        // it: `Board::start` programs the board's own copy, so a value edited while idle is
+        // applied first (only `apply_live_settings` runs: nothing else differs), and the start
+        // follows when the board comes back (`autostart`). Tried once per start.
+        if !std::mem::take(&mut self.outputs_before_start)
+            && let Some(want) = outputs_to_apply_before_start(self.engine.board_settings(), &self.cfg.outputs)
+        {
+            self.outputs_before_start = true;
+            self.edits_over_start = Some(self.edit_board.clone());
+            self.autostart = true;
+            self.engine.apply_board_settings(want);
             return;
         }
         if let Err(e) = self.engine.start_acquisition() {
@@ -1238,7 +1258,10 @@ impl eframe::App for App {
         let applied = self.engine.settings_applied();
         if !was_board && self.engine.has_board() {
             // After a failed Apply the board reports its old settings: the user's edits stay.
-            if !keep_edits(applied) {
+            if let Some(edits) = self.edits_over_start.take() {
+                // The apply before a start carried only the Outputs values: pending edits stay.
+                self.edit_board = edits;
+            } else if !keep_edits(applied) {
                 self.edit_board = self.engine.board_settings().unwrap_or_default();
             }
             self.reset_views();
@@ -1447,6 +1470,17 @@ impl eframe::App for App {
     }
 }
 
+/// The settings to apply before acquisition starts, when the board (idle, holding `board`) does
+/// not yet carry the Outputs panel's four values; None when it does, or there is no idle board.
+fn outputs_to_apply_before_start(
+    board: Option<BoardSettings>,
+    outputs: &crate::config::OutputSettings,
+) -> Option<BoardSettings> {
+    let board = board?;
+    let want = with_outputs(board.clone(), outputs);
+    (want != board).then_some(want)
+}
+
 /// A window close is refused while recording, unless it comes from a signal (`signal_quit`).
 fn refuse_close(close_requested: bool, recording: bool, signal_quit: bool) -> bool {
     close_requested && recording && !signal_quit
@@ -1529,6 +1563,35 @@ mod board_state_tests {
         assert_eq!(start_refusal(Some(true)), None);
         assert_eq!(start_refusal(None), None);
         assert!(start_refusal(Some(false)).is_some_and(|m| m.contains("press Apply again")));
+    }
+}
+
+#[cfg(test)]
+mod outputs_before_start_tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_outputs_edit_is_applied_before_the_start_and_nothing_else_is() {
+        let board = BoardSettings::default();
+        let mut o = crate::config::OutputSettings::default();
+        assert_eq!(
+            outputs_to_apply_before_start(Some(board.clone()), &o),
+            None,
+            "the board already holds them"
+        );
+        assert_eq!(outputs_to_apply_before_start(None, &o), None, "no idle board");
+        o.noise_slicer = 20;
+        o.dac_hpf_enabled = true;
+        o.dac_hpf_hz = 150.0;
+        let want = outputs_to_apply_before_start(Some(board.clone()), &o).expect("the panel differs");
+        assert_eq!(
+            (want.noise_slicer, want.dac_hpf_enabled, want.dac_hpf_hz),
+            (20, true, 150.0)
+        );
+        // Only the panel's values: the rest is the board's own, not any pending edit.
+        assert!(!board_differs(&want, &board));
+        // Once applied there is nothing more to do, so a start cannot loop.
+        assert_eq!(outputs_to_apply_before_start(Some(want), &o), None);
     }
 }
 

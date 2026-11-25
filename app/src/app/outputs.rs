@@ -94,7 +94,7 @@ impl Outputs {
                     ui.end_row();
                 }
             });
-            ui.checkbox(&mut o.ttl_threshold_mode, "Threshold → TTL out").on_hover_text("TTL out n goes high while DAC n crosses its threshold (stock \"DAC TTL\")");
+            ui.checkbox(&mut o.ttl_threshold_mode, "Threshold to TTL out").on_hover_text("TTL out n goes high while DAC n crosses its threshold (stock \"DAC TTL\")");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut o.dac_hpf_enabled, "DAC high-pass");
                 ui.add_enabled(o.dac_hpf_enabled, egui::DragValue::new(&mut o.dac_hpf_hz).range(1.0..=5000.0).speed(5.0).suffix(" Hz"));
