@@ -117,10 +117,21 @@ impl NpyFile {
         h.extend_from_slice(dict.as_bytes());
         h
     }
-    fn write<T: Copy>(&mut self, v: &[T]) -> Result<()> {
-        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
-        self.w.write_all(bytes)?;
+    fn write<T: bytemuck::Pod>(&mut self, v: &[T]) -> Result<()> {
+        self.w.write_all(bytemuck::cast_slice(v))?;
         self.count += v.len() as u64;
+        Ok(())
+    }
+    /// One record given as its bytes (the text records: bytemuck has no `Pod` for `[u8; 513]`).
+    fn write_record(&mut self, record: &[u8]) -> Result<()> {
+        assert_eq!(
+            record.len() as u64,
+            self.itemsize(),
+            "a record of the wrong size for {}",
+            self.descr
+        );
+        self.w.write_all(record)?;
+        self.count += 1;
         Ok(())
     }
     /// Bytes per record, from the dtype ("<i8" → 8, "|S513" → 513).
@@ -405,8 +416,7 @@ impl Recording {
             }
             self.written += b.len() as u64;
             self.next = Some(b.first_sample + b.len() as i64);
-            let bytes = unsafe { std::slice::from_raw_parts(b.data.as_ptr() as *const u8, b.data.len() * 2) };
-            self.main.dat.write_all(bytes)?;
+            self.main.dat.write_all(bytemuck::cast_slice(&b.data))?;
             let m = &mut self.main;
             m.tmp_i64.clear();
             m.tmp_i64.extend((0..b.len() as i64).map(|i| b.first_sample + i));
@@ -449,9 +459,7 @@ impl Recording {
                     .zip(bv)
                     .map(|(v, b)| (v / b).round().clamp(-32768.0, 32767.0) as i16),
             );
-            let bytes =
-                unsafe { std::slice::from_raw_parts(self.side_tmp.as_ptr() as *const u8, self.side_tmp.len() * 2) };
-            f.dat.write_all(bytes)?;
+            f.dat.write_all(bytemuck::cast_slice(&self.side_tmp))?;
             f.samples.write(&[s.sample_number])?;
             f.timestamps.write(&[s.timestamp])?;
         }
@@ -468,7 +476,7 @@ impl Recording {
             Some((s0, t0)) => t0 + (sample - s0) as f64 / self.layout.sample_rate,
             None => sample as f64 / self.layout.sample_rate,
         };
-        self.messages.text.write(&[message_record(text)])?;
+        self.messages.text.write_record(&message_record(text))?;
         self.messages.samples.write(&[sample])?;
         self.messages.timestamps.write(&[ts])?;
         if !keys.is_empty() {
