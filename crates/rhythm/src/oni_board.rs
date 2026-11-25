@@ -171,6 +171,10 @@ pub struct OniBoard {
     acq_clock_hz: u32,
     common_commands_set: bool,
     initial_scan: bool,
+    /// An `apply_settings` failed part way: the board holds neither the old nor the new
+    /// settings. `settings` then holds the ones from before that call, and the next
+    /// `apply_settings` reprograms everything it can instead of only what differs.
+    settings_unknown: bool,
     // ---- acquisition state ----
     health: Option<SharedHealth>,
     running: bool,
@@ -226,6 +230,7 @@ impl OniBoard {
             acq_clock_hz: 0,
             common_commands_set: false,
             initial_scan: true,
+            settings_unknown: false,
             health: None,
             running: false,
             pending: None,
@@ -970,6 +975,26 @@ impl OniBoard {
         None
     }
 
+    /// The register writes of `apply_settings`, with `self.settings` already `new`.
+    fn program(&mut self, new: &BoardSettings, plan: ApplyPlan) -> Result<()> {
+        if plan.channel_counts {
+            self.update_channel_counts();
+        }
+        if plan.reset_board {
+            self.reset_board()?;
+        }
+        match plan.chips {
+            Reprogram::SampleRate => self.set_sample_rate(new.sample_rate, true)?,
+            Reprogram::CableDelays => {
+                self.check_all_cable_delays()?;
+                self.update_registers()?;
+            }
+            Reprogram::Registers => self.update_registers()?,
+            Reprogram::Nothing => {}
+        }
+        self.apply_live_settings()
+    }
+
     fn apply_live_settings(&mut self) -> Result<()> {
         let s = self.settings.clone();
         self.set_ttl_mode(s.ttl_output_mode as u32)?;
@@ -992,7 +1017,8 @@ impl OniBoard {
                 self.enable_dac(d, true)?;
                 self.select_dac_stream(d, stream as u32)?;
                 self.select_dac_channel(d, ch as u32)?;
-                self.set_dac_threshold(d, ((thr as f64 / 0.195) + 32768.0).abs() as i32, thr >= 0.0)?;
+                let (level, polarity) = dac_threshold(thr);
+                self.set_dac_threshold(d, level, polarity)?;
             }
             None => self.enable_dac(d, false)?,
         }
@@ -1063,6 +1089,78 @@ pub fn chip_name(id: i32) -> &'static str {
         CHIP_ID_RHD2216 => "RHD2216",
         CHIP_ID_RHD2164 => "RHD2164",
         _ => "unknown",
+    }
+}
+
+/// µV per electrode LSB, in f64 for the DAC threshold. The same number as
+/// `ELECTRODE_UV_PER_BIT` (f32; a test checks that it rounds to it), but kept in f64:
+/// `0.195_f32 as f64` is not `0.195_f64`, and the stock plugin divides by the f64 literal.
+const ELECTRODE_UV_PER_BIT_F64: f64 = 0.195;
+
+/// The DAC comparator's level and polarity for a threshold in µV, as the stock plugin
+/// computes them (`AcqBoardONI.cpp`: `(int) abs ((threshold / 0.195) + 32768)`,
+/// `threshold >= 0`). The level is in DAC units, 32768 = 0 µV; `set_dac_threshold` clamps it
+/// to 0..=65535. The `abs` changes the result only below −32768 × 0.195 = −6389.76 µV, where
+/// it folds the level back up instead of letting it clamp to 0 (the GUI allows ±5000 µV).
+fn dac_threshold(thr_uv: f32) -> (i32, bool) {
+    (
+        ((thr_uv as f64 / ELECTRODE_UV_PER_BIT_F64) + 32768.0).abs() as i32,
+        thr_uv >= 0.0,
+    )
+}
+
+/// Which chip reprogramming `apply_settings` does, after the steps in `ApplyPlan`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reprogram {
+    /// New sample rate: clock, cable delays (rescan) and register lists.
+    SampleRate,
+    /// New cable delay adjustment: cable delays and register lists.
+    CableDelays,
+    /// New bandwidth, DSP, aux or fast settle: register lists.
+    Registers,
+    Nothing,
+}
+
+/// What `apply_settings` does, in this order, before `apply_live_settings` (always).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApplyPlan {
+    /// `update_channel_counts` (no register writes).
+    channel_counts: bool,
+    /// `reset_board` (sets the USB block read size).
+    reset_board: bool,
+    chips: Reprogram,
+}
+
+/// `everything`: the board's state is unknown after a failed apply, so do every step, as
+/// for a change of USB block size and sample rate together. Otherwise only what differs.
+fn apply_plan(old: &BoardSettings, new: &BoardSettings, everything: bool) -> ApplyPlan {
+    let chips = if everything || new.sample_rate != old.sample_rate {
+        Reprogram::SampleRate
+    } else if new.cable_delay_adjust != old.cable_delay_adjust {
+        Reprogram::CableDelays
+    } else if (
+        new.lower_bandwidth,
+        new.upper_bandwidth,
+        new.dsp_enabled,
+        new.dsp_cutoff,
+        new.acquire_aux,
+        new.fast_settle,
+    ) != (
+        old.lower_bandwidth,
+        old.upper_bandwidth,
+        old.dsp_enabled,
+        old.dsp_cutoff,
+        old.acquire_aux,
+        old.fast_settle,
+    ) {
+        Reprogram::Registers
+    } else {
+        Reprogram::Nothing
+    };
+    ApplyPlan {
+        channel_counts: everything || new.rhd2132_16ch != old.rhd2132_16ch,
+        reset_board: everything || new.usb_block_bytes != old.usb_block_bytes,
+        chips,
     }
 }
 
@@ -1195,37 +1293,22 @@ impl Board for OniBoard {
             bail!("cannot change board settings while acquiring");
         }
         let old = self.settings.clone();
+        let plan = apply_plan(&old, new, self.settings_unknown);
+        // The steps below read the new values from `self.settings` (reset_board: USB block
+        // size; update_channel_counts: 16-ch mode; cable delays: adjustment; update_registers:
+        // bandwidth, DSP, aux, fast settle, and it stores the actual DSP cutoff back;
+        // apply_live_settings: the rest), so they are stored first and taken back on error.
         self.settings = new.clone();
-        if new.rhd2132_16ch != old.rhd2132_16ch {
-            self.update_channel_counts();
+        let r = self.program(new, plan);
+        if r.is_err() {
+            // Part of `new` may be on the board, part not: claim the old settings, so the GUI
+            // still sees `new` as not applied, and reprogram everything next time.
+            self.settings = old;
+            self.settings_unknown = true;
+        } else {
+            self.settings_unknown = false;
         }
-        if new.usb_block_bytes != old.usb_block_bytes {
-            self.reset_board()?;
-        }
-        if new.sample_rate != old.sample_rate {
-            self.set_sample_rate(new.sample_rate, true)?;
-        } else if new.cable_delay_adjust != old.cable_delay_adjust {
-            self.check_all_cable_delays()?;
-            self.update_registers()?;
-        } else if (
-            new.lower_bandwidth,
-            new.upper_bandwidth,
-            new.dsp_enabled,
-            new.dsp_cutoff,
-            new.acquire_aux,
-            new.fast_settle,
-        ) != (
-            old.lower_bandwidth,
-            old.upper_bandwidth,
-            old.dsp_enabled,
-            old.dsp_cutoff,
-            old.acquire_aux,
-            old.fast_settle,
-        ) {
-            self.update_registers()?;
-        }
-        self.apply_live_settings()?;
-        Ok(())
+        r
     }
 
     fn available_sample_rates(&self) -> Vec<u32> {
@@ -1358,5 +1441,202 @@ impl Board for OniBoard {
         self.reset_board()?;
         info!("acquisition stopped");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `apply_dac` before `dac_threshold` was split out of it, written out literally.
+    fn original_dac_threshold(thr: f32) -> (i32, bool) {
+        (((thr as f64 / 0.195) + 32768.0).abs() as i32, thr >= 0.0)
+    }
+
+    /// The value `set_dac_threshold` writes for a (level, polarity).
+    fn register_word(level: i32, polarity: bool) -> u32 {
+        (level.clamp(0, 65535) as u32 & 0xffff) | ((polarity as u32) << 16)
+    }
+
+    #[test]
+    fn the_f64_lsb_is_the_f32_one() {
+        assert_eq!(ELECTRODE_UV_PER_BIT_F64 as f32, ELECTRODE_UV_PER_BIT);
+        // Why it is kept in f64: the f32 one widened is a different number.
+        assert_ne!(ELECTRODE_UV_PER_BIT as f64, ELECTRODE_UV_PER_BIT_F64);
+    }
+
+    #[test]
+    fn the_dac_threshold_is_unchanged_for_every_threshold() {
+        let check = |thr: f32| {
+            let (a, b) = (dac_threshold(thr), original_dac_threshold(thr));
+            assert_eq!(a, b, "threshold {thr:?} µV ({:#010x})", thr.to_bits());
+        };
+        // −32768 × 0.195 … 32767 × 0.195 µV and beyond (to ±8000 µV), in 0.0005 µV steps.
+        let mut naive_differs = 0;
+        for i in -16_000_000..=16_000_000 {
+            let thr = i as f32 * 0.0005;
+            check(thr);
+            let naive = ((thr as f64 / ELECTRODE_UV_PER_BIT as f64) + 32768.0).abs() as i32;
+            naive_differs += (naive != original_dac_threshold(thr).0) as u32;
+        }
+        assert!(naive_differs > 0, "dividing by the f32 LSB would change some levels");
+        // Every level boundary (k − 32768) × 0.195 µV and the f32 values next to it.
+        for k in -40_000..=100_000i32 {
+            let t = ((k - 32768) as f64 * 0.195) as f32;
+            for thr in [t, t.next_down(), t.next_up()] {
+                check(thr);
+            }
+        }
+        // A spread over all f32 bit patterns (NaNs, infinities, subnormals, huge values).
+        for bits in (0..=u32::MAX).step_by(997) {
+            check(f32::from_bits(bits));
+        }
+        for thr in [
+            0.0,
+            -0.0,
+            0.0975,
+            -0.0975,
+            0.195,
+            -0.195,
+            5000.0,
+            -5000.0,
+            6389.565,
+            -6389.76,
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+        ] {
+            check(thr);
+        }
+        assert_eq!(dac_threshold(0.0), (32768, true));
+        assert_eq!(dac_threshold(-0.0), (32768, true));
+        assert_eq!(dac_threshold(f32::NAN), (0, false));
+    }
+
+    #[test]
+    fn the_abs_only_matters_below_the_dac_range() {
+        let without_abs = |thr: f32| ((thr as f64 / 0.195) + 32768.0) as i32;
+        for i in -16_000_000..=16_000_000 {
+            let thr = i as f32 * 0.0005;
+            let (level, pol) = dac_threshold(thr);
+            let same = register_word(level, pol) == register_word(without_abs(thr), pol);
+            // The level before `abs` is ≤ −1 exactly when the threshold is ≤ −32769 × 0.195.
+            let below = (thr as f64 / 0.195) + 32768.0 <= -1.0;
+            assert_eq!(same, !below, "threshold {thr} µV");
+        }
+        // E.g. −7000 µV: level −3129.6 folds to 3129 (≈ −5779 µV) instead of clamping to 0.
+        assert_eq!(dac_threshold(-7000.0), (3129, false));
+    }
+
+    /// `apply_settings`'s conditions before `apply_plan` was split out of it, literally.
+    fn original_plan(old: &BoardSettings, new: &BoardSettings) -> ApplyPlan {
+        let chips = if new.sample_rate != old.sample_rate {
+            Reprogram::SampleRate
+        } else if new.cable_delay_adjust != old.cable_delay_adjust {
+            Reprogram::CableDelays
+        } else if (
+            new.lower_bandwidth,
+            new.upper_bandwidth,
+            new.dsp_enabled,
+            new.dsp_cutoff,
+            new.acquire_aux,
+            new.fast_settle,
+        ) != (
+            old.lower_bandwidth,
+            old.upper_bandwidth,
+            old.dsp_enabled,
+            old.dsp_cutoff,
+            old.acquire_aux,
+            old.fast_settle,
+        ) {
+            Reprogram::Registers
+        } else {
+            Reprogram::Nothing
+        };
+        ApplyPlan {
+            channel_counts: new.rhd2132_16ch != old.rhd2132_16ch,
+            reset_board: new.usb_block_bytes != old.usb_block_bytes,
+            chips,
+        }
+    }
+
+    /// Settings that differ from the defaults in the fields selected by `mask`'s bits.
+    fn variant(mask: u32) -> BoardSettings {
+        let mut s = BoardSettings::default();
+        let on = |b: u32| mask & (1 << b) != 0;
+        if on(0) {
+            s.sample_rate = 20000;
+        }
+        if on(1) {
+            s.cable_delay_adjust[2] = 1;
+        }
+        if on(2) {
+            s.lower_bandwidth = 0.1;
+        }
+        if on(3) {
+            s.upper_bandwidth = 6000.0;
+        }
+        if on(4) {
+            s.dsp_enabled = !s.dsp_enabled;
+        }
+        if on(5) {
+            s.dsp_cutoff = 1.0;
+        }
+        if on(6) {
+            s.acquire_aux = !s.acquire_aux;
+        }
+        if on(7) {
+            s.fast_settle = !s.fast_settle;
+        }
+        if on(8) {
+            s.rhd2132_16ch[0] = true;
+        }
+        if on(9) {
+            s.usb_block_bytes = 4096;
+        }
+        if on(10) {
+            // Live settings only: no step besides apply_live_settings.
+            s.leds = !s.leds;
+            s.noise_slicer = 20;
+            s.acquire_adc = !s.acquire_adc;
+        }
+        s
+    }
+
+    #[test]
+    fn a_successful_apply_plans_what_it_did_before() {
+        // Every subset of the changed fields, against the defaults and against a variant.
+        for base in [0, 0b101_0101_0101] {
+            let old = variant(base);
+            for m in 0..(1u32 << 11) {
+                let new = variant(m);
+                assert_eq!(
+                    apply_plan(&old, &new, false),
+                    original_plan(&old, &new),
+                    "{base:#b} -> {m:#b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn after_a_failed_apply_everything_is_reprogrammed() {
+        let all = ApplyPlan {
+            channel_counts: true,
+            reset_board: true,
+            chips: Reprogram::SampleRate,
+        };
+        for m in 0..(1u32 << 11) {
+            let new = variant(m);
+            assert_eq!(apply_plan(&BoardSettings::default(), &new, true), all);
+            assert_eq!(apply_plan(&new, &new, true), all);
+        }
+        // The same steps as a successful apply of a new USB block size, sample rate and 16-ch mode.
+        assert_eq!(original_plan(&variant(0), &variant(1 | (1 << 8) | (1 << 9))), all);
     }
 }
