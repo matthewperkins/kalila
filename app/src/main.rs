@@ -34,7 +34,7 @@ fn main() -> eframe::Result {
     };
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default().with_surface_config(egui_wgpu::SurfaceConfig { present_mode, desired_maximum_frame_latency: Some(1) });
     if let egui_wgpu::WgpuSetup::CreateNew(ref mut c) = wgpu_options.wgpu_setup {
-        c.instance_descriptor.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        c.instance_descriptor.backends = if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN | wgpu::Backends::GL };
         c.power_preference = wgpu::PowerPreference::HighPerformance;
     }
     let options = eframe::NativeOptions {

@@ -24,8 +24,8 @@ and the current state.
 ## Goal and priorities (in order)
 
 Rewrite the Open Ephys GUI and acquisition-board plugin in Rust; C only where unavoidable
-(vendored liboni, FT600 ONI driver wrapping FTDI's closed-source D3XX). **Linux only**:
-Windows and macOS are not a consideration (no cross-platform shims or testing).
+(vendored liboni, FT600 ONI driver wrapping FTDI's closed-source D3XX). **Linux first**; a macOS port (Apple silicon) is in progress on the branch `macos-port`,
+see "macOS port" below. Windows is not a consideration.
 
 1. Reliable acquisition (MUST).
 2. GPU drawing as much as possible, minimal CPU↔GPU transfer.
@@ -269,6 +269,31 @@ before the GUI Stop/Start and Apply check.
 - A tag only **drafts** the release; the user reads and publishes it. The tag must be
   `v<workspace version>`.
 - Shipped binaries: `kalila` and `kalila-headless` (the engine's headless example).
+
+## macOS port (branch `macos-port`, started 2026-11-24)
+
+Apple silicon only, macOS 27 (the user's MacBook Air M4). The Linux code paths must stay as
+they are; platform code sits behind small `cfg` seams.
+- **Runs on the simulator** (2026-11-24): Metal through wgpu (`main.rs` picks the backend per
+  OS), Core Audio through cpal, all tests pass, and a scripted run recorded and reviewed.
+  The WGSL shaders run unchanged.
+- **Seams so far:** `engine::sched` (SCHED_FIFO / SCHED_IDLE on Linux, QoS classes on
+  macOS), `oni::DRIVER_FILE` (`.so` / `.dylib`), `oni-sys/build.rs` links `libdl` on Linux only.
+- **The board does not work on macOS yet.** `crates/ft600` compiles there but `usbfs.rs` is
+  Linux's usbdevfs. Decided with the user: an IOKit backend in **pure Rust** (no C shim,
+  unlike dimna's `usb_iokit.c`), behind the same surface, under the same control-request
+  allowlist. Never run against a board without the user present.
+- **From dimna's port** (`~/dimna/docs/plans/macos-port.md`, `macos-step8-usb.md`): timers
+  wake 2–5 ms late while the screen is busy, so no timed pacing sleep on the acquisition
+  path (the simulator's pacing sleep is the likely cause of audio underruns on the sim);
+  the audio feeder needed a Mach time-constraint policy; display latency as macOS reports
+  it is ~5–7 ms without sync, 16–32 ms with. kalila's "display ms" read-out is not
+  time-to-screen on macOS until it uses the drawable's presented time.
+- `sync_all` is `F_FULLFSYNC` on macOS (slow); the recorder only syncs when a recording
+  finishes. The simulation test takes ~135 s there against ~6 s on Linux.
+- Scripted GUI runs on the Mac: window points are half the pixels (Retina).
+- Still to do: keep-awake assertion, time-constraint policy, the IOKit backend and its board
+  sessions, Cmd equivalents for the Ctrl gestures, a macOS CI job, an `.app`.
 
 ## Trace windows (rig, 2026-11-06)
 

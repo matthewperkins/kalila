@@ -428,9 +428,8 @@ fn band_live(key: &BandKey, fs: f64) -> BandLive {
 /// The builder thread: folds live blocks into the pyramids and backfills holes from the
 /// recording file. Runs at idle priority: it yields to everything else on the machine.
 pub fn pyramid_thread(rx: Receiver<Arc<Block>>, store: Arc<Mutex<Store>>, status: Arc<RecStatus>, pipe: Arc<PipelineStats>, layout: StreamLayout) {
-    use thread_priority::{NormalThreadSchedulePolicy, ThreadPriority, ThreadSchedulePolicy};
-    if let Err(e) = thread_priority::set_thread_priority_and_policy(thread_priority::thread_native_id(), ThreadPriority::Min, ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Idle)) {
-        log::warn!("pyramid builder: idle scheduling not set ({e:?}); using normal priority");
+    if let Err(e) = crate::sched::set_idle() {
+        log::warn!("pyramid builder: idle scheduling not set ({e}); using normal priority");
     }
     let fs = layout.sample_rate;
     let nch = layout.num_channels();

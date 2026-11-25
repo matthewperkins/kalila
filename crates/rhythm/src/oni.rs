@@ -45,7 +45,7 @@ impl std::fmt::Display for OpenError {
         match self {
             OpenError::DriverNotFound => write!(
                 f,
-                "libonidriver_ft600.so not found (install it or set LD_LIBRARY_PATH; see README)"
+                "{DRIVER_FILE} not found (install it or set ONI_DRIVER_PATH; see README)"
             ),
             OpenError::NoBoard(e) => write!(f, "no ONI acquisition board found ({e})"),
             OpenError::BadController => write!(f, "board gateware is incompatible; update to >= 2.0.0"),
@@ -186,6 +186,9 @@ impl Drop for Frame {
 /// Directories searched (in order) for `libonidriver_ft600.so` before the default
 /// library path: `$ONI_DRIVER_PATH`, next to the executable, `../lib`, common prefixes and
 /// existing Open Ephys GUI installs (so the driver they ship can be reused).
+/// File name liboni's loader opens for the FT600 driver on this platform.
+pub const DRIVER_FILE: &str = if cfg!(target_os = "macos") { "libonidriver_ft600.dylib" } else { "libonidriver_ft600.so" };
+
 pub fn driver_search_candidates() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
     let mut v: Vec<PathBuf> = Vec::new();
@@ -225,7 +228,7 @@ pub fn driver_search_candidates() -> Vec<std::path::PathBuf> {
 
 /// Point liboni at the first directory containing the FT600 driver. Returns it, if any.
 pub fn configure_driver_search() -> Option<std::path::PathBuf> {
-    let found = driver_search_candidates().into_iter().find(|d| d.join("libonidriver_ft600.so").exists())?;
+    let found = driver_search_candidates().into_iter().find(|d| d.join(DRIVER_FILE).exists())?;
     let c = CString::new(found.to_string_lossy().as_bytes()).ok()?;
     unsafe { sys::oni_set_driver_search_dir(c.as_ptr()) };
     Some(found)

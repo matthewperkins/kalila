@@ -179,8 +179,8 @@ impl OniBoard {
         let ctx = if d3xx {
             info!("Searching for ONI acquisition board (driver ft600 on D3XX, KALILA_DRIVER=d3xx)...");
             match crate::oni::configure_driver_search() {
-                Some(d) => info!("using libonidriver_ft600.so from {}", d.display()),
-                None => info!("libonidriver_ft600.so not found in known locations; trying the default library path"),
+                Some(d) => info!("using {} from {}", crate::oni::DRIVER_FILE, d.display()),
+                None => info!("{} not found in known locations; trying the default library path", crate::oni::DRIVER_FILE),
             }
             Context::open("ft600", -1)?
         } else {

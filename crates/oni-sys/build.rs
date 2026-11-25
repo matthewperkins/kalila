@@ -21,5 +21,8 @@ fn main() {
         .warnings(false)
         .compile("oni");
     // liboni dlopen()s `libonidriver_<name>.so` at runtime.
-    println!("cargo:rustc-link-lib=dylib=dl");
+    // (On macOS dlopen is in libSystem.)
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-lib=dylib=dl");
+    }
 }

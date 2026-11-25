@@ -13,6 +13,7 @@ pub mod audio;
 pub mod dsp;
 pub mod pyramid;
 pub mod record;
+mod sched;
 
 use anyhow::{Result, bail};
 use audio::{AudioMonitor, AudioSettings, AudioStats};
@@ -541,18 +542,7 @@ fn worker_role(name: &str) -> &'static str {
     }
 }
 
-fn set_realtime() -> bool {
-    use thread_priority::*;
-    #[cfg(target_os = "linux")]
-    {
-        let p = ThreadPriority::from_posix(ScheduleParams { sched_priority: 70 });
-        if set_thread_priority_and_policy(thread_native_id(), p, ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo)).is_ok() {
-            return true;
-        }
-    }
-    let _ = set_current_thread_priority(ThreadPriority::Max);
-    false
-}
+use sched::set_realtime;
 
 #[allow(clippy::too_many_arguments)]
 fn acquisition_loop(
