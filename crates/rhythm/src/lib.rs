@@ -5,6 +5,7 @@ pub mod assemble;
 pub mod oni;
 pub mod oni_board;
 pub mod parser;
+pub mod regdump;
 pub mod registers;
 pub mod sim_board;
 pub mod types;
