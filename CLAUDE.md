@@ -430,7 +430,11 @@ had its rig soak, listening check or Apply check yet** (list at the end).
   open; the ♪ in the Outputs panel.
 - **Golden register test:** `rhythm::regdump::digest` against `testdata/regdump-digest.txt`
   (regenerate only after checking against the stock plugin).
-- **Rig checks owed:** soak with recording (watch `bp` for a bump every 5 s); listen to the
+- **Rig soak of v0.2.0 passed (2026-11-26):** 600 s, 46 ch, own FT600 driver, recording:
+  `dropped=0 gaps=0 bad=0`, hwbuf 0.0 %, `bp` 0 ms, 18,000,064 contiguous samples; the 5 s
+  sync ran 119 times (median 7.6 ms, max 14.3 ms), recorder queue at most 5 blocks; no
+  "giving up" lines. Recording in `~/oers-test/soak-0.2.0`. No audio feed in that run.
+- **Rig checks owed:** listen to the
   audio (start, channel switch, mute); Apply in the GUI for rate, bandwidth, 16-ch, USB
   block; Ctrl+C on a headless recording; each Outputs control, and idle edit → Apply →
   values on the board before Start; power the board off while acquiring (error within
